@@ -7,7 +7,6 @@ import os
 import platform
 import plistlib
 import re
-import resource
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -532,6 +532,13 @@ def execution_mode(binary_arches: list[str], current_host_arch: str) -> str:
     return "incompatible"
 
 
+def profile_sort_key(profile_id: str, configured_profiles: list[dict[str, Any]]) -> int:
+    for index, profile in enumerate(configured_profiles):
+        if profile["id"] == profile_id:
+            return index
+    return len(configured_profiles)
+
+
 def run_benchmarks(
     paths: Paths,
     versions: list[str] | None = None,
@@ -539,6 +546,7 @@ def run_benchmarks(
     sample_limit: int | None = None,
     profiles: list[str] | None = None,
     force: bool = False,
+    jobs: int | None = None,
 ) -> dict[str, Any]:
     config = load_config(paths)
     release_payload = load_or_discover_releases(paths)
@@ -571,6 +579,7 @@ def run_benchmarks(
         for profile in config["profiles"]
         if not profile_filter or profile["id"] in profile_filter
     ]
+    worker_count = max(1, jobs or os.cpu_count() or 1)
     total_jobs = sum(
         len(dataset["samples"][:sample_limit] if sample_limit is not None else dataset["samples"])
         for dataset in selected_datasets
@@ -583,8 +592,7 @@ def run_benchmarks(
     raw_cache_dir = paths.cache / "raw"
     raw_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    runs: list[dict[str, Any]] = []
-    completed_jobs = 0
+    job_specs: list[dict[str, Any]] = []
     for release in selected_releases:
         app_path = paths.releases / release["version"] / "wsjtx.app"
         jt9_path = app_path / "Contents" / "MacOS" / "jt9"
@@ -595,87 +603,82 @@ def run_benchmarks(
                     sample_entries = sample_entries[:sample_limit]
                 for sample in sample_entries:
                     sample_dir = paths.samples / dataset["id"] / sample["id"]
-                    wav_path = sample_dir / f"{sample['id']}.wav"
-                    truth_path = sample_dir / f"{sample['id']}.txt"
-                    raw_output_path = (
-                        raw_dir
-                        / release["version"]
-                        / profile["id"]
-                        / dataset["id"]
-                        / f"{sample['id']}.txt"
-                    )
-                    cache_output_path = (
-                        raw_cache_dir
-                        / release["version"]
-                        / profile["id"]
-                        / dataset["id"]
-                        / f"{sample['id']}.txt"
-                    )
-                    cache_metrics_path = cache_output_path.with_suffix(".json")
-                    if cache_output_path.exists() and not force:
-                        stdout = cache_output_path.read_text()
-                        timing = read_json(cache_metrics_path) if cache_metrics_path.exists() else {}
-                    else:
-                        result = invoke_decoder(
-                            jt9_path=jt9_path,
-                            app_path=app_path,
-                            sample_path=wav_path,
-                            depth=profile["depth"],
-                            work_root=paths.temp / "runs" / run_id,
-                        )
-                        stdout = result["stdout"]
-                        timing = {
-                            "wall_seconds": result["wall_seconds"],
-                            "cpu_user_seconds": result["cpu_user_seconds"],
-                            "cpu_system_seconds": result["cpu_system_seconds"],
-                            "cpu_seconds": result["cpu_seconds"],
-                        }
-                        cache_output_path.parent.mkdir(parents=True, exist_ok=True)
-                        cache_output_path.write_text(stdout)
-                        write_json(cache_metrics_path, timing)
-                    raw_output_path.parent.mkdir(parents=True, exist_ok=True)
-                    raw_output_path.write_text(stdout)
-                    decodes = parse_decode_lines(stdout)
-                    truth = parse_truth_file(truth_path) if truth_path.exists() else []
-                    metrics = compare_decodes(decodes, truth) if truth else None
-                    completed_jobs += 1
-                    print(
-                        f"[{completed_jobs}/{total_jobs}] {release['version']} {profile['id']} {dataset['id']} {sample['id']}",
-                        flush=True,
-                    )
-                    runs.append(
+                    job_specs.append(
                         {
-                            "release_version": release["version"],
-                            "host_arch": host_arch(),
-                            "jt9_arches": release_metadata[release["version"]]["jt9_arches"],
-                            "execution_mode": execution_mode(
-                                release_metadata[release["version"]]["jt9_arches"],
-                                host_arch(),
-                            ),
-                            "profile_id": profile["id"],
-                            "profile_label": profile["label"],
-                            "dataset_id": dataset["id"],
-                            "dataset_label": dataset["label"],
-                            "dataset_kind": dataset["kind"],
-                            "sample_id": sample["id"],
-                            "raw_output_path": str(raw_output_path),
-                            "decode_count": len(decodes),
-                            "truth_count": len(truth),
-                            "wall_seconds": timing.get("wall_seconds"),
-                            "cpu_user_seconds": timing.get("cpu_user_seconds"),
-                            "cpu_system_seconds": timing.get("cpu_system_seconds"),
-                            "cpu_seconds": timing.get("cpu_seconds"),
-                            "decodes": decodes,
-                            "truth": truth,
-                            "metrics": metrics,
+                            "release": release,
+                            "profile": profile,
+                            "dataset": dataset,
+                            "sample": sample,
+                            "sample_dir": sample_dir,
+                            "app_path": app_path,
+                            "jt9_path": jt9_path,
+                            "run_id": run_id,
                         }
                     )
+
+    runs: list[dict[str, Any]] = []
+    completed_jobs = 0
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        pending: dict[Future[dict[str, Any]], dict[str, Any]] = {}
+        job_iter = iter(job_specs)
+
+        while len(pending) < worker_count:
+            try:
+                spec = next(job_iter)
+            except StopIteration:
+                break
+            future = executor.submit(
+                run_decode_job,
+                paths=paths,
+                raw_dir=raw_dir,
+                raw_cache_dir=raw_cache_dir,
+                release_metadata=release_metadata,
+                job_spec=spec,
+                force=force,
+            )
+            pending[future] = spec
+
+        while pending:
+            completed, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+            for future in completed:
+                spec = pending.pop(future)
+                run = future.result()
+                completed_jobs += 1
+                print(
+                    f"[{completed_jobs}/{total_jobs}] {spec['release']['version']} {spec['profile']['id']} {spec['dataset']['id']} {spec['sample']['id']}",
+                    flush=True,
+                )
+                runs.append(run)
+                try:
+                    next_spec = next(job_iter)
+                except StopIteration:
+                    continue
+                next_future = executor.submit(
+                    run_decode_job,
+                    paths=paths,
+                    raw_dir=raw_dir,
+                    raw_cache_dir=raw_cache_dir,
+                    release_metadata=release_metadata,
+                    job_spec=next_spec,
+                    force=force,
+                )
+                pending[next_future] = next_spec
+
+    runs.sort(
+        key=lambda item: (
+            version_key(item["release_version"]),
+            profile_sort_key(item["profile_id"], selected_profiles),
+            item["dataset_id"],
+            item["sample_id"],
+        )
+    )
 
     payload = {
         "generated_at": utc_now(),
         "run_id": run_id,
         "host_arch": host_arch(),
         "profiles": selected_profiles,
+        "jobs": worker_count,
         "releases": [
             {
                 "version": release["version"],
@@ -719,6 +722,8 @@ def invoke_decoder(
 ) -> dict[str, Any]:
     work_root.mkdir(parents=True, exist_ok=True)
     run_temp = Path(tempfile.mkdtemp(prefix="jt9-", dir=work_root))
+    stdout_path = run_temp / "stdout.txt"
+    stderr_path = run_temp / "stderr.txt"
     macos_dir = app_path / "Contents" / "MacOS"
     frameworks_dir = app_path / "Contents" / "Frameworks"
     env = os.environ.copy()
@@ -738,31 +743,120 @@ def invoke_decoder(
         str(run_temp),
         str(sample_path),
     ]
-    usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     started_at = time.monotonic()
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(run_temp),
-        check=True,
-    )
+    with stdout_path.open("w") as stdout_handle, stderr_path.open("w") as stderr_handle:
+        process = subprocess.Popen(
+            command,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            text=True,
+            env=env,
+            cwd=str(run_temp),
+        )
+        _, status, rusage = os.wait4(process.pid, 0)
     elapsed = time.monotonic() - started_at
-    usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    cpu_user_seconds = usage_after.ru_utime - usage_before.ru_utime
-    cpu_system_seconds = usage_after.ru_stime - usage_before.ru_stime
+    exit_code = os.waitstatus_to_exitcode(status)
+    if exit_code != 0:
+        raise subprocess.CalledProcessError(exit_code, command)
+    cpu_user_seconds = rusage.ru_utime
+    cpu_system_seconds = rusage.ru_stime
     cpu_seconds = cpu_user_seconds + cpu_system_seconds
-    stdout = completed.stdout
-    if completed.stderr.strip():
+    stdout = stdout_path.read_text()
+    stderr = stderr_path.read_text()
+    if stderr.strip():
         stdout = stdout + ("\n" if stdout and not stdout.endswith("\n") else "")
-        stdout += f"# stderr ({elapsed:.3f}s)\n{completed.stderr}"
+        stdout += f"# stderr ({elapsed:.3f}s)\n{stderr}"
     return {
         "stdout": stdout,
         "wall_seconds": elapsed,
         "cpu_user_seconds": cpu_user_seconds,
         "cpu_system_seconds": cpu_system_seconds,
         "cpu_seconds": cpu_seconds,
+    }
+
+
+def run_decode_job(
+    paths: Paths,
+    raw_dir: Path,
+    raw_cache_dir: Path,
+    release_metadata: dict[str, dict[str, Any]],
+    job_spec: dict[str, Any],
+    force: bool,
+) -> dict[str, Any]:
+    release = job_spec["release"]
+    profile = job_spec["profile"]
+    dataset = job_spec["dataset"]
+    sample = job_spec["sample"]
+    sample_dir = job_spec["sample_dir"]
+    wav_path = sample_dir / f"{sample['id']}.wav"
+    truth_path = sample_dir / f"{sample['id']}.txt"
+    raw_output_path = (
+        raw_dir
+        / release["version"]
+        / profile["id"]
+        / dataset["id"]
+        / f"{sample['id']}.txt"
+    )
+    cache_output_path = (
+        raw_cache_dir
+        / release["version"]
+        / profile["id"]
+        / dataset["id"]
+        / f"{sample['id']}.txt"
+    )
+    cache_metrics_path = cache_output_path.with_suffix(".json")
+
+    if cache_output_path.exists() and not force:
+        stdout = cache_output_path.read_text()
+        timing = read_json(cache_metrics_path) if cache_metrics_path.exists() else {}
+    else:
+        result = invoke_decoder(
+            jt9_path=job_spec["jt9_path"],
+            app_path=job_spec["app_path"],
+            sample_path=wav_path,
+            depth=profile["depth"],
+            work_root=paths.temp / "runs" / job_spec["run_id"],
+        )
+        stdout = result["stdout"]
+        timing = {
+            "wall_seconds": result["wall_seconds"],
+            "cpu_user_seconds": result["cpu_user_seconds"],
+            "cpu_system_seconds": result["cpu_system_seconds"],
+            "cpu_seconds": result["cpu_seconds"],
+        }
+        cache_output_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_output_path.write_text(stdout)
+        write_json(cache_metrics_path, timing)
+
+    raw_output_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_output_path.write_text(stdout)
+    decodes = parse_decode_lines(stdout)
+    truth = parse_truth_file(truth_path) if truth_path.exists() else []
+    metrics = compare_decodes(decodes, truth) if truth else None
+    return {
+        "release_version": release["version"],
+        "host_arch": host_arch(),
+        "jt9_arches": release_metadata[release["version"]]["jt9_arches"],
+        "execution_mode": execution_mode(
+            release_metadata[release["version"]]["jt9_arches"],
+            host_arch(),
+        ),
+        "profile_id": profile["id"],
+        "profile_label": profile["label"],
+        "dataset_id": dataset["id"],
+        "dataset_label": dataset["label"],
+        "dataset_kind": dataset["kind"],
+        "sample_id": sample["id"],
+        "raw_output_path": str(raw_output_path),
+        "decode_count": len(decodes),
+        "truth_count": len(truth),
+        "wall_seconds": timing.get("wall_seconds"),
+        "cpu_user_seconds": timing.get("cpu_user_seconds"),
+        "cpu_system_seconds": timing.get("cpu_system_seconds"),
+        "cpu_seconds": timing.get("cpu_seconds"),
+        "decodes": decodes,
+        "truth": truth,
+        "metrics": metrics,
     }
 
 

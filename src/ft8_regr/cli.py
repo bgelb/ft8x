@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--profiles", nargs="*", help="Profile ids to benchmark")
     run_parser.add_argument("--sample-limit", type=int, help="Limit samples per dataset")
     run_parser.add_argument("--force", action="store_true", help="Re-run existing raw decode jobs")
+    run_parser.add_argument("--jobs", type=int, help="Concurrent decoder jobs to run")
 
     report_parser = subparsers.add_parser("report", help="Render static HTML report")
     report_parser.add_argument("--results", help="Optional path to a results.json file")
@@ -86,6 +87,7 @@ def main() -> None:
             profiles=args.profiles,
             sample_limit=args.sample_limit,
             force=args.force,
+            jobs=args.jobs,
         )
         report_path = generate_report(paths, paths.results / payload["run_id"] / "results.json")
         print(f"results written to {paths.results / payload['run_id']}")
@@ -103,4 +105,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
