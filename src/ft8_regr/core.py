@@ -1030,7 +1030,7 @@ def generate_report(paths: Paths, results_path: Path | None = None) -> Path:
 def invoke_local_decoder(binary_path: Path, sample_path: Path) -> dict[str, Any]:
     started_at = time.monotonic()
     completed = subprocess.Popen(
-        [str(binary_path), str(sample_path)],
+        [str(binary_path), "decode", str(sample_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -1040,7 +1040,12 @@ def invoke_local_decoder(binary_path: Path, sample_path: Path) -> dict[str, Any]
     elapsed = time.monotonic() - started_at
     exit_code = os.waitstatus_to_exitcode(status)
     if exit_code != 0:
-        raise subprocess.CalledProcessError(exit_code, [str(binary_path), str(sample_path)], stdout, stderr)
+        raise subprocess.CalledProcessError(
+            exit_code,
+            [str(binary_path), "decode", str(sample_path)],
+            stdout,
+            stderr,
+        )
     if stderr.strip():
         stdout = stdout + ("\n" if stdout and not stdout.endswith("\n") else "") + stderr
     return {

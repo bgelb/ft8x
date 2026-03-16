@@ -358,9 +358,24 @@ fn decode_c28(value: u64) -> CallField {
         1 => CallField::Token("QRZ".to_string()),
         2 => CallField::Token("CQ".to_string()),
         3..=1002 => CallField::Token(format!("CQ {:03}", value - 3)),
-        1004..=1029 => {
-            let code = ((value - 1004) as u8 + b'A') as char;
-            CallField::Token(format!("CQ {code}"))
+        1003..=532_443 => {
+            let mut remaining = value - 1003;
+            let i1 = remaining / (27 * 27 * 27);
+            remaining %= 27 * 27 * 27;
+            let i2 = remaining / (27 * 27);
+            remaining %= 27 * 27;
+            let i3 = remaining / 27;
+            let i4 = remaining % 27;
+            let suffix = format!(
+                "{}{}{}{}",
+                alphabet27(i1 as usize),
+                alphabet27(i2 as usize),
+                alphabet27(i3 as usize),
+                alphabet27(i4 as usize)
+            )
+            .trim()
+            .to_string();
+            CallField::Token(format!("CQ {suffix}"))
         }
         raw if raw >= CALL_STANDARD_BASE as u64 => {
             let mut remaining = raw - CALL_STANDARD_BASE as u64;

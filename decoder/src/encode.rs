@@ -1,0 +1,447 @@
+use std::path::Path;
+use std::sync::OnceLock;
+
+use thiserror::Error;
+
+use crate::crc::crc14_ft8;
+use crate::message::{GridReport, ReplyWord};
+use crate::protocol::{
+    CALL_STANDARD_BASE, FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES,
+    FT8_TONE_SPACING_HZ, GRAY_TONES_TO_BITS,
+};
+use crate::wave::{AudioBuffer, DecoderError, write_wav};
+
+const MESSAGE_BITS: usize = 77;
+const INFO_BITS: usize = 91;
+const CODEWORD_BITS: usize = 174;
+const DATA_SYMBOLS: usize = 58;
+
+#[derive(Debug, Clone)]
+pub struct EncodedFrame {
+    pub message_bits: [u8; MESSAGE_BITS],
+    pub codeword_bits: [u8; CODEWORD_BITS],
+    pub data_symbols: [u8; DATA_SYMBOLS],
+    pub channel_symbols: [u8; FT8_MESSAGE_SYMBOLS],
+}
+
+#[derive(Debug, Clone)]
+pub struct WaveformOptions {
+    pub base_freq_hz: f32,
+    pub start_seconds: f32,
+    pub total_seconds: f32,
+    pub amplitude: f32,
+}
+
+impl Default for WaveformOptions {
+    fn default() -> Self {
+        Self {
+            base_freq_hz: 1_000.0,
+            start_seconds: 0.5,
+            total_seconds: 15.0,
+            amplitude: 0.8,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum EncodeError {
+    #[error("unsupported standard callsign: {0}")]
+    UnsupportedCallsign(String),
+    #[error("unsupported grid or report: {0}")]
+    UnsupportedInfo(String),
+    #[error("unsupported token: {0}")]
+    UnsupportedToken(String),
+    #[error("waveform too short for FT8 frame")]
+    WaveformTooShort,
+}
+
+pub fn encode_standard_message(
+    first: &str,
+    second: &str,
+    acknowledge: bool,
+    info: &GridReport,
+) -> Result<EncodedFrame, EncodeError> {
+    let mut message_bits = [0u8; MESSAGE_BITS];
+    write_bits(
+        &mut message_bits,
+        0,
+        28,
+        u64::from(encode_c28(first)?),
+    );
+    write_bits(&mut message_bits, 28, 1, 0);
+    write_bits(
+        &mut message_bits,
+        29,
+        28,
+        u64::from(encode_c28(second)?),
+    );
+    write_bits(&mut message_bits, 57, 1, 0);
+    write_bits(&mut message_bits, 58, 1, acknowledge as u64);
+    write_bits(&mut message_bits, 59, 15, u64::from(encode_g15(info)?));
+    write_bits(&mut message_bits, 74, 3, 1);
+
+    let crc = crc14_ft8(&message_bits);
+    let mut info_bits = [0u8; INFO_BITS];
+    info_bits[..MESSAGE_BITS].copy_from_slice(&message_bits);
+    info_bits[MESSAGE_BITS..].copy_from_slice(&crc);
+
+    let parity_rows = generator_rows();
+    let mut codeword_bits = [0u8; CODEWORD_BITS];
+    codeword_bits[..INFO_BITS].copy_from_slice(&info_bits);
+    for (row_index, row) in parity_rows.iter().enumerate() {
+        let parity = row
+            .iter()
+            .zip(info_bits.iter())
+            .fold(0u8, |acc, (tap, bit)| acc ^ (*tap & *bit));
+        codeword_bits[INFO_BITS + row_index] = parity;
+    }
+
+    let mut data_symbols = [0u8; DATA_SYMBOLS];
+    for (symbol_index, chunk) in codeword_bits.chunks_exact(3).enumerate() {
+        data_symbols[symbol_index] = bits_to_tone(chunk);
+    }
+
+    let mut channel_symbols = [0u8; FT8_MESSAGE_SYMBOLS];
+    channel_symbols[..7].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
+    channel_symbols[36..43].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
+    channel_symbols[72..79].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
+    channel_symbols[7..36].copy_from_slice(&data_symbols[..29]);
+    channel_symbols[43..72].copy_from_slice(&data_symbols[29..]);
+
+    Ok(EncodedFrame {
+        message_bits,
+        codeword_bits,
+        data_symbols,
+        channel_symbols,
+    })
+}
+
+pub fn synthesize_rectangular_waveform(
+    frame: &EncodedFrame,
+    options: &WaveformOptions,
+) -> Result<AudioBuffer, EncodeError> {
+    let total_samples = (options.total_seconds * FT8_SAMPLE_RATE as f32).round() as usize;
+    let start_sample = (options.start_seconds * FT8_SAMPLE_RATE as f32).round() as usize;
+    let frame_samples = FT8_MESSAGE_SYMBOLS * FT8_SYMBOL_SAMPLES;
+    if start_sample + frame_samples > total_samples {
+        return Err(EncodeError::WaveformTooShort);
+    }
+
+    let mut samples = vec![0.0f32; total_samples];
+    let mut phase = 0.0f32;
+    for (symbol_index, tone) in frame.channel_symbols.iter().copied().enumerate() {
+        let symbol_start = start_sample + symbol_index * FT8_SYMBOL_SAMPLES;
+        let freq_hz = options.base_freq_hz + tone as f32 * FT8_TONE_SPACING_HZ;
+        let omega = 2.0 * std::f32::consts::PI * freq_hz / FT8_SAMPLE_RATE as f32;
+        for offset in 0..FT8_SYMBOL_SAMPLES {
+            samples[symbol_start + offset] = options.amplitude * phase.cos();
+            phase += omega;
+            if phase > std::f32::consts::PI {
+                phase -= 2.0 * std::f32::consts::PI;
+            }
+        }
+    }
+
+    Ok(AudioBuffer {
+        sample_rate_hz: FT8_SAMPLE_RATE,
+        samples,
+    })
+}
+
+pub fn write_rectangular_standard_wav(
+    path: impl AsRef<Path>,
+    first: &str,
+    second: &str,
+    acknowledge: bool,
+    info: &GridReport,
+    options: &WaveformOptions,
+) -> Result<EncodedFrame, EncodeError> {
+    let frame = encode_standard_message(first, second, acknowledge, info)?;
+    let audio = synthesize_rectangular_waveform(&frame, options)?;
+    write_wav(path, &audio).map_err(map_wave_error)?;
+    Ok(frame)
+}
+
+pub fn parse_standard_info(text: &str) -> Result<GridReport, EncodeError> {
+    let upper = text.trim().to_uppercase();
+    if upper.is_empty() {
+        return Ok(GridReport::Blank);
+    }
+    if upper == "RRR" {
+        return Ok(GridReport::Reply(ReplyWord::Rrr));
+    }
+    if upper == "RR73" {
+        return Ok(GridReport::Reply(ReplyWord::Rr73));
+    }
+    if upper == "73" {
+        return Ok(GridReport::Reply(ReplyWord::SeventyThree));
+    }
+    if is_grid4(&upper) {
+        return Ok(GridReport::Grid(upper));
+    }
+    if let Ok(report) = upper.parse::<i16>() {
+        if (-50..=49).contains(&report) {
+            return Ok(GridReport::Signal(report));
+        }
+    }
+    Err(EncodeError::UnsupportedInfo(text.to_string()))
+}
+
+fn map_wave_error(error: DecoderError) -> EncodeError {
+    match error {
+        DecoderError::Wav(source) => EncodeError::UnsupportedInfo(source.to_string()),
+        DecoderError::UnsupportedFormat(message) => EncodeError::UnsupportedInfo(message),
+    }
+}
+
+fn generator_rows() -> &'static Vec<[u8; INFO_BITS]> {
+    static ROWS: OnceLock<Vec<[u8; INFO_BITS]>> = OnceLock::new();
+    ROWS.get_or_init(|| {
+        include_str!("../data/generator.dat")
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.len() != INFO_BITS || !trimmed.bytes().all(|byte| matches!(byte, b'0' | b'1'))
+                {
+                    return None;
+                }
+                let mut row = [0u8; INFO_BITS];
+                for (index, byte) in trimmed.bytes().enumerate() {
+                    row[index] = u8::from(byte == b'1');
+                }
+                Some(row)
+            })
+            .collect()
+    })
+}
+
+fn encode_c28(text: &str) -> Result<u32, EncodeError> {
+    let upper = text.trim().to_uppercase();
+    match upper.as_str() {
+        "DE" => Ok(0),
+        "QRZ" => Ok(1),
+        "CQ" => Ok(2),
+        _ => {
+            if let Some(rest) = upper.strip_prefix("CQ ") {
+                if rest.len() == 3 && rest.chars().all(|ch| ch.is_ascii_digit()) {
+                    let suffix = rest.parse::<u32>().map_err(|_| {
+                        EncodeError::UnsupportedToken(text.to_string())
+                    })?;
+                    return Ok(3 + suffix);
+                }
+                if (1..=4).contains(&rest.len()) && rest.chars().all(|ch| ch.is_ascii_uppercase()) {
+                    let mut packed = [' '; 4];
+                    let offset = 4 - rest.len();
+                    for (index, ch) in rest.chars().enumerate() {
+                        packed[offset + index] = ch;
+                    }
+                    let mut encoded = 0u32;
+                    for ch in packed {
+                        encoded = encoded * 27 + u32::from(alphabet27_index(ch).unwrap_or(0));
+                    }
+                    return Ok(1003 + encoded);
+                }
+                return Err(EncodeError::UnsupportedToken(text.to_string()));
+            }
+            Ok(CALL_STANDARD_BASE + encode_standard_callsign(&upper)?)
+        }
+    }
+}
+
+fn encode_standard_callsign(callsign: &str) -> Result<u32, EncodeError> {
+    let chars: Vec<char> = callsign.chars().collect();
+    let Some(digit_index) = chars.iter().position(|ch| ch.is_ascii_digit()) else {
+        return Err(EncodeError::UnsupportedCallsign(callsign.to_string()));
+    };
+    if !(digit_index == 1 || digit_index == 2) {
+        return Err(EncodeError::UnsupportedCallsign(callsign.to_string()));
+    }
+    let suffix_len = chars.len().saturating_sub(digit_index + 1);
+    if suffix_len == 0 || suffix_len > 3 || chars.len() > 6 {
+        return Err(EncodeError::UnsupportedCallsign(callsign.to_string()));
+    }
+
+    let mut packed = [' '; 6];
+    if digit_index == 1 {
+        packed[1] = chars[0];
+        packed[2] = chars[1];
+        for (offset, ch) in chars[2..].iter().copied().enumerate() {
+            packed[3 + offset] = ch;
+        }
+    } else {
+        packed[0] = chars[0];
+        packed[1] = chars[1];
+        packed[2] = chars[2];
+        for (offset, ch) in chars[3..].iter().copied().enumerate() {
+            packed[3 + offset] = ch;
+        }
+    }
+
+    let i1 = alphabet37_index(packed[0]).ok_or_else(|| {
+        EncodeError::UnsupportedCallsign(callsign.to_string())
+    })?;
+    let i2 = alphabet36_index(packed[1]).ok_or_else(|| {
+        EncodeError::UnsupportedCallsign(callsign.to_string())
+    })?;
+    let i3 = digit_index_10(packed[2]).ok_or_else(|| {
+        EncodeError::UnsupportedCallsign(callsign.to_string())
+    })?;
+    let i4 = alphabet27_index(packed[3]).ok_or_else(|| {
+        EncodeError::UnsupportedCallsign(callsign.to_string())
+    })?;
+    let i5 = alphabet27_index(packed[4]).ok_or_else(|| {
+        EncodeError::UnsupportedCallsign(callsign.to_string())
+    })?;
+    let i6 = alphabet27_index(packed[5]).ok_or_else(|| {
+        EncodeError::UnsupportedCallsign(callsign.to_string())
+    })?;
+
+    Ok(
+        (((((i1 * 36) + i2) * 10 + i3) * 27 + i4) * 27 + i5) * 27
+            + i6,
+    )
+}
+
+fn encode_g15(info: &GridReport) -> Result<u16, EncodeError> {
+    match info {
+        GridReport::Grid(grid) if is_grid4(grid) => {
+            let chars: Vec<char> = grid.chars().collect();
+            let value = (((chars[0] as u16 - b'A' as u16) * 18
+                + (chars[1] as u16 - b'A' as u16))
+                * 10
+                + (chars[2] as u16 - b'0' as u16))
+                * 10
+                + (chars[3] as u16 - b'0' as u16);
+            Ok(value)
+        }
+        GridReport::Blank => Ok(32_400),
+        GridReport::Reply(ReplyWord::Rrr) => Ok(32_402),
+        GridReport::Reply(ReplyWord::Rr73) => Ok(32_403),
+        GridReport::Reply(ReplyWord::SeventyThree) => Ok(32_404),
+        GridReport::Reply(ReplyWord::Blank) => Ok(32_400),
+        GridReport::Signal(report) if (-50..=49).contains(report) => {
+            Ok((32_435i32 + i32::from(*report)) as u16)
+        }
+        _ => Err(EncodeError::UnsupportedInfo(format!("{info:?}"))),
+    }
+}
+
+fn bits_to_tone(bits: &[u8]) -> u8 {
+    GRAY_TONES_TO_BITS
+        .iter()
+        .position(|candidate| candidate.as_slice() == bits)
+        .expect("valid Gray triad") as u8
+}
+
+fn write_bits(bits: &mut [u8], start: usize, len: usize, value: u64) {
+    for bit_index in 0..len {
+        let shift = len - 1 - bit_index;
+        bits[start + bit_index] = ((value >> shift) & 1) as u8;
+    }
+}
+
+fn is_grid4(grid: &str) -> bool {
+    let bytes = grid.as_bytes();
+    bytes.len() == 4
+        && matches!(bytes[0], b'A'..=b'R')
+        && matches!(bytes[1], b'A'..=b'R')
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+}
+
+fn alphabet37_index(ch: char) -> Option<u32> {
+    " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        .chars()
+        .position(|candidate| candidate == ch)
+        .map(|index| index as u32)
+}
+
+fn alphabet36_index(ch: char) -> Option<u32> {
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        .chars()
+        .position(|candidate| candidate == ch)
+        .map(|index| index as u32)
+}
+
+fn digit_index_10(ch: char) -> Option<u32> {
+    "0123456789"
+        .chars()
+        .position(|candidate| candidate == ch)
+        .map(|index| index as u32)
+}
+
+fn alphabet27_index(ch: char) -> Option<u32> {
+    " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        .chars()
+        .position(|candidate| candidate == ch)
+        .map(|index| index as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode_pcm;
+    use crate::message::{GridReport, HashResolver, unpack_message};
+    use crate::ldpc::ParityMatrix;
+    use crate::DecodeOptions;
+
+    #[test]
+    fn standard_message_codeword_satisfies_parity() {
+        let frame = encode_standard_message(
+            "GJ0KYZ",
+            "RK9AX",
+            false,
+            &GridReport::Grid("MO05".to_string()),
+        )
+        .expect("encode");
+        assert!(ParityMatrix::global().parity_ok(&frame.codeword_bits));
+    }
+
+    #[test]
+    fn encodes_cq_dx_token_round_trip() {
+        let frame = encode_standard_message(
+            "CQ DX",
+            "R6WA",
+            false,
+            &GridReport::Grid("LN32".to_string()),
+        )
+        .expect("encode");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let rendered = payload.render(&HashResolver::default());
+        assert_eq!(rendered.text, "CQ DX R6WA LN32");
+    }
+
+    #[test]
+    #[ignore = "slow end-to-end bringup check"]
+    fn encodes_and_decodes_rectangular_standard_message() {
+        let frame = encode_standard_message(
+            "GJ0KYZ",
+            "RK9AX",
+            false,
+            &GridReport::Grid("MO05".to_string()),
+        )
+        .expect("encode");
+        let audio = synthesize_rectangular_waveform(
+            &frame,
+            &WaveformOptions {
+                base_freq_hz: 1_234.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("waveform");
+        let report = decode_pcm(
+            &audio,
+            &DecodeOptions {
+                max_candidates: 8,
+                max_successes: 2,
+                ..DecodeOptions::default()
+            },
+        )
+        .expect("decode");
+        let decoded: Vec<_> = report.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        assert!(
+            decoded.contains(&"GJ0KYZ RK9AX MO05"),
+            "decoded messages: {decoded:?}"
+        );
+    }
+}

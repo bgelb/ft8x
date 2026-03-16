@@ -1,3 +1,6 @@
+use ldpc_toolbox::decoder::arithmetic::Minstarapproxf32;
+use ldpc_toolbox::decoder::horizontal_layered;
+use ldpc_toolbox::sparse::SparseMatrix as ToolboxSparseMatrix;
 use std::sync::OnceLock;
 
 use crate::protocol::GRAY_TONES_TO_BITS;
@@ -11,6 +14,7 @@ pub struct ParityMatrix {
     row_edges: Vec<Vec<usize>>,
     column_edges: Vec<Vec<usize>>,
     edge_columns: Vec<usize>,
+    toolbox_matrix: ToolboxSparseMatrix,
 }
 
 impl ParityMatrix {
@@ -60,11 +64,17 @@ impl ParityMatrix {
             row_edges.push(edges);
         }
 
+        let mut toolbox_matrix = ToolboxSparseMatrix::new(83, 174);
+        for (row_index, row) in rows.iter().enumerate() {
+            toolbox_matrix.insert_row(row_index, row.iter());
+        }
+
         Self {
             rows,
             row_edges,
             column_edges,
             edge_columns,
+            toolbox_matrix,
         }
     }
 
@@ -80,10 +90,26 @@ impl ParityMatrix {
     }
 
     pub fn decode(&self, llrs: &[f32]) -> Option<(Vec<u8>, usize)> {
+        self.decode_toolbox(llrs).or_else(|| self.decode_min_sum(llrs))
+    }
+
+    fn decode_toolbox(&self, llrs: &[f32]) -> Option<(Vec<u8>, usize)> {
         if llrs.len() != 174 {
             return None;
         }
+        let mut decoder =
+            horizontal_layered::Decoder::new(self.toolbox_matrix.clone(), Minstarapproxf32::new());
+        let llrs_f64: Vec<f64> = llrs.iter().map(|value| -(*value as f64)).collect();
+        match decoder.decode(&llrs_f64, MAX_ITERS) {
+            Ok(output) => Some((output.codeword, output.iterations)),
+            Err(_) => None,
+        }
+    }
 
+    fn decode_min_sum(&self, llrs: &[f32]) -> Option<(Vec<u8>, usize)> {
+        if llrs.len() != 174 {
+            return None;
+        }
         let edge_count = self.edge_columns.len();
         let mut q = vec![0.0f32; edge_count];
         let mut r = vec![0.0f32; edge_count];
