@@ -1,8 +1,0 @@
-/Users/bgelb/ft8-regr/decoder/target/debug/deps/unicode_ident-122d923a082262ca.d: /Users/bgelb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs /Users/bgelb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/tables.rs
-
-/Users/bgelb/ft8-regr/decoder/target/debug/deps/libunicode_ident-122d923a082262ca.rlib: /Users/bgelb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs /Users/bgelb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/tables.rs
-
-/Users/bgelb/ft8-regr/decoder/target/debug/deps/libunicode_ident-122d923a082262ca.rmeta: /Users/bgelb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs /Users/bgelb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/tables.rs
-
-/Users/bgelb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs:
-/Users/bgelb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/tables.rs:
