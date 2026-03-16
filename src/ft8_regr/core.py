@@ -157,10 +157,12 @@ def normalize_message(message: str) -> str:
     return re.sub(r"\s+", " ", message.strip().upper())
 
 
-def trim_truth_message(raw_message: str) -> str:
+def split_message_suffix(raw_message: str) -> tuple[str, str | None]:
     collapsed = raw_message.rstrip()
     parts = re.split(r"\s{2,}", collapsed, maxsplit=1)
-    return parts[0]
+    message = parts[0]
+    suffix = parts[1].strip() if len(parts) > 1 else None
+    return message, suffix
 
 
 def parse_decode_lines(text: str) -> list[dict[str, Any]]:
@@ -169,7 +171,8 @@ def parse_decode_lines(text: str) -> list[dict[str, Any]]:
         match = DECODE_PATTERN.match(line)
         if not match:
             continue
-        message = normalize_message(match.group("message"))
+        message_text, suffix = split_message_suffix(match.group("message"))
+        message = normalize_message(message_text)
         decodes.append(
             {
                 "utc": match.group("utc"),
@@ -177,6 +180,7 @@ def parse_decode_lines(text: str) -> list[dict[str, Any]]:
                 "dt": float(match.group("dt")),
                 "freq_hz": int(match.group("freq")),
                 "message": message,
+                "annotation": suffix,
             }
         )
     return decodes
@@ -188,7 +192,8 @@ def parse_truth_file(path: Path) -> list[dict[str, Any]]:
         match = DECODE_PATTERN.match(line)
         if not match:
             continue
-        message = normalize_message(trim_truth_message(match.group("message")))
+        message_text, suffix = split_message_suffix(match.group("message"))
+        message = normalize_message(message_text)
         decodes.append(
             {
                 "utc": match.group("utc"),
@@ -196,6 +201,7 @@ def parse_truth_file(path: Path) -> list[dict[str, Any]]:
                 "dt": float(match.group("dt")),
                 "freq_hz": int(match.group("freq")),
                 "message": message,
+                "annotation": suffix,
             }
         )
     return decodes
