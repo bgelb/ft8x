@@ -8,6 +8,7 @@ use realfft::RealFftPlanner;
 use rustfft::{Fft, FftPlanner};
 use serde::Serialize;
 
+use crate::encode::channel_symbols_from_codeword_bits;
 use crate::ldpc::ParityMatrix;
 use crate::message::{DecodedPayload, HashResolver, Payload, unpack_message};
 use crate::protocol::{
@@ -30,9 +31,9 @@ impl Default for DecodeOptions {
         Self {
             min_freq_hz: 200.0,
             max_freq_hz: 3_000.0,
-            max_candidates: 128,
+            max_candidates: 192,
             max_successes: 64,
-            search_passes: 2,
+            search_passes: 3,
         }
     }
 }
@@ -79,6 +80,7 @@ pub struct DecodeReport {
 #[derive(Debug)]
 struct SuccessfulDecode {
     payload: Payload,
+    codeword_bits: Vec<u8>,
     candidate: DecodeCandidate,
     ldpc_iterations: usize,
     snr_db: i32,
@@ -367,11 +369,14 @@ fn suppress_candidate(spectrogram: &mut Spectrogram, success: &SuccessfulDecode)
         ((success.candidate.start_seconds * FT8_SAMPLE_RATE as f32) / HOP_SAMPLES as f32).round() as isize;
     let base_bin = (success.candidate.freq_hz / FT8_TONE_SPACING_HZ).round() as isize
         - spectrogram.min_bin as isize;
-    for (symbol_index, tone) in all_costas_positions() {
+    let Some(channel_symbols) = channel_symbols_from_codeword_bits(&success.codeword_bits) else {
+        return;
+    };
+    for (symbol_index, tone) in channel_symbols.into_iter().enumerate() {
         let frame = start_frame + (symbol_index * HOPS_PER_SYMBOL) as isize;
         let bin = base_bin + tone as isize;
         for frame_delta in -1..=1 {
-            for bin_delta in -1..=1 {
+            for bin_delta in -2..=2 {
                 let frame_index = frame + frame_delta;
                 let bin_index = bin + bin_delta;
                 if frame_index < 0
@@ -432,12 +437,13 @@ fn try_candidate(
             };
 
             for llrs in &refined.llr_sets {
-                let Some((payload, iterations)) = decode_llr_set(parity, llrs, counters) else {
+                let Some((payload, bits, iterations)) = decode_llr_set(parity, llrs, counters) else {
                     continue;
                 };
 
                 let success = SuccessfulDecode {
                     payload,
+                    codeword_bits: bits,
                     candidate: DecodeCandidate {
                         start_seconds: refined.start_seconds,
                         dt_seconds: refined.start_seconds - 0.5,
@@ -711,7 +717,7 @@ fn decode_llr_set(
     parity: &ParityMatrix,
     llrs: &[f32],
     counters: &mut DecodeCounters,
-) -> Option<(Payload, usize)> {
+) -> Option<(Payload, Vec<u8>, usize)> {
     let Some((bits, iterations)) = parity.decode(llrs) else {
         return None;
     };
@@ -723,7 +729,7 @@ fn decode_llr_set(
         return None;
     };
     counters.parsed_payloads += 1;
-    Some((payload, iterations))
+    Some((payload, bits, iterations))
 }
 
 fn baseband_taper() -> &'static [f32] {

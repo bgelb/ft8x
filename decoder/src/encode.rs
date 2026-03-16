@@ -148,6 +148,27 @@ pub fn synthesize_rectangular_waveform(
     })
 }
 
+pub fn channel_symbols_from_codeword_bits(
+    codeword_bits: &[u8],
+) -> Option<[u8; FT8_MESSAGE_SYMBOLS]> {
+    if codeword_bits.len() < CODEWORD_BITS {
+        return None;
+    }
+
+    let mut data_symbols = [0u8; DATA_SYMBOLS];
+    for (symbol_index, chunk) in codeword_bits[..CODEWORD_BITS].chunks_exact(3).enumerate() {
+        data_symbols[symbol_index] = bits_to_tone(chunk);
+    }
+
+    let mut channel_symbols = [0u8; FT8_MESSAGE_SYMBOLS];
+    channel_symbols[..7].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
+    channel_symbols[36..43].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
+    channel_symbols[72..79].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
+    channel_symbols[7..36].copy_from_slice(&data_symbols[..29]);
+    channel_symbols[43..72].copy_from_slice(&data_symbols[29..]);
+    Some(channel_symbols)
+}
+
 pub fn write_rectangular_standard_wav(
     path: impl AsRef<Path>,
     first: &str,
