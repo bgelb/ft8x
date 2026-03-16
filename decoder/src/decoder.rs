@@ -8,9 +8,11 @@ use realfft::RealFftPlanner;
 use rustfft::{Fft, FftPlanner};
 use serde::Serialize;
 
-use crate::encode::channel_symbols_from_codeword_bits;
+use crate::encode::{
+    channel_symbols_from_codeword_bits, encode_standard_message, synthesize_channel_reference,
+};
 use crate::ldpc::ParityMatrix;
-use crate::message::{DecodedPayload, HashResolver, Payload, unpack_message};
+use crate::message::{DecodedPayload, GridReport, HashResolver, Payload, unpack_message};
 use crate::protocol::{
     FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES, FT8_TONE_SPACING_HZ,
     HOP_SAMPLES, HOPS_PER_SYMBOL, all_costas_positions,
@@ -119,6 +121,11 @@ struct BasebandPlan {
     inverse: Arc<dyn Fft<f32>>,
 }
 
+#[derive(Clone)]
+struct AprioriPattern {
+    llr_overrides: Vec<(usize, f32)>,
+}
+
 const LONG_INPUT_SAMPLES: usize = 15 * FT8_SAMPLE_RATE as usize;
 const LONG_FFT_SAMPLES: usize = 192_000;
 const DOWNSAMPLE_FACTOR: usize = 60;
@@ -127,6 +134,7 @@ const BASEBAND_SAMPLES: usize = LONG_FFT_SAMPLES / DOWNSAMPLE_FACTOR;
 const BASEBAND_SYMBOL_SAMPLES: usize = FT8_SYMBOL_SAMPLES / DOWNSAMPLE_FACTOR;
 const FFT_BIN_HZ: f32 = FT8_SAMPLE_RATE as f32 / LONG_FFT_SAMPLES as f32;
 const BASEBAND_TAPER_LEN: usize = 100;
+const AP_MAX_CANDIDATE_RANK: usize = 192;
 
 pub fn decode_wav_file(
     path: impl AsRef<Path>,
@@ -152,15 +160,28 @@ pub fn decode_pcm(
         ));
     }
 
-    let mut spectrogram = build_spectrogram(audio, options);
-    let long_spectrum = build_long_spectrum(audio);
+    let mut residual_audio = audio.clone();
     let baseband_plan = BasebandPlan::new();
     let parity = ParityMatrix::global();
     let mut top_candidates = Vec::new();
     let mut counters = DecodeCounters::default();
+    let initial_spectrogram = build_spectrogram(audio, options);
+    let frame_count = initial_spectrogram.frame_count;
+    let usable_bins = initial_spectrogram.usable_bins;
 
     let mut successes = Vec::<SuccessfulDecode>::new();
     for pass in 0..options.search_passes.max(1) {
+        let spectrogram = if pass == 0 {
+            Spectrogram {
+                bins: initial_spectrogram.bins.clone(),
+                frame_count: initial_spectrogram.frame_count,
+                usable_bins: initial_spectrogram.usable_bins,
+                min_bin: initial_spectrogram.min_bin,
+            }
+        } else {
+            build_spectrogram(&residual_audio, options)
+        };
+        let long_spectrum = build_long_spectrum(&residual_audio);
         let candidates = collect_candidates(&spectrogram, options);
         if pass == 0 {
             top_candidates = candidates.clone();
@@ -171,13 +192,15 @@ pub fn decode_pcm(
 
         let attempts: Vec<_> = candidates
             .par_iter()
+            .enumerate()
             .map(|candidate| {
                 let mut local_counters = DecodeCounters::default();
                 let success = try_candidate(
                     &spectrogram,
                     &long_spectrum,
                     &baseband_plan,
-                    candidate,
+                    candidate.0,
+                    candidate.1,
                     parity,
                     &mut local_counters,
                 );
@@ -214,7 +237,7 @@ pub fn decode_pcm(
         }
 
         for success in &pass_successes {
-            suppress_candidate(&mut spectrogram, success);
+            subtract_candidate(&mut residual_audio, success);
         }
         successes.extend(pass_successes);
     }
@@ -260,8 +283,8 @@ pub fn decode_pcm(
         sample_rate_hz: audio.sample_rate_hz,
         duration_seconds: audio.samples.len() as f32 / audio.sample_rate_hz as f32,
         diagnostics: DecodeDiagnostics {
-            frame_count: spectrogram.frame_count,
-            usable_bins: spectrogram.usable_bins,
+            frame_count,
+            usable_bins,
             examined_candidates: options.max_candidates,
             accepted_candidates: decodes.len(),
             ldpc_codewords: counters.ldpc_codewords,
@@ -364,31 +387,37 @@ fn collect_candidates(spectrogram: &Spectrogram, options: &DecodeOptions) -> Vec
     selected
 }
 
-fn suppress_candidate(spectrogram: &mut Spectrogram, success: &SuccessfulDecode) {
-    let start_frame =
-        ((success.candidate.start_seconds * FT8_SAMPLE_RATE as f32) / HOP_SAMPLES as f32).round() as isize;
-    let base_bin = (success.candidate.freq_hz / FT8_TONE_SPACING_HZ).round() as isize
-        - spectrogram.min_bin as isize;
+fn subtract_candidate(audio: &mut AudioBuffer, success: &SuccessfulDecode) {
     let Some(channel_symbols) = channel_symbols_from_codeword_bits(&success.codeword_bits) else {
         return;
     };
-    for (symbol_index, tone) in channel_symbols.into_iter().enumerate() {
-        let frame = start_frame + (symbol_index * HOPS_PER_SYMBOL) as isize;
-        let bin = base_bin + tone as isize;
-        for frame_delta in -1..=1 {
-            for bin_delta in -2..=2 {
-                let frame_index = frame + frame_delta;
-                let bin_index = bin + bin_delta;
-                if frame_index < 0
-                    || bin_index < 0
-                    || frame_index as usize >= spectrogram.frame_count
-                    || bin_index as usize >= spectrogram.usable_bins
-                {
-                    continue;
-                }
-                let row = frame_index as usize * spectrogram.usable_bins;
-                spectrogram.bins[row + bin_index as usize] = 0.0;
+    let start_sample =
+        (success.candidate.start_seconds * FT8_SAMPLE_RATE as f32).round() as isize;
+    let reference = synthesize_channel_reference(&channel_symbols, success.candidate.freq_hz);
+    for symbol_index in 0..FT8_MESSAGE_SYMBOLS {
+        let symbol_start = start_sample + (symbol_index * FT8_SYMBOL_SAMPLES) as isize;
+        let reference_start = symbol_index * FT8_SYMBOL_SAMPLES;
+        let mut acc = Complex32::new(0.0, 0.0);
+        let mut count = 0.0f32;
+        for offset in 0..FT8_SYMBOL_SAMPLES {
+            let index = symbol_start + offset as isize;
+            if index < 0 || index as usize >= audio.samples.len() {
+                continue;
             }
+            acc += reference[reference_start + offset].conj() * audio.samples[index as usize];
+            count += 1.0;
+        }
+        if count == 0.0 {
+            continue;
+        }
+        let coeff = acc / count;
+        for offset in 0..FT8_SYMBOL_SAMPLES {
+            let index = symbol_start + offset as isize;
+            if index < 0 || index as usize >= audio.samples.len() {
+                continue;
+            }
+            audio.samples[index as usize] -=
+                2.0 * (coeff * reference[reference_start + offset]).re;
         }
     }
 }
@@ -397,6 +426,7 @@ fn try_candidate(
     spectrogram: &Spectrogram,
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
+    candidate_rank: usize,
     candidate: &DecodeCandidate,
     parity: &ParityMatrix,
     counters: &mut DecodeCounters,
@@ -456,6 +486,31 @@ fn try_candidate(
                 match &best {
                     Some(existing) if existing.candidate.score >= success.candidate.score => {}
                     _ => best = Some(success),
+                }
+            }
+
+            if best.is_none() && candidate_rank < AP_MAX_CANDIDATE_RANK {
+                for pattern in apriori_patterns() {
+                    let llrs = apply_apriori(&refined.llr_sets[0], pattern);
+                    let Some((payload, bits, iterations)) = decode_llr_set(parity, &llrs, counters) else {
+                        continue;
+                    };
+                    let success = SuccessfulDecode {
+                        payload,
+                        codeword_bits: bits,
+                        candidate: DecodeCandidate {
+                            start_seconds: refined.start_seconds,
+                            dt_seconds: refined.start_seconds - 0.5,
+                            freq_hz: refined.freq_hz,
+                            score: refined.sync_score.max(candidate.score),
+                        },
+                        ldpc_iterations: iterations,
+                        snr_db: refined.snr_db,
+                    };
+                    match &best {
+                        Some(existing) if existing.candidate.score >= success.candidate.score => {}
+                        _ => best = Some(success),
+                    }
                 }
             }
         }
@@ -808,6 +863,37 @@ fn normalize_metric_vector(values: &mut [f32]) {
             *value /= sigma;
         }
     }
+}
+
+fn apriori_patterns() -> &'static [AprioriPattern] {
+    static PATTERNS: OnceLock<Vec<AprioriPattern>> = OnceLock::new();
+    PATTERNS.get_or_init(|| vec![prefix_pattern("CQ"), prefix_pattern("CQ DX")])
+}
+
+fn prefix_pattern(first: &str) -> AprioriPattern {
+    let frame = encode_standard_message(first, "K1ABC", false, &GridReport::Blank)
+        .expect("valid AP prefix frame");
+    let mut llr_overrides = Vec::with_capacity(32);
+    for bit_index in 0..29 {
+        llr_overrides.push((bit_index, bit_to_llr(frame.message_bits[bit_index])));
+    }
+    for bit_index in 74..77 {
+        llr_overrides.push((bit_index, bit_to_llr(frame.message_bits[bit_index])));
+    }
+    AprioriPattern { llr_overrides }
+}
+
+fn apply_apriori(llrs: &[f32], pattern: &AprioriPattern) -> Vec<f32> {
+    let mut adjusted = llrs.to_vec();
+    let apmag = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max).max(1.0) * 1.1;
+    for &(bit_index, sign) in &pattern.llr_overrides {
+        adjusted[bit_index] = apmag * sign;
+    }
+    adjusted
+}
+
+fn bit_to_llr(bit: u8) -> f32 {
+    if bit == 0 { -1.0 } else { 1.0 }
 }
 
 fn estimate_snr_db(symbols: &[[Complex32; 8]]) -> i32 {

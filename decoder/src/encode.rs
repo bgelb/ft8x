@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+use num_complex::Complex32;
 use thiserror::Error;
 
 use crate::crc::crc14_ft8;
 use crate::message::{GridReport, ReplyWord};
 use crate::protocol::{
     CALL_STANDARD_BASE, FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES,
-    FT8_TONE_SPACING_HZ, GRAY_TONES_TO_BITS,
+    GRAY_TONES_TO_BITS,
 };
 use crate::wave::{AudioBuffer, DecoderError, write_wav};
 
@@ -15,6 +16,7 @@ const MESSAGE_BITS: usize = 77;
 const INFO_BITS: usize = 91;
 const CODEWORD_BITS: usize = 174;
 const DATA_SYMBOLS: usize = 58;
+const GFSK_BT: f32 = 2.0;
 
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
@@ -128,24 +130,77 @@ pub fn synthesize_rectangular_waveform(
     }
 
     let mut samples = vec![0.0f32; total_samples];
-    let mut phase = 0.0f32;
-    for (symbol_index, tone) in frame.channel_symbols.iter().copied().enumerate() {
-        let symbol_start = start_sample + symbol_index * FT8_SYMBOL_SAMPLES;
-        let freq_hz = options.base_freq_hz + tone as f32 * FT8_TONE_SPACING_HZ;
-        let omega = 2.0 * std::f32::consts::PI * freq_hz / FT8_SAMPLE_RATE as f32;
-        for offset in 0..FT8_SYMBOL_SAMPLES {
-            samples[symbol_start + offset] = options.amplitude * phase.cos();
-            phase += omega;
-            if phase > std::f32::consts::PI {
-                phase -= 2.0 * std::f32::consts::PI;
-            }
-        }
+    let reference = synthesize_channel_reference(&frame.channel_symbols, options.base_freq_hz);
+    for (offset, sample) in reference.iter().enumerate() {
+        samples[start_sample + offset] = options.amplitude * sample.re;
     }
 
     Ok(AudioBuffer {
         sample_rate_hz: FT8_SAMPLE_RATE,
         samples,
     })
+}
+
+pub fn synthesize_channel_reference(
+    channel_symbols: &[u8; FT8_MESSAGE_SYMBOLS],
+    base_freq_hz: f32,
+) -> Vec<Complex32> {
+    let nsym = FT8_MESSAGE_SYMBOLS;
+    let nsps = FT8_SYMBOL_SAMPLES;
+    let pulse = gfsk_frequency_pulse(GFSK_BT, nsps);
+    let mut dphi = vec![0.0f32; (nsym + 2) * nsps];
+    let dphi_peak = 2.0 * std::f32::consts::PI / nsps as f32;
+    for (symbol_index, tone) in channel_symbols.iter().copied().enumerate() {
+        let start = symbol_index * nsps;
+        for offset in 0..(3 * nsps) {
+            dphi[start + offset] += dphi_peak * pulse[offset] * tone as f32;
+        }
+    }
+    for offset in 0..(2 * nsps) {
+        dphi[offset] += dphi_peak * channel_symbols[0] as f32 * pulse[nsps + offset];
+        dphi[nsym * nsps + offset] += dphi_peak * channel_symbols[nsym - 1] as f32 * pulse[offset];
+    }
+
+    let mut phase = 0.0f32;
+    let carrier_step = 2.0 * std::f32::consts::PI * base_freq_hz / FT8_SAMPLE_RATE as f32;
+    let mut reference = vec![Complex32::new(0.0, 0.0); nsym * nsps];
+    for (index, sample) in reference.iter_mut().enumerate() {
+        *sample = Complex32::new(phase.cos(), phase.sin());
+        phase = (phase + carrier_step + dphi[index + nsps]).rem_euclid(2.0 * std::f32::consts::PI);
+    }
+
+    let ramp_samples = (nsps as f32 / 8.0).round() as usize;
+    for offset in 0..ramp_samples {
+        let phase = std::f32::consts::PI * offset as f32 / (2.0 * ramp_samples as f32);
+        let start_gain = phase.sin().powi(2);
+        let end_gain = phase.cos().powi(2);
+        reference[offset] *= start_gain;
+        let tail_index = reference.len() - ramp_samples + offset;
+        reference[tail_index] *= end_gain;
+    }
+    reference
+}
+
+fn gfsk_frequency_pulse(bt: f32, nsps: usize) -> Vec<f32> {
+    let c = std::f32::consts::PI * (2.0 / std::f32::consts::LN_2).sqrt();
+    (0..(3 * nsps))
+        .map(|index| {
+            let t = (index as f32 + 1.0 - 1.5 * nsps as f32) / nsps as f32;
+            0.5 * (erf_approx(c * bt * (t + 0.5)) - erf_approx(c * bt * (t - 0.5)))
+        })
+        .collect()
+}
+
+fn erf_approx(x: f32) -> f32 {
+    let sign = x.signum();
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp();
+    sign * y
 }
 
 pub fn channel_symbols_from_codeword_bits(
