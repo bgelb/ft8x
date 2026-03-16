@@ -1025,3 +1025,199 @@ def generate_report(paths: Paths, results_path: Path | None = None) -> Path:
             shutil.rmtree(latest_dir)
     shutil.copytree(report_dir, latest_dir)
     return html_path
+
+
+def invoke_local_decoder(binary_path: Path, sample_path: Path) -> dict[str, Any]:
+    started_at = time.monotonic()
+    completed = subprocess.Popen(
+        [str(binary_path), str(sample_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _, status, rusage = os.wait4(completed.pid, 0)
+    stdout, stderr = completed.communicate()
+    elapsed = time.monotonic() - started_at
+    exit_code = os.waitstatus_to_exitcode(status)
+    if exit_code != 0:
+        raise subprocess.CalledProcessError(exit_code, [str(binary_path), str(sample_path)], stdout, stderr)
+    if stderr.strip():
+        stdout = stdout + ("\n" if stdout and not stdout.endswith("\n") else "") + stderr
+    return {
+        "stdout": stdout,
+        "wall_seconds": elapsed,
+        "cpu_user_seconds": rusage.ru_utime,
+        "cpu_system_seconds": rusage.ru_stime,
+        "cpu_seconds": rusage.ru_utime + rusage.ru_stime,
+    }
+
+
+def summarize_decoder_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        entry = grouped.setdefault(
+            run["dataset_id"],
+            {
+                "dataset_id": run["dataset_id"],
+                "dataset_label": run["dataset_label"],
+                "dataset_kind": run["dataset_kind"],
+                "samples": 0,
+                "decode_count": 0,
+                "truth_count": 0,
+                "wall_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "cpu_system_seconds": 0.0,
+                "cpu_seconds": 0.0,
+                "tp": 0,
+                "fp": 0,
+                "fn": 0,
+            },
+        )
+        entry["samples"] += 1
+        entry["decode_count"] += run["decode_count"]
+        entry["truth_count"] += run["truth_count"]
+        entry["wall_seconds"] += run.get("wall_seconds") or 0.0
+        entry["cpu_user_seconds"] += run.get("cpu_user_seconds") or 0.0
+        entry["cpu_system_seconds"] += run.get("cpu_system_seconds") or 0.0
+        entry["cpu_seconds"] += run.get("cpu_seconds") or 0.0
+        if run["metrics"]:
+            entry["tp"] += run["metrics"]["tp"]
+            entry["fp"] += run["metrics"]["fp"]
+            entry["fn"] += run["metrics"]["fn"]
+    summary = sorted(grouped.values(), key=lambda item: item["dataset_id"])
+    for entry in summary:
+        entry["avg_wall_seconds"] = entry["wall_seconds"] / entry["samples"] if entry["samples"] else None
+        entry["avg_cpu_user_seconds"] = entry["cpu_user_seconds"] / entry["samples"] if entry["samples"] else None
+        entry["avg_cpu_system_seconds"] = entry["cpu_system_seconds"] / entry["samples"] if entry["samples"] else None
+        entry["avg_cpu_seconds"] = entry["cpu_seconds"] / entry["samples"] if entry["samples"] else None
+        if entry["dataset_kind"] == "scored":
+            predicted = entry["tp"] + entry["fp"]
+            expected = entry["tp"] + entry["fn"]
+            entry["precision"] = entry["tp"] / predicted if predicted else 0.0
+            entry["recall"] = entry["tp"] / expected if expected else 0.0
+            precision = entry["precision"]
+            recall = entry["recall"]
+            entry["f1"] = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        else:
+            entry["precision"] = None
+            entry["recall"] = None
+            entry["f1"] = None
+    return summary
+
+
+def write_decoder_summary_csv(path: Path, summary_rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "dataset_id",
+                "dataset_kind",
+                "samples",
+                "decode_count",
+                "truth_count",
+                "wall_seconds",
+                "cpu_user_seconds",
+                "cpu_system_seconds",
+                "cpu_seconds",
+                "avg_wall_seconds",
+                "avg_cpu_user_seconds",
+                "avg_cpu_system_seconds",
+                "avg_cpu_seconds",
+                "tp",
+                "fp",
+                "fn",
+                "precision",
+                "recall",
+                "f1",
+            ],
+        )
+        writer.writeheader()
+        for row in summary_rows:
+            writer.writerow({key: row.get(key) for key in writer.fieldnames})
+
+
+def run_rust_benchmark(
+    paths: Paths,
+    binary_path: Path,
+    datasets: list[str] | None = None,
+    sample_limit: int | None = None,
+) -> dict[str, Any]:
+    if not binary_path.exists():
+        raise FileNotFoundError(f"Missing decoder binary: {binary_path}")
+
+    dataset_payload = load_or_discover_datasets(paths)
+    dataset_filter = set(datasets or [])
+    sync_samples(paths, dataset_filter or None, sample_limit)
+
+    selected_datasets = [
+        dataset
+        for dataset in dataset_payload["datasets"]
+        if not dataset_filter or dataset["id"] in dataset_filter
+    ]
+    run_id = f"rust-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    run_dir = paths.results / run_id
+    raw_dir = run_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    runs: list[dict[str, Any]] = []
+    total_jobs = sum(
+        len(dataset["samples"][:sample_limit] if sample_limit is not None else dataset["samples"])
+        for dataset in selected_datasets
+    )
+    completed_jobs = 0
+    for dataset in selected_datasets:
+        sample_entries = dataset["samples"][:sample_limit] if sample_limit is not None else dataset["samples"]
+        for sample in sample_entries:
+            sample_dir = paths.samples / dataset["id"] / sample["id"]
+            wav_path = sample_dir / f"{sample['id']}.wav"
+            truth_path = sample_dir / f"{sample['id']}.txt"
+            result = invoke_local_decoder(binary_path, wav_path)
+            stdout = result["stdout"]
+            raw_output_path = raw_dir / dataset["id"] / f"{sample['id']}.txt"
+            raw_output_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_output_path.write_text(stdout)
+            decodes = parse_decode_lines(stdout)
+            truth = parse_truth_file(truth_path) if truth_path.exists() else []
+            metrics = compare_decodes(decodes, truth) if truth else None
+            runs.append(
+                {
+                    "decoder_id": "rust-ft8",
+                    "decoder_label": "Rust FT8 Decoder",
+                    "binary_path": str(binary_path),
+                    "dataset_id": dataset["id"],
+                    "dataset_label": dataset["label"],
+                    "dataset_kind": dataset["kind"],
+                    "sample_id": sample["id"],
+                    "raw_output_path": str(raw_output_path),
+                    "decode_count": len(decodes),
+                    "truth_count": len(truth),
+                    "wall_seconds": result["wall_seconds"],
+                    "cpu_user_seconds": result["cpu_user_seconds"],
+                    "cpu_system_seconds": result["cpu_system_seconds"],
+                    "cpu_seconds": result["cpu_seconds"],
+                    "decodes": decodes,
+                    "truth": truth,
+                    "metrics": metrics,
+                }
+            )
+            completed_jobs += 1
+            print(f"[{completed_jobs}/{total_jobs}] rust-ft8 {dataset['id']} {sample['id']}", flush=True)
+
+    summary_rows = summarize_decoder_runs(runs)
+    payload = {
+        "generated_at": utc_now(),
+        "run_id": run_id,
+        "decoder_id": "rust-ft8",
+        "decoder_label": "Rust FT8 Decoder",
+        "binary_path": str(binary_path),
+        "datasets": [
+            {"id": dataset["id"], "label": dataset["label"], "kind": dataset["kind"]}
+            for dataset in selected_datasets
+        ],
+        "runs": runs,
+        "summary": summary_rows,
+    }
+    write_json(run_dir / "results.json", payload)
+    write_decoder_summary_csv(run_dir / "summary.csv", summary_rows)
+    return payload

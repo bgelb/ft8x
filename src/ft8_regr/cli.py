@@ -9,6 +9,7 @@ from .core import (
     discover_releases,
     ensure_directories,
     generate_report,
+    run_rust_benchmark,
     run_benchmarks,
     sync_releases,
     sync_samples,
@@ -46,6 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--sample-limit", type=int, help="Limit samples per dataset")
     run_parser.add_argument("--force", action="store_true", help="Re-run existing raw decode jobs")
     run_parser.add_argument("--jobs", type=int, help="Concurrent decoder jobs to run")
+
+    rust_parser = subparsers.add_parser("run-rust", help="Run the Rust FT8 decoder benchmark")
+    rust_parser.add_argument("--datasets", nargs="*", help="Dataset ids to benchmark")
+    rust_parser.add_argument("--sample-limit", type=int, help="Limit samples per dataset")
+    rust_parser.add_argument(
+        "--binary",
+        default="decoder/target/release/ft8-decoder",
+        help="Path to the ft8-decoder binary.",
+    )
 
     report_parser = subparsers.add_parser("report", help="Render static HTML report")
     report_parser.add_argument("--results", help="Optional path to a results.json file")
@@ -92,6 +102,16 @@ def main() -> None:
         report_path = generate_report(paths, paths.results / payload["run_id"] / "results.json")
         print(f"results written to {paths.results / payload['run_id']}")
         print(f"report written to {report_path}")
+        return
+
+    if args.command == "run-rust":
+        payload = run_rust_benchmark(
+            paths,
+            binary_path=Path(args.binary).resolve(),
+            datasets=args.datasets,
+            sample_limit=args.sample_limit,
+        )
+        print(f"results written to {paths.results / payload['run_id']}")
         return
 
     if args.command == "report":
