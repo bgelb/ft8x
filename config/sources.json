@@ -1,0 +1,44 @@
+{
+  "release_source": {
+    "id": "sourceforge-wsjtx",
+    "index_url": "https://sourceforge.net/projects/wsjt/files/",
+    "download_url_template": "https://sourceforge.net/projects/wsjt/files/wsjtx-{version}/wsjtx-{version}-Darwin.dmg/download",
+    "minimum_version": "2.0.0",
+    "include_prerelease_major_min": 3
+  },
+  "datasets": [
+    {
+      "id": "kgoba-ft8-lib",
+      "label": "kgoba/ft8_lib test/wav",
+      "kind": "scored",
+      "listing_url": "https://api.github.com/repos/kgoba/ft8_lib/contents/test/wav",
+      "description": "Labeled FT8 WAV corpus with companion .txt decode expectations.",
+      "pair_text_files": true
+    },
+    {
+      "id": "d9394-ft8-test-wave",
+      "label": "d9394/ft8_test_wave",
+      "kind": "unscored",
+      "listing_url": "https://api.github.com/repos/d9394/ft8_test_wave/contents",
+      "description": "Unlabeled FT8 WAV captures useful for exploratory coverage.",
+      "pair_text_files": false
+    }
+  ],
+  "profiles": [
+    {
+      "id": "quick",
+      "label": "Quick (depth 1)",
+      "depth": 1
+    },
+    {
+      "id": "medium",
+      "label": "Medium (depth 2)",
+      "depth": 2
+    },
+    {
+      "id": "deepest",
+      "label": "Deepest (depth 3)",
+      "depth": 3
+    }
+  ]
+}
