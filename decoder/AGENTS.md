@@ -13,3 +13,15 @@
   - a protocol or signal-model explanation,
   - a clean empirical validation against synthetic and corpus data,
   - or a named/tunable configuration point in the Rust implementation.
+
+## Investigation Notes
+
+- Prefer corpus-level A/B runs over intuition. Several plausible-looking changes were neutral or harmful, and the harness results made that obvious quickly.
+- After any structural decoder change, inspect worst samples individually and determine whether misses are absent from the candidate list or present-but-failing downstream. That split has been the fastest way to localize the real bottleneck.
+- Compare against the exact WSJT-X path being targeted, not a guessed profile. For FT8 this matters because `quick`, `medium`, and `deepest` differ materially, and single-file `jt9` runs still enable more machinery than they first appear to.
+- When borrowing ideas from WSJT-X, inspect the whole local mechanism around them. Reading only one routine in isolation led to a bad early `sync8` port; reading `sync8`, `ft8_decode`, `ft8b`, `sync8d`, and `ft8_downsample` together was much more effective.
+- Candidate-budget and subtraction changes can produce large recall jumps without changing message priors. Use those before reaching for AP or other rescue-style mechanisms.
+- If a missed truth already appears as a strong coarse candidate, stop tuning candidate search and move deeper into refinement, soft metrics, or LDPC/OSD.
+- Keep synthetic waveform validation in place, but do not trust it as a proxy for corpus readiness. The corpus failures have mostly been dense-scene weak-signal interactions, not legality of generated signals.
+- For stubborn misses, probe the exact truth `dt/freq` through a dedicated candidate-debug path before changing algorithms. That distinguishes “candidate exists but the decoder cannot recover it” from “the search/refinement handoff is dropping it.”
+- When a miss decodes at its exact truth coordinates but not in the normal run, inspect boundary handling first. This directly exposed the negative-`dt` coarse-candidate rejection bug, which was worth a large recall jump on the corpus.

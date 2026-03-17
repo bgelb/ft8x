@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 use ft8_decoder::{
-    DecodeOptions, GridReport, WaveformOptions, decode_wav_file, parse_standard_info,
-    write_rectangular_standard_wav,
+    DecodeOptions, GridReport, WaveformOptions, debug_candidate_wav_file, decode_wav_file,
+    parse_standard_info, write_rectangular_standard_wav,
 };
 
 #[derive(Debug, Parser)]
@@ -35,6 +35,19 @@ enum Command {
 
         #[arg(long, default_value_t = 200)]
         max_successes: usize,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugCandidate {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
 
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
@@ -104,6 +117,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "{} {:>4} {:>5.2} {:>4.0} ~ {}",
                     decode.utc, decode.snr_db, decode.dt_seconds, decode.freq_hz, decode.text
                 );
+            }
+        }
+        Command::DebugCandidate {
+            wav,
+            dt_seconds,
+            freq_hz,
+            pretty,
+        } => {
+            let report = debug_candidate_wav_file(&wav, dt_seconds, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
             }
         }
         Command::GenerateStandard {

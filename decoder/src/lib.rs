@@ -7,7 +7,8 @@ mod protocol;
 mod wave;
 
 pub use decoder::{
-    DecodeCandidate, DecodeDiagnostics, DecodeOptions, DecodeReport, DecodedMessage, decode_pcm,
+    CandidateDebugReport, CandidatePassDebug, DecodeCandidate, DecodeDiagnostics, DecodeOptions,
+    DecodeReport, DecodedMessage, debug_candidate_pcm, debug_candidate_wav_file, decode_pcm,
     decode_wav_file,
 };
 pub use encode::{
