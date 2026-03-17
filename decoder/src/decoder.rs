@@ -31,8 +31,8 @@ impl Default for DecodeOptions {
         Self {
             min_freq_hz: 200.0,
             max_freq_hz: 3_000.0,
-            max_candidates: 192,
-            max_successes: 64,
+            max_candidates: 600,
+            max_successes: 200,
             search_passes: 3,
         }
     }
@@ -465,7 +465,6 @@ fn try_candidate(
             {
                 continue;
             }
-
             let coarse_freq_hz = (spectrogram.min_bin + candidate_bin) as f32 * FT8_TONE_SPACING_HZ;
             let coarse_start_seconds = candidate_frame as f32 * HOP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32;
             let Some(refined) = refine_candidate(

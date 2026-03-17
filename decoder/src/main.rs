@@ -30,10 +30,10 @@ enum Command {
         #[arg(long, default_value_t = 3000.0)]
         max_freq_hz: f32,
 
-        #[arg(long, default_value_t = 128)]
+        #[arg(long, default_value_t = 600)]
         max_candidates: usize,
 
-        #[arg(long, default_value_t = 64)]
+        #[arg(long, default_value_t = 200)]
         max_successes: usize,
 
         #[arg(long, action = ArgAction::SetTrue)]
