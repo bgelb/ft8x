@@ -119,6 +119,13 @@ struct BasebandPlan {
     inverse: Arc<dyn Fft<f32>>,
 }
 
+struct SubtractionPlan {
+    forward: Arc<dyn Fft<f32>>,
+    inverse: Arc<dyn Fft<f32>>,
+    filter_spectrum: Vec<Complex32>,
+    edge_correction: Vec<f32>,
+}
+
 const LONG_INPUT_SAMPLES: usize = 15 * FT8_SAMPLE_RATE as usize;
 const LONG_FFT_SAMPLES: usize = 192_000;
 const DOWNSAMPLE_FACTOR: usize = 60;
@@ -127,6 +134,8 @@ const BASEBAND_SAMPLES: usize = LONG_FFT_SAMPLES / DOWNSAMPLE_FACTOR;
 const BASEBAND_SYMBOL_SAMPLES: usize = FT8_SYMBOL_SAMPLES / DOWNSAMPLE_FACTOR;
 const FFT_BIN_HZ: f32 = FT8_SAMPLE_RATE as f32 / LONG_FFT_SAMPLES as f32;
 const BASEBAND_TAPER_LEN: usize = 100;
+const SUBTRACT_FILTER_SAMPLES: usize = 4_000;
+const SUBTRACT_FILTER_HALF: usize = SUBTRACT_FILTER_SAMPLES / 2;
 
 pub fn decode_wav_file(
     path: impl AsRef<Path>,
@@ -154,6 +163,7 @@ pub fn decode_pcm(
 
     let mut residual_audio = audio.clone();
     let baseband_plan = BasebandPlan::new();
+    let subtraction_plan = SubtractionPlan::global();
     let parity = ParityMatrix::global();
     let mut top_candidates = Vec::new();
     let mut counters = DecodeCounters::default();
@@ -227,7 +237,7 @@ pub fn decode_pcm(
         }
 
         for success in &pass_successes {
-            subtract_candidate(&mut residual_audio, success);
+            subtract_candidate(&mut residual_audio, success, subtraction_plan);
         }
         successes.extend(pass_successes);
     }
@@ -377,38 +387,50 @@ fn collect_candidates(spectrogram: &Spectrogram, options: &DecodeOptions) -> Vec
     selected
 }
 
-fn subtract_candidate(audio: &mut AudioBuffer, success: &SuccessfulDecode) {
+fn subtract_candidate(
+    audio: &mut AudioBuffer,
+    success: &SuccessfulDecode,
+    plan: &SubtractionPlan,
+) {
     let Some(channel_symbols) = channel_symbols_from_codeword_bits(&success.codeword_bits) else {
         return;
     };
     let start_sample =
         (success.candidate.start_seconds * FT8_SAMPLE_RATE as f32).round() as isize;
     let reference = synthesize_channel_reference(&channel_symbols, success.candidate.freq_hz);
-    for symbol_index in 0..FT8_MESSAGE_SYMBOLS {
-        let symbol_start = start_sample + (symbol_index * FT8_SYMBOL_SAMPLES) as isize;
-        let reference_start = symbol_index * FT8_SYMBOL_SAMPLES;
-        let mut acc = Complex32::new(0.0, 0.0);
-        let mut count = 0.0f32;
-        for offset in 0..FT8_SYMBOL_SAMPLES {
-            let index = symbol_start + offset as isize;
-            if index < 0 || index as usize >= audio.samples.len() {
-                continue;
-            }
-            acc += reference[reference_start + offset].conj() * audio.samples[index as usize];
-            count += 1.0;
-        }
-        if count == 0.0 {
+    let frame_len = reference.len();
+    let mut envelope = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
+    for (offset, sample) in reference.iter().enumerate() {
+        let index = start_sample + offset as isize;
+        if index < 0 || index as usize >= audio.samples.len() {
             continue;
         }
-        let coeff = acc / count;
-        for offset in 0..FT8_SYMBOL_SAMPLES {
-            let index = symbol_start + offset as isize;
-            if index < 0 || index as usize >= audio.samples.len() {
-                continue;
-            }
-            audio.samples[index as usize] -=
-                2.0 * (coeff * reference[reference_start + offset]).re;
+        envelope[offset] = sample.conj() * audio.samples[index as usize];
+    }
+
+    plan.forward.process(&mut envelope);
+    for (value, filter) in envelope.iter_mut().zip(&plan.filter_spectrum) {
+        *value *= *filter;
+    }
+    plan.inverse.process(&mut envelope);
+    let scale = 1.0 / LONG_INPUT_SAMPLES as f32;
+    for value in &mut envelope {
+        *value *= scale;
+    }
+
+    for offset in 0..frame_len {
+        let index = start_sample + offset as isize;
+        if index < 0 || index as usize >= audio.samples.len() {
+            continue;
         }
+        let edge = offset.min(frame_len - 1 - offset);
+        let correction = if edge < plan.edge_correction.len() {
+            plan.edge_correction[edge]
+        } else {
+            1.0
+        };
+        let coeff = envelope[offset] * correction;
+        audio.samples[index as usize] -= 2.0 * (coeff * reference[offset]).re;
     }
 }
 
@@ -560,6 +582,53 @@ impl BasebandPlan {
         let mut planner = FftPlanner::<f32>::new();
         Self {
             inverse: planner.plan_fft_inverse(BASEBAND_SAMPLES),
+        }
+    }
+}
+
+impl SubtractionPlan {
+    fn global() -> &'static Self {
+        static PLAN: OnceLock<SubtractionPlan> = OnceLock::new();
+        PLAN.get_or_init(Self::new)
+    }
+
+    fn new() -> Self {
+        let mut planner = FftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(LONG_INPUT_SAMPLES);
+        let inverse = planner.plan_fft_inverse(LONG_INPUT_SAMPLES);
+
+        let mut window = Vec::with_capacity(SUBTRACT_FILTER_SAMPLES + 1);
+        for tap in -(SUBTRACT_FILTER_HALF as isize)..=(SUBTRACT_FILTER_HALF as isize) {
+            let phase =
+                std::f32::consts::PI * tap as f32 / SUBTRACT_FILTER_SAMPLES as f32;
+            window.push(phase.cos().powi(2));
+        }
+        let sumw = window.iter().copied().sum::<f32>();
+
+        let mut kernel = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
+        for (index, weight) in window.iter().copied().enumerate() {
+            let lag = index as isize - SUBTRACT_FILTER_HALF as isize;
+            let slot = if lag < 0 {
+                (LONG_INPUT_SAMPLES as isize + lag) as usize
+            } else {
+                lag as usize
+            };
+            kernel[slot] = Complex32::new(weight / sumw, 0.0);
+        }
+        forward.process(&mut kernel);
+
+        let mut edge_correction = Vec::with_capacity(SUBTRACT_FILTER_HALF + 1);
+        for edge in 0..=SUBTRACT_FILTER_HALF {
+            let first = SUBTRACT_FILTER_HALF - edge;
+            let available = window[first..].iter().copied().sum::<f32>();
+            edge_correction.push((sumw / available).max(1.0));
+        }
+
+        Self {
+            forward,
+            inverse,
+            filter_spectrum: kernel,
+            edge_correction,
         }
     }
 }
