@@ -8,11 +8,9 @@ use realfft::RealFftPlanner;
 use rustfft::{Fft, FftPlanner};
 use serde::Serialize;
 
-use crate::encode::{
-    channel_symbols_from_codeword_bits, encode_standard_message, synthesize_channel_reference,
-};
+use crate::encode::{channel_symbols_from_codeword_bits, synthesize_channel_reference};
 use crate::ldpc::ParityMatrix;
-use crate::message::{DecodedPayload, GridReport, HashResolver, Payload, unpack_message};
+use crate::message::{DecodedPayload, HashResolver, Payload, unpack_message};
 use crate::protocol::{
     FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES, FT8_TONE_SPACING_HZ,
     HOP_SAMPLES, HOPS_PER_SYMBOL, all_costas_positions,
@@ -121,11 +119,6 @@ struct BasebandPlan {
     inverse: Arc<dyn Fft<f32>>,
 }
 
-#[derive(Clone)]
-struct AprioriPattern {
-    llr_overrides: Vec<(usize, f32)>,
-}
-
 const LONG_INPUT_SAMPLES: usize = 15 * FT8_SAMPLE_RATE as usize;
 const LONG_FFT_SAMPLES: usize = 192_000;
 const DOWNSAMPLE_FACTOR: usize = 60;
@@ -134,7 +127,6 @@ const BASEBAND_SAMPLES: usize = LONG_FFT_SAMPLES / DOWNSAMPLE_FACTOR;
 const BASEBAND_SYMBOL_SAMPLES: usize = FT8_SYMBOL_SAMPLES / DOWNSAMPLE_FACTOR;
 const FFT_BIN_HZ: f32 = FT8_SAMPLE_RATE as f32 / LONG_FFT_SAMPLES as f32;
 const BASEBAND_TAPER_LEN: usize = 100;
-const AP_MAX_CANDIDATE_RANK: usize = 192;
 
 pub fn decode_wav_file(
     path: impl AsRef<Path>,
@@ -192,15 +184,13 @@ pub fn decode_pcm(
 
         let attempts: Vec<_> = candidates
             .par_iter()
-            .enumerate()
             .map(|candidate| {
                 let mut local_counters = DecodeCounters::default();
                 let success = try_candidate(
                     &spectrogram,
                     &long_spectrum,
                     &baseband_plan,
-                    candidate.0,
-                    candidate.1,
+                    candidate,
                     parity,
                     &mut local_counters,
                 );
@@ -426,7 +416,6 @@ fn try_candidate(
     spectrogram: &Spectrogram,
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
-    candidate_rank: usize,
     candidate: &DecodeCandidate,
     parity: &ParityMatrix,
     counters: &mut DecodeCounters,
@@ -486,31 +475,6 @@ fn try_candidate(
                 match &best {
                     Some(existing) if existing.candidate.score >= success.candidate.score => {}
                     _ => best = Some(success),
-                }
-            }
-
-            if best.is_none() && candidate_rank < AP_MAX_CANDIDATE_RANK {
-                for pattern in apriori_patterns() {
-                    let llrs = apply_apriori(&refined.llr_sets[0], pattern);
-                    let Some((payload, bits, iterations)) = decode_llr_set(parity, &llrs, counters) else {
-                        continue;
-                    };
-                    let success = SuccessfulDecode {
-                        payload,
-                        codeword_bits: bits,
-                        candidate: DecodeCandidate {
-                            start_seconds: refined.start_seconds,
-                            dt_seconds: refined.start_seconds - 0.5,
-                            freq_hz: refined.freq_hz,
-                            score: refined.sync_score.max(candidate.score),
-                        },
-                        ldpc_iterations: iterations,
-                        snr_db: refined.snr_db,
-                    };
-                    match &best {
-                        Some(existing) if existing.candidate.score >= success.candidate.score => {}
-                        _ => best = Some(success),
-                    }
                 }
             }
         }
@@ -863,37 +827,6 @@ fn normalize_metric_vector(values: &mut [f32]) {
             *value /= sigma;
         }
     }
-}
-
-fn apriori_patterns() -> &'static [AprioriPattern] {
-    static PATTERNS: OnceLock<Vec<AprioriPattern>> = OnceLock::new();
-    PATTERNS.get_or_init(|| vec![prefix_pattern("CQ"), prefix_pattern("CQ DX")])
-}
-
-fn prefix_pattern(first: &str) -> AprioriPattern {
-    let frame = encode_standard_message(first, "K1ABC", false, &GridReport::Blank)
-        .expect("valid AP prefix frame");
-    let mut llr_overrides = Vec::with_capacity(32);
-    for bit_index in 0..29 {
-        llr_overrides.push((bit_index, bit_to_llr(frame.message_bits[bit_index])));
-    }
-    for bit_index in 74..77 {
-        llr_overrides.push((bit_index, bit_to_llr(frame.message_bits[bit_index])));
-    }
-    AprioriPattern { llr_overrides }
-}
-
-fn apply_apriori(llrs: &[f32], pattern: &AprioriPattern) -> Vec<f32> {
-    let mut adjusted = llrs.to_vec();
-    let apmag = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max).max(1.0) * 1.1;
-    for &(bit_index, sign) in &pattern.llr_overrides {
-        adjusted[bit_index] = apmag * sign;
-    }
-    adjusted
-}
-
-fn bit_to_llr(bit: u8) -> f32 {
-    if bit == 0 { -1.0 } else { 1.0 }
 }
 
 fn estimate_snr_db(symbols: &[[Complex32; 8]]) -> i32 {
