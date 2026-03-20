@@ -1036,12 +1036,9 @@ fn try_candidate(
                 }
 
                 if !refined_hit {
-                    if let Some((payload, bits, iterations)) = decode_llr_set(
-                        parity,
-                        &refined.symbol_bit_llrs,
-                        max_osd,
-                        counters,
-                    ) {
+                    if let Some((payload, bits, iterations)) =
+                        decode_llr_set(parity, &refined.symbol_bit_llrs, max_osd, counters)
+                    {
                         let success = SuccessfulDecode {
                             payload,
                             codeword_bits: bits,

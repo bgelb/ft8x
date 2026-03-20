@@ -5,7 +5,7 @@ use crate::protocol::GRAY_TONES_TO_BITS;
 
 const MAX_ITERS: usize = 30;
 const OSD_NT: usize = 40;
-const OSD_NTHETA: usize = 10;
+const OSD_NTHETA: usize = 12;
 
 #[derive(Debug)]
 pub struct ParityMatrix {
