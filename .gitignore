@@ -4,3 +4,6 @@ __pycache__/
 artifacts/
 
 decoder/target/
+decoded.txt
+jt9_wisdom.dat
+timer.out

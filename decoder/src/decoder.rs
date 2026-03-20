@@ -126,6 +126,7 @@ struct DecodeCounters {
 
 struct SearchResult {
     successes: Vec<SuccessfulDecode>,
+    residual_audio: AudioBuffer,
     frame_count: usize,
     usable_bins: usize,
     top_candidates: Vec<DecodeCandidate>,
@@ -163,8 +164,8 @@ const SYNC8_FFT_SAMPLES: usize = FT8_SYMBOL_SAMPLES * 2;
 const SYNC8_STEP_SAMPLES: usize = FT8_SYMBOL_SAMPLES / 4;
 const SYNC8_MAX_LAG: isize = 62;
 const SYNC8_LOCAL_LAG: isize = 10;
-const SYNC8_THRESHOLD: f32 = 1.5;
-const SYNC8_EARLY_THRESHOLD: f32 = 1.9;
+const SYNC8_THRESHOLD: f32 = 1.6;
+const SYNC8_EARLY_THRESHOLD: f32 = 2.0;
 const BASEBAND_RATE_HZ: f32 = FT8_SAMPLE_RATE as f32 / DOWNSAMPLE_FACTOR as f32;
 const BASEBAND_SAMPLES: usize = LONG_FFT_SAMPLES / DOWNSAMPLE_FACTOR;
 const BASEBAND_SYMBOL_SAMPLES: usize = FT8_SYMBOL_SAMPLES / DOWNSAMPLE_FACTOR;
@@ -212,20 +213,10 @@ pub fn debug_candidate_pcm(
     let mut passes = Vec::new();
     let resolver = HashResolver::default();
 
-    for (index, llrs) in refined.llr_sets.iter().enumerate() {
-        let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
-        let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-        let decoded = decode_llr_set(parity, llrs, &mut counters).map(|(payload, _, iterations)| {
-            let rendered = payload.render(&resolver);
-            (rendered.text, iterations)
-        });
-        passes.push(CandidatePassDebug {
-            pass_name: format!("regular-{}", index + 1),
-            mean_abs_llr,
-            max_abs_llr,
-            decoded_text: decoded.as_ref().map(|(text, _)| text.clone()),
-            ldpc_iterations: decoded.map(|(_, iterations)| iterations),
-        });
+    append_debug_passes(&mut passes, "regular", &refined.llr_sets, parity, &mut counters, &resolver);
+
+    if let Some(seed) = extract_candidate_at(&long_spectrum, &baseband_plan, dt_seconds + 0.5, freq_hz) {
+        append_debug_passes(&mut passes, "seed", &seed.llr_sets, parity, &mut counters, &resolver);
     }
 
     let ap_magnitude = refined.llr_sets[0]
@@ -270,6 +261,31 @@ pub fn debug_candidate_pcm(
     })
 }
 
+fn append_debug_passes(
+    passes: &mut Vec<CandidatePassDebug>,
+    prefix: &str,
+    llr_sets: &[Vec<f32>; 4],
+    parity: &ParityMatrix,
+    counters: &mut DecodeCounters,
+    resolver: &HashResolver,
+) {
+    for (index, llrs) in llr_sets.iter().enumerate() {
+        let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
+        let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
+        let decoded = decode_llr_set(parity, llrs, counters).map(|(payload, _, iterations)| {
+            let rendered = payload.render(resolver);
+            (rendered.text, iterations)
+        });
+        passes.push(CandidatePassDebug {
+            pass_name: format!("{prefix}-{}", index + 1),
+            mean_abs_llr,
+            max_abs_llr,
+            decoded_text: decoded.as_ref().map(|(text, _)| text.clone()),
+            ldpc_iterations: decoded.map(|(_, iterations)| iterations),
+        });
+    }
+}
+
 pub fn decode_pcm(
     audio: &AudioBuffer,
     options: &DecodeOptions,
@@ -287,47 +303,62 @@ pub fn decode_pcm(
     }
 
     let subtraction_plan = SubtractionPlan::global();
-    let early_successes = if audio.samples.len() >= EARLY_41_SAMPLES {
+    let early41 = if audio.samples.len() >= EARLY_41_SAMPLES {
         let early_audio = zero_tail(audio, EARLY_41_SAMPLES);
-        run_decode_search(
+        Some(run_decode_search(
             &early_audio,
             options,
             None,
             Vec::new(),
             SYNC8_EARLY_THRESHOLD,
             false,
-        )
-        .successes
-    } else {
-        Vec::new()
-    };
-    let prepared_full = if !early_successes.is_empty() && audio.samples.len() >= EARLY_47_SAMPLES {
-        let mut partial47 = zero_tail(audio, EARLY_47_SAMPLES);
-        let mut subtracted = vec![false; early_successes.len()];
-        for (index, success) in early_successes.iter().enumerate() {
-            if success.candidate.dt_seconds < 0.396 {
-                subtract_candidate(&mut partial47, success, subtraction_plan);
-                subtracted[index] = true;
-            }
-        }
-
-        let mut prepared = audio.clone();
-        prepared.samples[..EARLY_47_SAMPLES]
-            .copy_from_slice(&partial47.samples[..EARLY_47_SAMPLES]);
-        for (index, success) in early_successes.iter().enumerate() {
-            if !subtracted[index] {
-                subtract_candidate(&mut prepared, success, subtraction_plan);
-            }
-        }
-        Some(prepared)
+        ))
     } else {
         None
     };
+    let early47 = if audio.samples.len() >= EARLY_47_SAMPLES {
+        let mut partial47 = zero_tail(audio, EARLY_47_SAMPLES);
+        if let Some(stage41) = &early41 {
+            for success in &stage41.successes {
+                if success.candidate.dt_seconds < 0.396 {
+                    subtract_candidate(&mut partial47, success, subtraction_plan);
+                }
+            }
+        }
+        let initial_successes = early41
+            .as_ref()
+            .map(|stage| stage.successes.clone())
+            .unwrap_or_default();
+        Some(run_decode_search(
+            &partial47,
+            options,
+            Some(partial47.clone()),
+            initial_successes,
+            SYNC8_THRESHOLD,
+            false,
+        ))
+    } else {
+        None
+    };
+    let prepared_full = early47.as_ref().map(|stage47| {
+        let mut prepared = audio.clone();
+        for success in &stage47.successes {
+            subtract_candidate(&mut prepared, success, subtraction_plan);
+        }
+        prepared.samples[..EARLY_47_SAMPLES]
+            .copy_from_slice(&stage47.residual_audio.samples[..EARLY_47_SAMPLES]);
+        prepared
+    });
+    let initial_successes = early47
+        .as_ref()
+        .map(|stage| stage.successes.clone())
+        .or_else(|| early41.as_ref().map(|stage| stage.successes.clone()))
+        .unwrap_or_default();
     let search = run_decode_search(
         audio,
         options,
         prepared_full,
-        early_successes,
+        initial_successes,
         SYNC8_THRESHOLD,
         true,
     );
@@ -484,6 +515,7 @@ fn run_decode_search(
 
     SearchResult {
         successes,
+        residual_audio,
         frame_count,
         usable_bins,
         top_candidates,
@@ -922,6 +954,33 @@ fn refine_candidate(
         start_seconds,
         freq_hz: best_freq_hz,
         sync_score: best_score,
+        snr_db: estimate_snr_db(&data_tones),
+        data_tones,
+        llr_sets,
+    })
+}
+
+fn extract_candidate_at(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    start_seconds: f32,
+    freq_hz: f32,
+) -> Option<RefinedCandidate> {
+    let baseband = downsample_candidate(long_spectrum, baseband_plan, freq_hz)?;
+    let start_index = (start_seconds * BASEBAND_RATE_HZ).round() as isize;
+    let full_tones = extract_symbol_tones(&baseband, start_index);
+    if sync_quality(&full_tones) <= 6 {
+        return None;
+    }
+    let data_tones: Vec<[Complex32; 8]> = crate::protocol::FT8_DATA_POSITIONS
+        .iter()
+        .map(|&symbol_index| full_tones[symbol_index])
+        .collect();
+    let llr_sets = compute_bitmetric_passes(&full_tones);
+    Some(RefinedCandidate {
+        start_seconds,
+        freq_hz,
+        sync_score: sync8d(&baseband, start_index, 0.0),
         snr_db: estimate_snr_db(&data_tones),
         data_tones,
         llr_sets,

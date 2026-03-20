@@ -25,3 +25,7 @@
 - Keep synthetic waveform validation in place, but do not trust it as a proxy for corpus readiness. The corpus failures have mostly been dense-scene weak-signal interactions, not legality of generated signals.
 - For stubborn misses, probe the exact truth `dt/freq` through a dedicated candidate-debug path before changing algorithms. That distinguishes “candidate exists but the decoder cannot recover it” from “the search/refinement handoff is dropping it.”
 - When a miss decodes at its exact truth coordinates but not in the normal run, inspect boundary handling first. This directly exposed the negative-`dt` coarse-candidate rejection bug, which was worth a large recall jump on the corpus.
+- After reaching the mid-90% recall range, run the truth-seeded debug probe across all remaining false negatives and classify them explicitly:
+  - `seeded-hit`: coarse search / candidate admission problem
+  - `seeded-none`: downstream extraction or BP/OSD fidelity problem
+  This quickly showed that only 1 of the remaining 18 truth misses was an easy search-side recovery, and stopped several low-value search tweaks.

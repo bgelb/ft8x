@@ -856,6 +856,7 @@ def run_decode_job(
         "raw_output_path": str(raw_output_path),
         "decode_count": len(decodes),
         "truth_count": len(truth),
+        "scored_truth_count": metrics["scored_truth_count"] if metrics else len(truth),
         "wall_seconds": timing.get("wall_seconds"),
         "cpu_user_seconds": timing.get("cpu_user_seconds"),
         "cpu_system_seconds": timing.get("cpu_system_seconds"),
@@ -884,6 +885,8 @@ def compare_decodes(
     )
     return {
         "matching_rule": "unique-message",
+        "scored_decode_count": len(predicted),
+        "scored_truth_count": len(expected),
         "tp": len(true_positive),
         "fp": len(false_positive),
         "fn": len(false_negative),
@@ -912,6 +915,7 @@ def summarize_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "samples": 0,
                 "decode_count": 0,
                 "truth_count": 0,
+                "scored_truth_count": 0,
                 "wall_seconds": 0.0,
                 "cpu_user_seconds": 0.0,
                 "cpu_system_seconds": 0.0,
@@ -924,6 +928,7 @@ def summarize_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         entry["samples"] += 1
         entry["decode_count"] += run["decode_count"]
         entry["truth_count"] += run["truth_count"]
+        entry["scored_truth_count"] += run.get("scored_truth_count", run["truth_count"])
         entry["wall_seconds"] += run.get("wall_seconds") or 0.0
         entry["cpu_user_seconds"] += run.get("cpu_user_seconds") or 0.0
         entry["cpu_system_seconds"] += run.get("cpu_system_seconds") or 0.0
@@ -971,6 +976,7 @@ def write_summary_csv(path: Path, summary_rows: list[dict[str, Any]]) -> None:
                 "samples",
                 "decode_count",
                 "truth_count",
+                "scored_truth_count",
                 "wall_seconds",
                 "cpu_user_seconds",
                 "cpu_system_seconds",
@@ -1069,6 +1075,7 @@ def summarize_decoder_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "samples": 0,
                 "decode_count": 0,
                 "truth_count": 0,
+                "scored_truth_count": 0,
                 "wall_seconds": 0.0,
                 "cpu_user_seconds": 0.0,
                 "cpu_system_seconds": 0.0,
@@ -1081,6 +1088,7 @@ def summarize_decoder_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         entry["samples"] += 1
         entry["decode_count"] += run["decode_count"]
         entry["truth_count"] += run["truth_count"]
+        entry["scored_truth_count"] += run.get("scored_truth_count", run["truth_count"])
         entry["wall_seconds"] += run.get("wall_seconds") or 0.0
         entry["cpu_user_seconds"] += run.get("cpu_user_seconds") or 0.0
         entry["cpu_system_seconds"] += run.get("cpu_system_seconds") or 0.0
@@ -1121,6 +1129,7 @@ def write_decoder_summary_csv(path: Path, summary_rows: list[dict[str, Any]]) ->
                 "samples",
                 "decode_count",
                 "truth_count",
+                "scored_truth_count",
                 "wall_seconds",
                 "cpu_user_seconds",
                 "cpu_system_seconds",
@@ -1197,6 +1206,7 @@ def run_rust_benchmark(
                     "raw_output_path": str(raw_output_path),
                     "decode_count": len(decodes),
                     "truth_count": len(truth),
+                    "scored_truth_count": metrics["scored_truth_count"] if metrics else len(truth),
                     "wall_seconds": result["wall_seconds"],
                     "cpu_user_seconds": result["cpu_user_seconds"],
                     "cpu_system_seconds": result["cpu_system_seconds"],

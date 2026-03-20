@@ -262,7 +262,7 @@ def render_report(payload: dict[str, Any]) -> str:
 
     <section>
       <h2>Overview</h2>
-      <p>Scored datasets use unique-message matching against companion truth files. Unscored datasets only report decode volume. Each overview row is one release, with side-by-side depth columns for decode quality and average CPU time per sample.</p>
+      <p>Scored datasets use unique-message matching against companion truth files, and reporting uses the scored truth count rather than raw truth rows. Unscored datasets only report decode volume. Each overview row is one release, with side-by-side depth columns for decode quality and average CPU time per sample.</p>
       {trend_sections}
       {release_matrix}
     </section>
@@ -492,6 +492,7 @@ def render_detail_sections(runs: list[dict[str, Any]]) -> str:
         total_fp = sum(entry["metrics"]["fp"] for entry in scored_entries) if scored_entries else 0
         total_fn = sum(entry["metrics"]["fn"] for entry in scored_entries) if scored_entries else 0
         total_tp = sum(entry["metrics"]["tp"] for entry in scored_entries) if scored_entries else 0
+        total_scored_truth = sum(entry.get("scored_truth_count", entry["truth_count"]) for entry in scored_entries)
         total_cpu_seconds = sum(entry.get("cpu_seconds") or 0.0 for entry in entries)
         avg_cpu_seconds = total_cpu_seconds / len(entries) if entries else None
         total_wall_seconds = sum(entry.get("wall_seconds") or 0.0 for entry in entries)
@@ -502,6 +503,7 @@ def render_detail_sections(runs: list[dict[str, Any]]) -> str:
                 sample_lines.append(
                     f"<div class='list-label'>{entry['sample_id']}</div>"
                     f"<div class='mono'>TP {metrics['tp']} | FP {metrics['fp']} | FN {metrics['fn']}\n"
+                    f"scored truth count: {entry.get('scored_truth_count', entry['truth_count'])} | raw truth rows: {entry['truth_count']}\n"
                     f"cpu: {seconds(entry.get('cpu_seconds'))} | wall: {seconds(entry.get('wall_seconds'))}\n"
                     f"missing: {', '.join(metrics['false_negative_messages']) or '-'}\n"
                     f"unexpected: {', '.join(metrics['false_positive_messages']) or '-'}</div>"
@@ -525,6 +527,7 @@ def render_detail_sections(runs: list[dict[str, Any]]) -> str:
                 <span>TP: {total_tp}</span>
                 <span>FP: {total_fp}</span>
                 <span>FN: {total_fn}</span>
+                <span>Scored truth: {total_scored_truth}</span>
                 <span>CPU total: {seconds(total_cpu_seconds)}</span>
                 <span>CPU avg: {seconds(avg_cpu_seconds)}</span>
                 <span>Wall avg: {seconds(avg_wall_seconds)}</span>
