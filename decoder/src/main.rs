@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 use ft8_decoder::{
-    DecodeOptions, GridReport, WaveformOptions, debug_candidate_wav_file, decode_wav_file,
-    parse_standard_info, write_rectangular_standard_wav,
+    DecodeOptions, DecodeProfile, GridReport, WaveformOptions, debug_candidate_wav_file,
+    decode_wav_file, parse_standard_info, write_rectangular_standard_wav,
 };
 
 #[derive(Debug, Parser)]
@@ -38,6 +38,9 @@ enum Command {
 
         #[arg(long, default_value_t = 3)]
         search_passes: usize,
+
+        #[arg(long, default_value = "medium")]
+        profile: String,
 
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
@@ -96,9 +99,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_candidates,
             max_successes,
             search_passes,
+            profile,
             pretty,
         } => {
+            let profile = profile.parse::<DecodeProfile>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
             let options = DecodeOptions {
+                profile,
                 min_freq_hz,
                 max_freq_hz,
                 max_candidates,

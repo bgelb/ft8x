@@ -1033,10 +1033,11 @@ def generate_report(paths: Paths, results_path: Path | None = None) -> Path:
     return html_path
 
 
-def invoke_local_decoder(binary_path: Path, sample_path: Path) -> dict[str, Any]:
+def invoke_local_decoder(binary_path: Path, sample_path: Path, profile_id: str) -> dict[str, Any]:
     started_at = time.monotonic()
+    command = [str(binary_path), "decode", "--profile", profile_id, str(sample_path)]
     completed = subprocess.Popen(
-        [str(binary_path), "decode", str(sample_path)],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -1048,7 +1049,7 @@ def invoke_local_decoder(binary_path: Path, sample_path: Path) -> dict[str, Any]
     if exit_code != 0:
         raise subprocess.CalledProcessError(
             exit_code,
-            [str(binary_path), "decode", str(sample_path)],
+            command,
             stdout,
             stderr,
         )
@@ -1064,11 +1065,14 @@ def invoke_local_decoder(binary_path: Path, sample_path: Path) -> dict[str, Any]
 
 
 def summarize_decoder_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[str, dict[str, Any]] = {}
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for run in runs:
+        key = (run["profile_id"], run["dataset_id"])
         entry = grouped.setdefault(
-            run["dataset_id"],
+            key,
             {
+                "profile_id": run["profile_id"],
+                "profile_label": run["profile_label"],
                 "dataset_id": run["dataset_id"],
                 "dataset_label": run["dataset_label"],
                 "dataset_kind": run["dataset_kind"],
@@ -1097,7 +1101,7 @@ def summarize_decoder_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             entry["tp"] += run["metrics"]["tp"]
             entry["fp"] += run["metrics"]["fp"]
             entry["fn"] += run["metrics"]["fn"]
-    summary = sorted(grouped.values(), key=lambda item: item["dataset_id"])
+    summary = sorted(grouped.values(), key=lambda item: (item["profile_id"], item["dataset_id"]))
     for entry in summary:
         entry["avg_wall_seconds"] = entry["wall_seconds"] / entry["samples"] if entry["samples"] else None
         entry["avg_cpu_user_seconds"] = entry["cpu_user_seconds"] / entry["samples"] if entry["samples"] else None
@@ -1124,6 +1128,8 @@ def write_decoder_summary_csv(path: Path, summary_rows: list[dict[str, Any]]) ->
         writer = csv.DictWriter(
             handle,
             fieldnames=[
+                "profile_id",
+                "profile_label",
                 "dataset_id",
                 "dataset_kind",
                 "samples",
@@ -1155,13 +1161,16 @@ def run_rust_benchmark(
     paths: Paths,
     binary_path: Path,
     datasets: list[str] | None = None,
+    profiles: list[str] | None = None,
     sample_limit: int | None = None,
 ) -> dict[str, Any]:
     if not binary_path.exists():
         raise FileNotFoundError(f"Missing decoder binary: {binary_path}")
 
+    config = load_config(paths)
     dataset_payload = load_or_discover_datasets(paths)
     dataset_filter = set(datasets or [])
+    profile_filter = set(profiles or [])
     sync_samples(paths, dataset_filter or None, sample_limit)
 
     selected_datasets = [
@@ -1169,6 +1178,21 @@ def run_rust_benchmark(
         for dataset in dataset_payload["datasets"]
         if not dataset_filter or dataset["id"] in dataset_filter
     ]
+    if dataset_filter and not selected_datasets:
+        raise ValueError(f"No matching datasets: {', '.join(sorted(dataset_filter))}")
+    selected_profiles = [
+        profile
+        for profile in config["profiles"]
+        if (
+            profile["id"] in profile_filter
+            if profile_filter
+            else profile["id"] == "medium"
+        )
+    ]
+    if profile_filter and not selected_profiles:
+        raise ValueError(f"No matching profiles: {', '.join(sorted(profile_filter))}")
+    if not selected_profiles:
+        raise ValueError("No Rust decoder profiles selected")
     run_id = f"rust-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     run_dir = paths.results / run_id
     raw_dir = run_dir / "raw"
@@ -1178,46 +1202,52 @@ def run_rust_benchmark(
     total_jobs = sum(
         len(dataset["samples"][:sample_limit] if sample_limit is not None else dataset["samples"])
         for dataset in selected_datasets
-    )
+    ) * len(selected_profiles)
     completed_jobs = 0
-    for dataset in selected_datasets:
-        sample_entries = dataset["samples"][:sample_limit] if sample_limit is not None else dataset["samples"]
-        for sample in sample_entries:
-            sample_dir = paths.samples / dataset["id"] / sample["id"]
-            wav_path = sample_dir / f"{sample['id']}.wav"
-            truth_path = sample_dir / f"{sample['id']}.txt"
-            result = invoke_local_decoder(binary_path, wav_path)
-            stdout = result["stdout"]
-            raw_output_path = raw_dir / dataset["id"] / f"{sample['id']}.txt"
-            raw_output_path.parent.mkdir(parents=True, exist_ok=True)
-            raw_output_path.write_text(stdout)
-            decodes = parse_decode_lines(stdout)
-            truth = parse_truth_file(truth_path) if truth_path.exists() else []
-            metrics = compare_decodes(decodes, truth) if truth else None
-            runs.append(
-                {
-                    "decoder_id": "rust-ft8",
-                    "decoder_label": "Rust FT8 Decoder",
-                    "binary_path": str(binary_path),
-                    "dataset_id": dataset["id"],
-                    "dataset_label": dataset["label"],
-                    "dataset_kind": dataset["kind"],
-                    "sample_id": sample["id"],
-                    "raw_output_path": str(raw_output_path),
-                    "decode_count": len(decodes),
-                    "truth_count": len(truth),
-                    "scored_truth_count": metrics["scored_truth_count"] if metrics else len(truth),
-                    "wall_seconds": result["wall_seconds"],
-                    "cpu_user_seconds": result["cpu_user_seconds"],
-                    "cpu_system_seconds": result["cpu_system_seconds"],
-                    "cpu_seconds": result["cpu_seconds"],
-                    "decodes": decodes,
-                    "truth": truth,
-                    "metrics": metrics,
-                }
-            )
-            completed_jobs += 1
-            print(f"[{completed_jobs}/{total_jobs}] rust-ft8 {dataset['id']} {sample['id']}", flush=True)
+    for profile in selected_profiles:
+        for dataset in selected_datasets:
+            sample_entries = dataset["samples"][:sample_limit] if sample_limit is not None else dataset["samples"]
+            for sample in sample_entries:
+                sample_dir = paths.samples / dataset["id"] / sample["id"]
+                wav_path = sample_dir / f"{sample['id']}.wav"
+                truth_path = sample_dir / f"{sample['id']}.txt"
+                result = invoke_local_decoder(binary_path, wav_path, profile["id"])
+                stdout = result["stdout"]
+                raw_output_path = raw_dir / profile["id"] / dataset["id"] / f"{sample['id']}.txt"
+                raw_output_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_output_path.write_text(stdout)
+                decodes = parse_decode_lines(stdout)
+                truth = parse_truth_file(truth_path) if truth_path.exists() else []
+                metrics = compare_decodes(decodes, truth) if truth else None
+                runs.append(
+                    {
+                        "decoder_id": "rust-ft8",
+                        "decoder_label": "Rust FT8 Decoder",
+                        "binary_path": str(binary_path),
+                        "profile_id": profile["id"],
+                        "profile_label": profile["label"],
+                        "dataset_id": dataset["id"],
+                        "dataset_label": dataset["label"],
+                        "dataset_kind": dataset["kind"],
+                        "sample_id": sample["id"],
+                        "raw_output_path": str(raw_output_path),
+                        "decode_count": len(decodes),
+                        "truth_count": len(truth),
+                        "scored_truth_count": metrics["scored_truth_count"] if metrics else len(truth),
+                        "wall_seconds": result["wall_seconds"],
+                        "cpu_user_seconds": result["cpu_user_seconds"],
+                        "cpu_system_seconds": result["cpu_system_seconds"],
+                        "cpu_seconds": result["cpu_seconds"],
+                        "decodes": decodes,
+                        "truth": truth,
+                        "metrics": metrics,
+                    }
+                )
+                completed_jobs += 1
+                print(
+                    f"[{completed_jobs}/{total_jobs}] rust-ft8 {profile['id']} {dataset['id']} {sample['id']}",
+                    flush=True,
+                )
 
     summary_rows = summarize_decoder_runs(runs)
     payload = {
@@ -1226,6 +1256,7 @@ def run_rust_benchmark(
         "decoder_id": "rust-ft8",
         "decoder_label": "Rust FT8 Decoder",
         "binary_path": str(binary_path),
+        "profiles": selected_profiles,
         "datasets": [
             {"id": dataset["id"], "label": dataset["label"], "kind": dataset["kind"]}
             for dataset in selected_datasets

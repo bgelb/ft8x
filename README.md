@@ -59,6 +59,21 @@ Re-render the latest report:
 PYTHONPATH=src python3 -m ft8_regr.cli report
 ```
 
+Run the Rust decoder against the medium and deepest profiles:
+
+```bash
+PYTHONPATH=src python3 -m ft8_regr.cli run-rust \
+  --profiles medium deepest \
+  --datasets kgoba-ft8-lib \
+  --sample-limit 3
+```
+
+Or decode a single file directly with the Rust CLI:
+
+```bash
+decoder/target/release/ft8-decoder decode --profile deepest path/to/sample.wav
+```
+
 The main outputs land under:
 
 - `artifacts/discovery/`

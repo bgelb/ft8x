@@ -10,30 +10,101 @@ use serde::Serialize;
 
 use crate::encode::{channel_symbols_from_codeword_bits, synthesize_channel_reference};
 use crate::ldpc::ParityMatrix;
-use crate::message::{DecodedPayload, GridReport, HashResolver, Payload, unpack_message};
+use crate::message::{DecodedPayload, GridReport, HashResolver, MessageKind, Payload, unpack_message};
 use crate::protocol::{
     FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES, FT8_TONE_SPACING_HZ,
     HOP_SAMPLES, HOPS_PER_SYMBOL, all_costas_positions,
 };
 use crate::wave::{AudioBuffer, DecoderError, load_wav};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecodeProfile {
+    Quick,
+    Medium,
+    Deepest,
+}
+
+impl DecodeProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Medium => "medium",
+            Self::Deepest => "deepest",
+        }
+    }
+}
+
+impl Default for DecodeProfile {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+impl std::str::FromStr for DecodeProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "quick" => Ok(Self::Quick),
+            "medium" => Ok(Self::Medium),
+            "deep" | "deepest" => Ok(Self::Deepest),
+            other => Err(format!(
+                "unsupported profile '{other}'; expected quick, medium, or deepest"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DecodeOptions {
+    pub profile: DecodeProfile,
     pub min_freq_hz: f32,
     pub max_freq_hz: f32,
     pub max_candidates: usize,
     pub max_successes: usize,
     pub search_passes: usize,
+    pub target_freq_hz: f32,
+    pub tx_freq_hz: f32,
+    pub ap_width_hz: f32,
 }
 
 impl Default for DecodeOptions {
     fn default() -> Self {
         Self {
+            profile: DecodeProfile::Medium,
             min_freq_hz: 200.0,
             max_freq_hz: 4_000.0,
             max_candidates: 600,
             max_successes: 200,
             search_passes: 3,
+            target_freq_hz: 1_500.0,
+            tx_freq_hz: 1_500.0,
+            ap_width_hz: 75.0,
+        }
+    }
+}
+
+impl DecodeOptions {
+    fn uses_early_decodes(&self) -> bool {
+        !matches!(self.profile, DecodeProfile::Quick)
+    }
+
+    fn sync_threshold(&self) -> f32 {
+        if matches!(self.profile, DecodeProfile::Deepest) {
+            1.3
+        } else {
+            SYNC8_THRESHOLD
+        }
+    }
+
+    fn max_osd_passes(&self, outer_pass: usize, _freq_hz: f32) -> isize {
+        match self.profile {
+            DecodeProfile::Quick => -1,
+            DecodeProfile::Medium => 0,
+            DecodeProfile::Deepest => {
+                if outer_pass == 0 { 0 } else { 3 }
+            }
         }
     }
 }
@@ -114,6 +185,7 @@ struct RefinedCandidate {
     freq_hz: f32,
     sync_score: f32,
     llr_sets: [Vec<f32>; 4],
+    symbol_bit_llrs: Vec<f32>,
     snr_db: i32,
 }
 
@@ -226,10 +298,55 @@ pub fn debug_candidate_pcm(
     let mut passes = Vec::new();
     let resolver = HashResolver::default();
 
-    append_debug_passes(&mut passes, "regular", &refined.llr_sets, parity, &mut counters, &resolver);
+    append_debug_passes(
+        &mut passes,
+        "regular",
+        &refined.llr_sets,
+        parity,
+        &mut counters,
+        &resolver,
+        0,
+    );
+    append_debug_single_pass(
+        &mut passes,
+        "symbol",
+        &refined.symbol_bit_llrs,
+        parity,
+        &mut counters,
+        &resolver,
+        0,
+    );
+    append_debug_single_pass(
+        &mut passes,
+        "symbol-osd2",
+        &refined.symbol_bit_llrs,
+        parity,
+        &mut counters,
+        &resolver,
+        2,
+    );
+    append_debug_single_pass(
+        &mut passes,
+        "symbol-osd3",
+        &refined.symbol_bit_llrs,
+        parity,
+        &mut counters,
+        &resolver,
+        3,
+    );
 
-    if let Some(seed) = extract_candidate_at(&long_spectrum, &baseband_plan, dt_seconds + 0.5, freq_hz) {
-        append_debug_passes(&mut passes, "seed", &seed.llr_sets, parity, &mut counters, &resolver);
+    if let Some(seed) =
+        extract_candidate_at(&long_spectrum, &baseband_plan, dt_seconds + 0.5, freq_hz)
+    {
+        append_debug_passes(
+            &mut passes,
+            "seed",
+            &seed.llr_sets,
+            parity,
+            &mut counters,
+            &resolver,
+            0,
+        );
     }
 
     let ap_magnitude = refined.llr_sets[0]
@@ -246,11 +363,13 @@ pub fn debug_candidate_pcm(
             let mean_abs_llr =
                 llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
             let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-            let decoded = decode_llr_set_with_known_bits(parity, &llrs, known_bits, &mut counters)
-                .map(|(payload, _, iterations)| {
-                    let rendered = payload.render(&resolver);
-                    (rendered.text, iterations)
-                });
+            let decoded =
+                decode_llr_set_with_known_bits(parity, &llrs, known_bits, 0, &mut counters).map(
+                    |(payload, _, iterations)| {
+                        let rendered = payload.render(&resolver);
+                        (rendered.text, iterations)
+                    },
+                );
             passes.push(CandidatePassDebug {
                 pass_name: name.to_string(),
                 mean_abs_llr,
@@ -281,22 +400,43 @@ fn append_debug_passes(
     parity: &ParityMatrix,
     counters: &mut DecodeCounters,
     resolver: &HashResolver,
+    max_osd: isize,
 ) {
     for (index, llrs) in llr_sets.iter().enumerate() {
-        let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
-        let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-        let decoded = decode_llr_set(parity, llrs, counters).map(|(payload, _, iterations)| {
-            let rendered = payload.render(resolver);
-            (rendered.text, iterations)
-        });
-        passes.push(CandidatePassDebug {
-            pass_name: format!("{prefix}-{}", index + 1),
-            mean_abs_llr,
-            max_abs_llr,
-            decoded_text: decoded.as_ref().map(|(text, _)| text.clone()),
-            ldpc_iterations: decoded.map(|(_, iterations)| iterations),
-        });
+        append_debug_single_pass(
+            passes,
+            &format!("{prefix}-{}", index + 1),
+            llrs,
+            parity,
+            counters,
+            resolver,
+            max_osd,
+        );
     }
+}
+
+fn append_debug_single_pass(
+    passes: &mut Vec<CandidatePassDebug>,
+    pass_name: &str,
+    llrs: &[f32],
+    parity: &ParityMatrix,
+    counters: &mut DecodeCounters,
+    resolver: &HashResolver,
+    max_osd: isize,
+) {
+    let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
+    let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
+    let decoded = decode_llr_set(parity, llrs, max_osd, counters).map(|(payload, _, iterations)| {
+        let rendered = payload.render(resolver);
+        (rendered.text, iterations)
+    });
+    passes.push(CandidatePassDebug {
+        pass_name: pass_name.to_string(),
+        mean_abs_llr,
+        max_abs_llr,
+        decoded_text: decoded.as_ref().map(|(text, _)| text.clone()),
+        ldpc_iterations: decoded.map(|(_, iterations)| iterations),
+    });
 }
 
 pub fn decode_pcm(
@@ -316,7 +456,7 @@ pub fn decode_pcm(
     }
 
     let subtraction_plan = SubtractionPlan::global();
-    let early41 = if audio.samples.len() >= EARLY_41_SAMPLES {
+    let early41 = if options.uses_early_decodes() && audio.samples.len() >= EARLY_41_SAMPLES {
         let early_audio = zero_tail(audio, EARLY_41_SAMPLES);
         Some(run_decode_search(
             &early_audio,
@@ -329,7 +469,7 @@ pub fn decode_pcm(
     } else {
         None
     };
-    let early47 = if audio.samples.len() >= EARLY_47_SAMPLES {
+    let early47 = if options.uses_early_decodes() && audio.samples.len() >= EARLY_47_SAMPLES {
         let mut partial47 = zero_tail(audio, EARLY_47_SAMPLES);
         if let Some(stage41) = &early41 {
             for success in &stage41.successes {
@@ -347,7 +487,7 @@ pub fn decode_pcm(
             options,
             Some(partial47.clone()),
             initial_successes,
-            SYNC8_THRESHOLD,
+            options.sync_threshold(),
             false,
         ))
     } else {
@@ -372,7 +512,7 @@ pub fn decode_pcm(
         options,
         prepared_full,
         initial_successes,
-        SYNC8_THRESHOLD,
+        options.sync_threshold(),
         true,
     );
 
@@ -384,6 +524,9 @@ pub fn decode_pcm(
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
         let payload = success.payload.render(&resolver);
+        if matches!(payload.kind, MessageKind::Unsupported) {
+            continue;
+        }
         let text = payload.text.clone();
         if text.trim().is_empty() {
             continue;
@@ -475,6 +618,8 @@ fn run_decode_search(
                     &long_spectrum,
                     &baseband_plan,
                     candidate,
+                    options,
+                    pass,
                     parity,
                     allow_ap,
                     &mut local_counters,
@@ -600,8 +745,8 @@ fn collect_candidates(
     }
 
     let min_bin = ((options.min_freq_hz / SYNC8_BIN_HZ).round() as usize).max(1);
-    let max_bin = ((options.max_freq_hz / SYNC8_BIN_HZ).round() as usize)
-        .min(SYNC8_FFT_SAMPLES / 2 - 12);
+    let max_bin =
+        ((options.max_freq_hz / SYNC8_BIN_HZ).round() as usize).min(SYNC8_FFT_SAMPLES / 2 - 12);
     if min_bin >= max_bin {
         return Vec::new();
     }
@@ -657,8 +802,7 @@ fn collect_candidates(
             raw.push(DecodeCandidate {
                 start_seconds: lag as f32 * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32
                     + 0.48,
-                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SAMPLES as f32
-                    / FT8_SAMPLE_RATE as f32,
+                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32,
                 freq_hz: bin as f32 * SYNC8_BIN_HZ,
                 score,
             });
@@ -667,13 +811,14 @@ fn collect_candidates(
     for &(bin, lag, score) in &secondary {
         if score >= sync_threshold
             && score.is_finite()
-            && !primary.iter().any(|&(b, local_lag, _)| b == bin && local_lag == lag)
+            && !primary
+                .iter()
+                .any(|&(b, local_lag, _)| b == bin && local_lag == lag)
         {
             raw.push(DecodeCandidate {
                 start_seconds: lag as f32 * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32
                     + 0.48,
-                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SAMPLES as f32
-                    / FT8_SAMPLE_RATE as f32,
+                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32,
                 freq_hz: bin as f32 * SYNC8_BIN_HZ,
                 score,
             });
@@ -777,16 +922,11 @@ fn collect_candidates_legacy(audio: &AudioBuffer, options: &DecodeOptions) -> Ve
     selected
 }
 
-fn subtract_candidate(
-    audio: &mut AudioBuffer,
-    success: &SuccessfulDecode,
-    plan: &SubtractionPlan,
-) {
+fn subtract_candidate(audio: &mut AudioBuffer, success: &SuccessfulDecode, plan: &SubtractionPlan) {
     let Some(channel_symbols) = channel_symbols_from_codeword_bits(&success.codeword_bits) else {
         return;
     };
-    let start_sample =
-        (success.candidate.start_seconds * FT8_SAMPLE_RATE as f32).round() as isize;
+    let start_sample = (success.candidate.start_seconds * FT8_SAMPLE_RATE as f32).round() as isize;
     let reference = synthesize_channel_reference(&channel_symbols, success.candidate.freq_hz);
     let frame_len = reference.len();
     let mut envelope = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
@@ -829,6 +969,8 @@ fn try_candidate(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
     candidate: &DecodeCandidate,
+    options: &DecodeOptions,
+    outer_pass: usize,
     parity: &ParityMatrix,
     allow_ap: bool,
     counters: &mut DecodeCounters,
@@ -849,13 +991,13 @@ fn try_candidate(
             continue;
         }
         let coarse_freq_hz = (search_grid.min_bin + candidate_bin) as f32 * FT8_TONE_SPACING_HZ;
-        let Some(initial_baseband) = downsample_candidate(long_spectrum, baseband_plan, coarse_freq_hz)
+        let Some(initial_baseband) =
+            downsample_candidate(long_spectrum, baseband_plan, coarse_freq_hz)
         else {
             continue;
         };
         for frame_delta in -2..=2 {
-            let coarse_start_seconds =
-                candidate.start_seconds + frame_delta as f32 * hop_seconds;
+            let coarse_start_seconds = candidate.start_seconds + frame_delta as f32 * hop_seconds;
             if let Some(refined) = refine_candidate_with_cache(
                 long_spectrum,
                 baseband_plan,
@@ -864,10 +1006,11 @@ fn try_candidate(
                 coarse_start_seconds,
                 coarse_freq_hz,
             ) {
+                let max_osd = options.max_osd_passes(outer_pass, refined.freq_hz);
                 let mut refined_hit = false;
                 for llrs in &refined.llr_sets {
                     let Some((payload, bits, iterations)) =
-                        decode_llr_set(parity, llrs, counters)
+                        decode_llr_set(parity, llrs, max_osd, counters)
                     else {
                         continue;
                     };
@@ -892,6 +1035,33 @@ fn try_candidate(
                     break;
                 }
 
+                if !refined_hit {
+                    if let Some((payload, bits, iterations)) = decode_llr_set(
+                        parity,
+                        &refined.symbol_bit_llrs,
+                        max_osd,
+                        counters,
+                    ) {
+                        let success = SuccessfulDecode {
+                            payload,
+                            codeword_bits: bits,
+                            candidate: DecodeCandidate {
+                                start_seconds: refined.start_seconds,
+                                dt_seconds: refined.start_seconds - 0.5,
+                                freq_hz: refined.freq_hz,
+                                score: refined.sync_score.max(candidate.score),
+                            },
+                            ldpc_iterations: iterations,
+                            snr_db: refined.snr_db,
+                        };
+                        match &best {
+                            Some(existing) if existing.candidate.score >= success.candidate.score => {}
+                            _ => best = Some(success),
+                        }
+                        refined_hit = true;
+                    }
+                }
+
                 if allow_ap && !refined_hit && best.is_none() {
                     let ap_magnitude = refined.llr_sets[0]
                         .iter()
@@ -905,12 +1075,11 @@ fn try_candidate(
                                 known_bits,
                                 ap_magnitude,
                             );
-                            if let Some((payload, bits, iterations)) = decode_llr_set_with_known_bits(
-                                parity,
-                                &ap_llrs,
-                                known_bits,
-                                counters,
-                            ) {
+                            if let Some((payload, bits, iterations)) =
+                                decode_llr_set_with_known_bits(
+                                    parity, &ap_llrs, known_bits, max_osd, counters,
+                                )
+                            {
                                 best = Some(SuccessfulDecode {
                                     payload,
                                     codeword_bits: bits,
@@ -1002,6 +1171,7 @@ fn refine_candidate_with_cache(
         return None;
     }
     let llr_sets = compute_bitmetric_passes(&full_tones);
+    let symbol_bit_llrs = compute_symbol_bit_llrs(&full_tones);
     let start_seconds = (refined_ibest as f32 - 1.0) / BASEBAND_RATE_HZ;
     Some(RefinedCandidate {
         start_seconds,
@@ -1009,6 +1179,7 @@ fn refine_candidate_with_cache(
         sync_score: best_score,
         snr_db: estimate_snr_db(&full_tones),
         llr_sets,
+        symbol_bit_llrs,
     })
 }
 
@@ -1025,12 +1196,14 @@ fn extract_candidate_at(
         return None;
     }
     let llr_sets = compute_bitmetric_passes(&full_tones);
+    let symbol_bit_llrs = compute_symbol_bit_llrs(&full_tones);
     Some(RefinedCandidate {
         start_seconds,
         freq_hz,
         sync_score: sync8d(&baseband, start_index, 0.0),
         snr_db: estimate_snr_db(&full_tones),
         llr_sets,
+        symbol_bit_llrs,
     })
 }
 
@@ -1109,8 +1282,7 @@ impl SubtractionPlan {
 
         let mut window = Vec::with_capacity(SUBTRACT_FILTER_SAMPLES + 1);
         for tap in -(SUBTRACT_FILTER_HALF as isize)..=(SUBTRACT_FILTER_HALF as isize) {
-            let phase =
-                std::f32::consts::PI * tap as f32 / SUBTRACT_FILTER_SAMPLES as f32;
+            let phase = std::f32::consts::PI * tap as f32 / SUBTRACT_FILTER_SAMPLES as f32;
             window.push(phase.cos().powi(2));
         }
         let sumw = window.iter().copied().sum::<f32>();
@@ -1240,11 +1412,7 @@ fn sync8_score(
 
 fn ratio_sync_score(signal: f32, band_total: f32) -> f32 {
     let noise = (band_total - signal) / 6.0;
-    if noise > 0.0 {
-        signal / noise
-    } else {
-        0.0
-    }
+    if noise > 0.0 { signal / noise } else { 0.0 }
 }
 
 fn normalize_sync_scores(scores: &mut [(usize, isize, f32)]) {
@@ -1270,12 +1438,12 @@ fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
     for (offset, tone) in crate::protocol::FT8_COSTAS.iter().copied().enumerate() {
         for block in [0usize, 36, 72] {
             let symbol_start = start_index + ((block + offset) * BASEBAND_SYMBOL_SAMPLES) as isize;
-            if symbol_start < 0
-                || symbol_start as usize + BASEBAND_SYMBOL_SAMPLES > baseband.len()
+            if symbol_start < 0 || symbol_start as usize + BASEBAND_SYMBOL_SAMPLES > baseband.len()
             {
                 continue;
             }
-            let segment = &baseband[symbol_start as usize..symbol_start as usize + BASEBAND_SYMBOL_SAMPLES];
+            let segment =
+                &baseband[symbol_start as usize..symbol_start as usize + BASEBAND_SYMBOL_SAMPLES];
             let corr = match &residual {
                 Some(residual) => correlate_tone_residual(segment, tone, residual),
                 None => correlate_tone_nominal(segment, tone),
@@ -1290,9 +1458,7 @@ fn extract_symbol_tones(baseband: &[Complex32], start_index: isize) -> Vec<[Comp
     let mut tones = vec![[Complex32::new(0.0, 0.0); 8]; FT8_MESSAGE_SYMBOLS];
     for (symbol_index, symbol_tones) in tones.iter_mut().enumerate() {
         let sample_index = start_index + (symbol_index * BASEBAND_SYMBOL_SAMPLES) as isize;
-        if sample_index < 0
-            || sample_index as usize + BASEBAND_SYMBOL_SAMPLES > baseband.len()
-        {
+        if sample_index < 0 || sample_index as usize + BASEBAND_SYMBOL_SAMPLES > baseband.len() {
             continue;
         }
         let segment =
@@ -1390,12 +1556,26 @@ fn compute_bitmetric_passes(full_tones: &[[Complex32; 8]]) -> [Vec<f32>; 4] {
     [bmeta, bmetb, bmetc, bmetd]
 }
 
+fn compute_symbol_bit_llrs(full_tones: &[[Complex32; 8]]) -> Vec<f32> {
+    let data_tones: Vec<[f32; 8]> = crate::protocol::FT8_DATA_POSITIONS
+        .iter()
+        .map(|&symbol_index| {
+            std::array::from_fn(|tone| full_tones[symbol_index][tone].norm_sqr())
+        })
+        .collect();
+    ParityMatrix::symbol_bit_llrs(&data_tones)
+        .into_iter()
+        .flat_map(|symbol| symbol.into_iter())
+        .collect()
+}
+
 fn decode_llr_set(
     parity: &ParityMatrix,
     llrs: &[f32],
+    max_osd: isize,
     counters: &mut DecodeCounters,
 ) -> Option<(Payload, Vec<u8>, usize)> {
-    let Some((bits, iterations)) = parity.decode(llrs) else {
+    let Some((bits, iterations)) = parity.decode_with_maxosd(llrs, max_osd) else {
         return None;
     };
     if bits.iter().all(|bit| *bit == 0) {
@@ -1405,6 +1585,9 @@ fn decode_llr_set(
     let Some(payload) = unpack_message(&bits) else {
         return None;
     };
+    if matches!(payload, Payload::Unsupported(_, _)) {
+        return None;
+    }
     counters.parsed_payloads += 1;
     Some((payload, bits, iterations))
 }
@@ -1413,9 +1596,12 @@ fn decode_llr_set_with_known_bits(
     parity: &ParityMatrix,
     llrs: &[f32],
     known_bits: &[Option<u8>],
+    max_osd: isize,
     counters: &mut DecodeCounters,
 ) -> Option<(Payload, Vec<u8>, usize)> {
-    let Some((bits, iterations)) = parity.decode_with_known_bits(llrs, known_bits) else {
+    let Some((bits, iterations)) =
+        parity.decode_with_known_bits_and_maxosd(llrs, known_bits, max_osd)
+    else {
         return None;
     };
     if bits.iter().all(|bit| *bit == 0) {
@@ -1425,6 +1611,9 @@ fn decode_llr_set_with_known_bits(
     let Some(payload) = unpack_message(&bits) else {
         return None;
     };
+    if matches!(payload, Payload::Unsupported(_, _)) {
+        return None;
+    }
     counters.parsed_payloads += 1;
     Some((payload, bits, iterations))
 }
@@ -1432,8 +1621,9 @@ fn decode_llr_set_with_known_bits(
 fn cq_ap_known_bits() -> &'static [Option<u8>] {
     static BITS: OnceLock<Vec<Option<u8>>> = OnceLock::new();
     BITS.get_or_init(|| {
-        let frame = crate::encode::encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank)
-            .expect("encode CQ AP template");
+        let frame =
+            crate::encode::encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank)
+                .expect("encode CQ AP template");
         let mut known = vec![None; 174];
         for index in 0..29 {
             known[index] = Some(frame.message_bits[index]);
@@ -1482,9 +1672,8 @@ fn baseband_taper() -> &'static [f32] {
     TAPER.get_or_init(|| {
         (0..=BASEBAND_TAPER_LEN)
             .map(|index| {
-                0.5
-                    * (1.0
-                        + (index as f32 * std::f32::consts::PI / BASEBAND_TAPER_LEN as f32).cos())
+                0.5 * (1.0
+                    + (index as f32 * std::f32::consts::PI / BASEBAND_TAPER_LEN as f32).cos())
             })
             .collect()
     })
@@ -1517,10 +1706,7 @@ fn tone_basis() -> &'static [[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8] {
     BASIS.get_or_init(|| {
         std::array::from_fn(|tone| {
             std::array::from_fn(|index| {
-                let phase = -2.0
-                    * std::f32::consts::PI
-                    * tone as f32
-                    * index as f32
+                let phase = -2.0 * std::f32::consts::PI * tone as f32 * index as f32
                     / BASEBAND_SYMBOL_SAMPLES as f32;
                 Complex32::new(phase.cos(), phase.sin())
             })
@@ -1530,8 +1716,7 @@ fn tone_basis() -> &'static [[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8] {
 
 fn residual_tweak(residual_hz: f32) -> [Complex32; BASEBAND_SYMBOL_SAMPLES] {
     std::array::from_fn(|index| {
-        let phase =
-            -2.0 * std::f32::consts::PI * residual_hz * index as f32 / BASEBAND_RATE_HZ;
+        let phase = -2.0 * std::f32::consts::PI * residual_hz * index as f32 / BASEBAND_RATE_HZ;
         Complex32::new(phase.cos(), phase.sin())
     })
 }
@@ -1559,7 +1744,11 @@ fn normalize_metric_vector(values: &mut [f32]) {
     let mean = values.iter().copied().sum::<f32>() / values.len() as f32;
     let second = values.iter().map(|value| value * value).sum::<f32>() / values.len() as f32;
     let variance = second - mean * mean;
-    let sigma = if variance > 0.0 { variance.sqrt() } else { second.sqrt() };
+    let sigma = if variance > 0.0 {
+        variance.sqrt()
+    } else {
+        second.sqrt()
+    };
     if sigma > 0.0 {
         for value in values {
             *value /= sigma;
@@ -1620,5 +1809,36 @@ mod tests {
                 success.is_some()
             );
         }
+    }
+
+    #[test]
+    fn parses_known_profiles() {
+        assert_eq!(
+            "quick".parse::<DecodeProfile>().unwrap(),
+            DecodeProfile::Quick
+        );
+        assert_eq!(
+            "medium".parse::<DecodeProfile>().unwrap(),
+            DecodeProfile::Medium
+        );
+        assert_eq!(
+            "deepest".parse::<DecodeProfile>().unwrap(),
+            DecodeProfile::Deepest
+        );
+        assert_eq!(
+            "deep".parse::<DecodeProfile>().unwrap(),
+            DecodeProfile::Deepest
+        );
+    }
+
+    #[test]
+    fn deepest_profile_uses_extra_osd_after_first_pass() {
+        let options = DecodeOptions {
+            profile: DecodeProfile::Deepest,
+            ..DecodeOptions::default()
+        };
+        assert_eq!(options.max_osd_passes(0, 1_500.0), 0);
+        assert_eq!(options.max_osd_passes(1, 1_500.0), 3);
+        assert_eq!(options.max_osd_passes(1, 1_700.0), 3);
     }
 }

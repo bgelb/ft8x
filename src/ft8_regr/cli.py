@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rust_parser = subparsers.add_parser("run-rust", help="Run the Rust FT8 decoder benchmark")
     rust_parser.add_argument("--datasets", nargs="*", help="Dataset ids to benchmark")
+    rust_parser.add_argument("--profiles", nargs="*", help="Profile ids to benchmark")
     rust_parser.add_argument("--sample-limit", type=int, help="Limit samples per dataset")
     rust_parser.add_argument(
         "--binary",
@@ -109,6 +110,7 @@ def main() -> None:
             paths,
             binary_path=Path(args.binary).resolve(),
             datasets=args.datasets,
+            profiles=args.profiles,
             sample_limit=args.sample_limit,
         )
         print(f"results written to {paths.results / payload['run_id']}")

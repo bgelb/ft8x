@@ -76,11 +76,7 @@ impl ParityMatrix {
             .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
-                if trimmed.len() != 91
-                    || !trimmed
-                        .bytes()
-                        .all(|byte| matches!(byte, b'0' | b'1'))
-                {
+                if trimmed.len() != 91 || !trimmed.bytes().all(|byte| matches!(byte, b'0' | b'1')) {
                     return None;
                 }
                 Some(
@@ -121,29 +117,51 @@ impl ParityMatrix {
             .all(|row| row.iter().fold(0u8, |acc, column| acc ^ bits[*column]) == 0)
     }
 
+    #[allow(dead_code)]
     pub fn decode(&self, llrs: &[f32]) -> Option<(Vec<u8>, usize)> {
-        self.decode_bp_osd(llrs, None)
+        self.decode_with_maxosd(llrs, 0)
     }
 
+    #[allow(dead_code)]
     pub fn decode_with_known_bits(
         &self,
         llrs: &[f32],
         known_bits: &[Option<u8>],
     ) -> Option<(Vec<u8>, usize)> {
-        self.decode_bp_osd(llrs, Some(known_bits))
+        self.decode_with_known_bits_and_maxosd(llrs, known_bits, 0)
+    }
+
+    pub fn decode_with_maxosd(&self, llrs: &[f32], maxosd: isize) -> Option<(Vec<u8>, usize)> {
+        self.decode_bp_osd(llrs, None, maxosd)
+    }
+
+    pub fn decode_with_known_bits_and_maxosd(
+        &self,
+        llrs: &[f32],
+        known_bits: &[Option<u8>],
+        maxosd: isize,
+    ) -> Option<(Vec<u8>, usize)> {
+        self.decode_bp_osd(llrs, Some(known_bits), maxosd)
     }
 
     fn decode_bp_osd(
         &self,
         llrs: &[f32],
         known_bits: Option<&[Option<u8>]>,
+        maxosd: isize,
     ) -> Option<(Vec<u8>, usize)> {
         if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
             return None;
         }
+        let maxosd = maxosd.clamp(-1, 3);
         let mut tov = [[0.0f32; 3]; 174];
         let mut toc = [[0.0f32; 7]; 83];
         let mut tanhtoc = [[0.0f32; 7]; 83];
+        let mut zsum = [0.0f32; 174];
+        let mut saved_llrs = Vec::<Vec<f32>>::new();
+        if maxosd == 0 {
+            saved_llrs.push(llrs.to_vec());
+        }
 
         for (row_index, columns) in self.row_columns.iter().enumerate() {
             for (slot, &column) in columns.iter().enumerate() {
@@ -157,7 +175,9 @@ impl ParityMatrix {
                 .and_then(|bits| bits[column])
                 .unwrap_or_else(|| u8::from(llr >= 0.0));
         }
-        if self.parity_ok(&initial_bits) && crc::crc_matches(&initial_bits[..77], &initial_bits[77..91]) {
+        if self.parity_ok(&initial_bits)
+            && crc::crc_matches(&initial_bits[..77], &initial_bits[77..91])
+        {
             return Some((initial_bits.to_vec(), 0));
         }
 
@@ -172,6 +192,14 @@ impl ParityMatrix {
                 } else {
                     llrs[column] + tov[column][0] + tov[column][1] + tov[column][2]
                 };
+            }
+            if maxosd > 0 {
+                for (acc, value) in zsum.iter_mut().zip(zn.iter().copied()) {
+                    *acc += value;
+                }
+                if iteration > 0 && iteration as isize <= maxosd {
+                    saved_llrs.push(zsum.to_vec());
+                }
             }
 
             for (column, value) in zn.iter().copied().enumerate() {
@@ -215,7 +243,8 @@ impl ParityMatrix {
             for column in 0..174 {
                 for (slot, &row_index) in self.column_rows[column].iter().enumerate() {
                     let mut product = 1.0f32;
-                    for (row_slot, &other_column) in self.row_columns[row_index].iter().enumerate() {
+                    for (row_slot, &other_column) in self.row_columns[row_index].iter().enumerate()
+                    {
                         if other_column == column {
                             continue;
                         }
@@ -226,14 +255,19 @@ impl ParityMatrix {
             }
         }
 
-        self.decode_osd_medium(llrs, known_bits)
+        for (index, llrs) in saved_llrs.iter().enumerate() {
+            if let Some(bits) = self.decode_osd_medium(llrs, known_bits) {
+                return Some((bits, MAX_ITERS + index + 1));
+            }
+        }
+        None
     }
 
     fn decode_osd_medium(
         &self,
         llrs: &[f32],
         known_bits: Option<&[Option<u8>]>,
-    ) -> Option<(Vec<u8>, usize)> {
+    ) -> Option<Vec<u8>> {
         if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
             return None;
         }
@@ -300,8 +334,12 @@ impl ParityMatrix {
             message[first] ^= 1;
             let codeword = encode_mrb(&message, &genmrb);
             let parity_tail = xor_tail(&codeword, &hard, K);
-            let nd1kpt =
-                parity_tail.iter().take(OSD_NT).map(|&bit| bit as usize).sum::<usize>() + 1;
+            let nd1kpt = parity_tail
+                .iter()
+                .take(OSD_NT)
+                .map(|&bit| bit as usize)
+                .sum::<usize>()
+                + 1;
             if nd1kpt <= OSD_NTHETA {
                 let distance = weighted_distance(&codeword, &hard, &reliabilities);
                 if distance < best_distance {
@@ -338,15 +376,14 @@ impl ParityMatrix {
         for (column, bit) in best_codeword.into_iter().enumerate() {
             restored[permuted_indices[column]] = bit;
         }
-        if self.parity_ok(&restored)
-            && crc::crc_matches(&restored[..77], &restored[77..91])
-        {
-            Some((restored, MAX_ITERS + 1))
+        if self.parity_ok(&restored) && crc::crc_matches(&restored[..77], &restored[77..91]) {
+            Some(restored)
         } else {
             None
         }
     }
 
+    #[allow(dead_code)]
     pub fn symbol_bit_llrs(tones: &[[f32; 8]]) -> Vec<[f32; 3]> {
         let mut all = Vec::with_capacity(tones.len() * 8);
         for symbol in tones {
