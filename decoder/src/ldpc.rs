@@ -11,6 +11,7 @@ const OSD_NTHETA: usize = 10;
 pub struct ParityMatrix {
     rows: Vec<Vec<usize>>,
     row_columns: Vec<Vec<usize>>,
+    row_column_slots: Vec<Vec<usize>>,
     column_rows: Vec<Vec<usize>>,
     generator_rows: Vec<Vec<u8>>,
 }
@@ -55,6 +56,21 @@ impl ParityMatrix {
                 column_rows[column].push(row_index);
             }
         }
+        let row_column_slots = row_columns
+            .iter()
+            .enumerate()
+            .map(|(row_index, columns)| {
+                columns
+                    .iter()
+                    .map(|&column| {
+                        column_rows[column]
+                            .iter()
+                            .position(|&stored_row| stored_row == row_index)
+                            .expect("column contains row")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         let parity_generator: Vec<Vec<u8>> = include_str!("../data/generator.dat")
             .lines()
@@ -88,6 +104,7 @@ impl ParityMatrix {
         Self {
             rows,
             row_columns,
+            row_column_slots,
             column_rows,
             generator_rows,
         }
@@ -124,9 +141,9 @@ impl ParityMatrix {
         if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
             return None;
         }
-        let mut tov = vec![[0.0f32; 3]; 174];
-        let mut toc = vec![[0.0f32; 7]; 83];
-        let mut tanhtoc = vec![[0.0f32; 7]; 83];
+        let mut tov = [[0.0f32; 3]; 174];
+        let mut toc = [[0.0f32; 7]; 83];
+        let mut tanhtoc = [[0.0f32; 7]; 83];
 
         for (row_index, columns) in self.row_columns.iter().enumerate() {
             for (slot, &column) in columns.iter().enumerate() {
@@ -134,21 +151,18 @@ impl ParityMatrix {
             }
         }
 
-        let initial_bits: Vec<u8> = llrs
-            .iter()
-            .enumerate()
-            .map(|(column, llr)| {
-                known_bits
-                    .and_then(|bits| bits[column])
-                    .unwrap_or_else(|| u8::from(*llr >= 0.0))
-            })
-            .collect();
+        let mut initial_bits = [0u8; 174];
+        for (column, llr) in llrs.iter().copied().enumerate() {
+            initial_bits[column] = known_bits
+                .and_then(|bits| bits[column])
+                .unwrap_or_else(|| u8::from(llr >= 0.0));
+        }
         if self.parity_ok(&initial_bits) && crc::crc_matches(&initial_bits[..77], &initial_bits[77..91]) {
-            return Some((initial_bits, 0));
+            return Some((initial_bits.to_vec(), 0));
         }
 
-        let mut hard_bits = vec![0u8; 174];
-        let mut zn = vec![0.0f32; 174];
+        let mut hard_bits = [0u8; 174];
+        let mut zn = [0.0f32; 174];
         let mut ncnt = 0isize;
         let mut nclast = 0usize;
         for iteration in 0..=MAX_ITERS {
@@ -156,12 +170,7 @@ impl ParityMatrix {
                 zn[column] = if known_bits.and_then(|bits| bits[column]).is_some() {
                     llrs[column]
                 } else {
-                    llrs[column]
-                        + self.column_rows[column]
-                            .iter()
-                            .enumerate()
-                            .map(|(slot, _)| tov[column][slot])
-                            .sum::<f32>()
+                    llrs[column] + tov[column][0] + tov[column][1] + tov[column][2]
                 };
             }
 
@@ -174,7 +183,7 @@ impl ParityMatrix {
                 .filter(|row| row.iter().fold(0u8, |acc, &column| acc ^ hard_bits[column]) != 0)
                 .count();
             if ncheck == 0 && crc::crc_matches(&hard_bits[..77], &hard_bits[77..91]) {
-                return Some((hard_bits, iteration));
+                return Some((hard_bits.to_vec(), iteration));
             }
 
             if iteration > 0 {
@@ -192,10 +201,7 @@ impl ParityMatrix {
 
             for (row_index, columns) in self.row_columns.iter().enumerate() {
                 for (slot, &column) in columns.iter().enumerate() {
-                    let col_slot = self.column_rows[column]
-                        .iter()
-                        .position(|&row| row == row_index)
-                        .expect("column contains row");
+                    let col_slot = self.row_column_slots[row_index][slot];
                     toc[row_index][slot] = zn[column] - tov[column][col_slot];
                 }
             }

@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use num_complex::Complex32;
 use rayon::prelude::*;
-use realfft::RealFftPlanner;
+use realfft::{RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftPlanner};
 use serde::Serialize;
 
@@ -113,7 +113,6 @@ struct RefinedCandidate {
     start_seconds: f32,
     freq_hz: f32,
     sync_score: f32,
-    data_tones: Vec<[Complex32; 8]>,
     llr_sets: [Vec<f32>; 4],
     snr_db: i32,
 }
@@ -133,6 +132,13 @@ struct SearchResult {
     counters: DecodeCounters,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SearchGrid {
+    frame_count: usize,
+    usable_bins: usize,
+    min_bin: usize,
+}
+
 #[derive(Debug)]
 struct Spectrogram {
     bins: Vec<f32>,
@@ -144,6 +150,14 @@ struct Spectrogram {
 #[derive(Debug)]
 struct LongSpectrum {
     bins: Vec<Complex32>,
+}
+
+struct LongSpectrumPlan {
+    forward: Arc<dyn RealToComplex<f32>>,
+}
+
+struct Sync8Plan {
+    forward: Arc<dyn RealToComplex<f32>>,
 }
 
 struct BasebandPlan {
@@ -178,7 +192,6 @@ const EARLY_BLOCK_SAMPLES: usize = 3_456;
 const EARLY_41_SAMPLES: usize = 41 * EARLY_BLOCK_SAMPLES;
 const EARLY_47_SAMPLES: usize = 47 * EARLY_BLOCK_SAMPLES;
 const NFQSO_HZ: f32 = 1_500.0;
-
 pub fn decode_wav_file(
     path: impl AsRef<Path>,
     options: &DecodeOptions,
@@ -424,6 +437,7 @@ fn run_decode_search(
     sync_threshold: f32,
     allow_ap: bool,
 ) -> SearchResult {
+    let total_passes = options.search_passes.max(1);
     let has_residual_override = residual_override.is_some();
     let mut residual_audio = residual_override.unwrap_or_else(|| audio.clone());
     let baseband_plan = BasebandPlan::new();
@@ -431,9 +445,9 @@ fn run_decode_search(
     let parity = ParityMatrix::global();
     let mut top_candidates = Vec::new();
     let mut counters = DecodeCounters::default();
-    let initial_spectrogram = build_spectrogram(audio, options);
-    let frame_count = initial_spectrogram.frame_count;
-    let usable_bins = initial_spectrogram.usable_bins;
+    let search_grid = search_grid(audio, options);
+    let frame_count = search_grid.frame_count;
+    let usable_bins = search_grid.usable_bins;
 
     let mut successes = initial_successes;
     if !has_residual_override {
@@ -442,17 +456,7 @@ fn run_decode_search(
         }
     }
 
-    for pass in 0..options.search_passes.max(1) {
-        let spectrogram = if pass == 0 {
-            Spectrogram {
-                bins: initial_spectrogram.bins.clone(),
-                frame_count: initial_spectrogram.frame_count,
-                usable_bins: initial_spectrogram.usable_bins,
-                min_bin: initial_spectrogram.min_bin,
-            }
-        } else {
-            build_spectrogram(&residual_audio, options)
-        };
+    for pass in 0..total_passes {
         let long_spectrum = build_long_spectrum(&residual_audio);
         let candidates = collect_candidates(&residual_audio, options, sync_threshold);
         if pass == 0 {
@@ -467,7 +471,7 @@ fn run_decode_search(
             .map(|candidate| {
                 let mut local_counters = DecodeCounters::default();
                 let success = try_candidate(
-                    &spectrogram,
+                    search_grid,
                     &long_spectrum,
                     &baseband_plan,
                     candidate,
@@ -507,10 +511,18 @@ fn run_decode_search(
             pass_successes.truncate(remaining);
         }
 
-        for success in &pass_successes {
-            subtract_candidate(&mut residual_audio, success, subtraction_plan);
+        let will_run_next_pass = pass + 1 < total_passes;
+
+        if will_run_next_pass {
+            for success in &pass_successes {
+                subtract_candidate(&mut residual_audio, success, subtraction_plan);
+            }
         }
         successes.extend(pass_successes);
+
+        if !will_run_next_pass {
+            break;
+        }
     }
 
     SearchResult {
@@ -523,11 +535,22 @@ fn run_decode_search(
     }
 }
 
-fn build_spectrogram(audio: &AudioBuffer, options: &DecodeOptions) -> Spectrogram {
+fn search_grid(audio: &AudioBuffer, options: &DecodeOptions) -> SearchGrid {
     let min_bin = (options.min_freq_hz / FT8_TONE_SPACING_HZ).floor().max(0.0) as usize;
     let max_bin = (options.max_freq_hz / FT8_TONE_SPACING_HZ).ceil() as usize + 7;
-    let usable_bins = max_bin.saturating_sub(min_bin) + 1;
-    let frame_count = (audio.samples.len().saturating_sub(FT8_SYMBOL_SAMPLES) / HOP_SAMPLES) + 1;
+    SearchGrid {
+        frame_count: (audio.samples.len().saturating_sub(FT8_SYMBOL_SAMPLES) / HOP_SAMPLES) + 1,
+        usable_bins: max_bin.saturating_sub(min_bin) + 1,
+        min_bin,
+    }
+}
+
+fn build_spectrogram(audio: &AudioBuffer, options: &DecodeOptions) -> Spectrogram {
+    let search_grid = search_grid(audio, options);
+    let min_bin = search_grid.min_bin;
+    let usable_bins = search_grid.usable_bins;
+    let frame_count = search_grid.frame_count;
+    let max_bin = min_bin + usable_bins - 1;
 
     let mut planner = RealFftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(FT8_SYMBOL_SAMPLES);
@@ -583,8 +606,8 @@ fn collect_candidates(
         return Vec::new();
     }
 
-    let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(SYNC8_FFT_SAMPLES);
+    let plan = Sync8Plan::global();
+    let fft = &plan.forward;
     let mut input = fft.make_input_vec();
     let mut spectrum = fft.make_output_vec();
     let mut symbol_power = vec![0.0f32; nhsym * (SYNC8_FFT_SAMPLES / 2 + 1)];
@@ -802,7 +825,7 @@ fn subtract_candidate(
 }
 
 fn try_candidate(
-    spectrogram: &Spectrogram,
+    search_grid: SearchGrid,
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
     candidate: &DecodeCandidate,
@@ -811,29 +834,37 @@ fn try_candidate(
     counters: &mut DecodeCounters,
 ) -> Option<SuccessfulDecode> {
     let base_bin =
-        (candidate.freq_hz / FT8_TONE_SPACING_HZ).round() as isize - spectrogram.min_bin as isize;
+        (candidate.freq_hz / FT8_TONE_SPACING_HZ).round() as isize - search_grid.min_bin as isize;
     let hop_seconds = HOP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32;
 
     let mut best: Option<SuccessfulDecode> = None;
-    for frame_delta in -2..=2 {
-        for bin_delta in -2..=2 {
-            let candidate_bin = base_bin + bin_delta;
-            if candidate_bin < 0 {
-                continue;
-            }
-            let candidate_bin = candidate_bin as usize;
-            if candidate_bin + 7 >= spectrogram.usable_bins {
-                continue;
-            }
-            let coarse_freq_hz = (spectrogram.min_bin + candidate_bin) as f32 * FT8_TONE_SPACING_HZ;
+    let mut refined_basebands = Vec::<(i32, Vec<Complex32>)>::new();
+    for bin_delta in -2..=2 {
+        let candidate_bin = base_bin + bin_delta;
+        if candidate_bin < 0 {
+            continue;
+        }
+        let candidate_bin = candidate_bin as usize;
+        if candidate_bin + 7 >= search_grid.usable_bins {
+            continue;
+        }
+        let coarse_freq_hz = (search_grid.min_bin + candidate_bin) as f32 * FT8_TONE_SPACING_HZ;
+        let Some(initial_baseband) = downsample_candidate(long_spectrum, baseband_plan, coarse_freq_hz)
+        else {
+            continue;
+        };
+        for frame_delta in -2..=2 {
             let coarse_start_seconds =
                 candidate.start_seconds + frame_delta as f32 * hop_seconds;
-            if let Some(refined) = refine_candidate(
+            if let Some(refined) = refine_candidate_with_cache(
                 long_spectrum,
                 baseband_plan,
+                &initial_baseband,
+                &mut refined_basebands,
                 coarse_start_seconds,
                 coarse_freq_hz,
             ) {
+                let mut refined_hit = false;
                 for llrs in &refined.llr_sets {
                     let Some((payload, bits, iterations)) =
                         decode_llr_set(parity, llrs, counters)
@@ -857,9 +888,11 @@ fn try_candidate(
                         Some(existing) if existing.candidate.score >= success.candidate.score => {}
                         _ => best = Some(success),
                     }
+                    refined_hit = true;
+                    break;
                 }
 
-                if allow_ap && best.is_none() {
+                if allow_ap && !refined_hit && best.is_none() {
                     let ap_magnitude = refined.llr_sets[0]
                         .iter()
                         .map(|value| value.abs())
@@ -908,10 +941,29 @@ fn refine_candidate(
     coarse_freq_hz: f32,
 ) -> Option<RefinedCandidate> {
     let initial_baseband = downsample_candidate(long_spectrum, baseband_plan, coarse_freq_hz)?;
+    let mut refined_basebands = Vec::new();
+    refine_candidate_with_cache(
+        long_spectrum,
+        baseband_plan,
+        &initial_baseband,
+        &mut refined_basebands,
+        coarse_start_seconds,
+        coarse_freq_hz,
+    )
+}
+
+fn refine_candidate_with_cache(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    initial_baseband: &[Complex32],
+    refined_basebands: &mut Vec<(i32, Vec<Complex32>)>,
+    coarse_start_seconds: f32,
+    coarse_freq_hz: f32,
+) -> Option<RefinedCandidate> {
     let mut ibest = ((coarse_start_seconds * BASEBAND_RATE_HZ).round()) as isize;
     let mut best_score = f32::NEG_INFINITY;
     for idt in (ibest - 10)..=(ibest + 10) {
-        let sync_score = sync8d(&initial_baseband, idt, 0.0);
+        let sync_score = sync8d(initial_baseband, idt, 0.0);
         if sync_score > best_score {
             best_score = sync_score;
             ibest = idt;
@@ -922,40 +974,40 @@ fn refine_candidate(
     best_score = f32::NEG_INFINITY;
     for ifr in -5..=5 {
         let residual_hz = ifr as f32 * 0.5;
-        let sync_score = sync8d(&initial_baseband, ibest, residual_hz);
+        let sync_score = sync8d(initial_baseband, ibest, residual_hz);
         if sync_score > best_score {
             best_score = sync_score;
             best_freq_hz = coarse_freq_hz + residual_hz;
         }
     }
 
-    let refined_baseband = downsample_candidate(long_spectrum, baseband_plan, best_freq_hz)?;
+    let refined_baseband = cached_refined_baseband(
+        long_spectrum,
+        baseband_plan,
+        refined_basebands,
+        best_freq_hz,
+    )?;
     let mut refined_ibest = ibest;
     best_score = f32::NEG_INFINITY;
     for delta in -4..=4 {
-        let sync_score = sync8d(&refined_baseband, ibest + delta, 0.0);
+        let sync_score = sync8d(refined_baseband, ibest + delta, 0.0);
         if sync_score > best_score {
             best_score = sync_score;
             refined_ibest = ibest + delta;
         }
     }
 
-    let full_tones = extract_symbol_tones(&refined_baseband, refined_ibest);
+    let full_tones = extract_symbol_tones(refined_baseband, refined_ibest);
     if sync_quality(&full_tones) <= 6 {
         return None;
     }
-    let data_tones: Vec<[Complex32; 8]> = crate::protocol::FT8_DATA_POSITIONS
-        .iter()
-        .map(|&symbol_index| full_tones[symbol_index])
-        .collect();
     let llr_sets = compute_bitmetric_passes(&full_tones);
     let start_seconds = (refined_ibest as f32 - 1.0) / BASEBAND_RATE_HZ;
     Some(RefinedCandidate {
         start_seconds,
         freq_hz: best_freq_hz,
         sync_score: best_score,
-        snr_db: estimate_snr_db(&data_tones),
-        data_tones,
+        snr_db: estimate_snr_db(&full_tones),
         llr_sets,
     })
 }
@@ -972,24 +1024,34 @@ fn extract_candidate_at(
     if sync_quality(&full_tones) <= 6 {
         return None;
     }
-    let data_tones: Vec<[Complex32; 8]> = crate::protocol::FT8_DATA_POSITIONS
-        .iter()
-        .map(|&symbol_index| full_tones[symbol_index])
-        .collect();
     let llr_sets = compute_bitmetric_passes(&full_tones);
     Some(RefinedCandidate {
         start_seconds,
         freq_hz,
         sync_score: sync8d(&baseband, start_index, 0.0),
-        snr_db: estimate_snr_db(&data_tones),
-        data_tones,
+        snr_db: estimate_snr_db(&full_tones),
         llr_sets,
     })
 }
 
+fn cached_refined_baseband<'a>(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    cache: &'a mut Vec<(i32, Vec<Complex32>)>,
+    freq_hz: f32,
+) -> Option<&'a [Complex32]> {
+    let key = (freq_hz * 16.0).round() as i32;
+    if let Some(index) = cache.iter().position(|(cached_key, _)| *cached_key == key) {
+        return Some(cache[index].1.as_slice());
+    }
+    let baseband = downsample_candidate(long_spectrum, baseband_plan, freq_hz)?;
+    cache.push((key, baseband));
+    cache.last().map(|(_, baseband)| baseband.as_slice())
+}
+
 fn build_long_spectrum(audio: &AudioBuffer) -> LongSpectrum {
-    let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(LONG_FFT_SAMPLES);
+    let plan = LongSpectrumPlan::global();
+    let fft = &plan.forward;
     let mut input = fft.make_input_vec();
     let mut spectrum = fft.make_output_vec();
 
@@ -999,6 +1061,30 @@ fn build_long_spectrum(audio: &AudioBuffer) -> LongSpectrum {
 
     fft.process(&mut input, &mut spectrum).expect("long fft");
     LongSpectrum { bins: spectrum }
+}
+
+impl LongSpectrumPlan {
+    fn global() -> &'static Self {
+        static PLAN: OnceLock<LongSpectrumPlan> = OnceLock::new();
+        PLAN.get_or_init(|| {
+            let mut planner = RealFftPlanner::<f32>::new();
+            Self {
+                forward: planner.plan_fft_forward(LONG_FFT_SAMPLES),
+            }
+        })
+    }
+}
+
+impl Sync8Plan {
+    fn global() -> &'static Self {
+        static PLAN: OnceLock<Sync8Plan> = OnceLock::new();
+        PLAN.get_or_init(|| {
+            let mut planner = RealFftPlanner::<f32>::new();
+            Self {
+                forward: planner.plan_fft_forward(SYNC8_FFT_SAMPLES),
+            }
+        })
+    }
 }
 
 impl BasebandPlan {
@@ -1180,6 +1266,7 @@ fn normalize_sync_scores(scores: &mut [(usize, isize, f32)]) {
 
 fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
     let mut sync = 0.0f32;
+    let residual = (residual_hz != 0.0).then(|| residual_tweak(residual_hz));
     for (offset, tone) in crate::protocol::FT8_COSTAS.iter().copied().enumerate() {
         for block in [0usize, 36, 72] {
             let symbol_start = start_index + ((block + offset) * BASEBAND_SYMBOL_SAMPLES) as isize;
@@ -1189,7 +1276,10 @@ fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
                 continue;
             }
             let segment = &baseband[symbol_start as usize..symbol_start as usize + BASEBAND_SYMBOL_SAMPLES];
-            let corr = correlate_tone(segment, tone, residual_hz);
+            let corr = match &residual {
+                Some(residual) => correlate_tone_residual(segment, tone, residual),
+                None => correlate_tone_nominal(segment, tone),
+            };
             sync += corr.norm_sqr();
         }
     }
@@ -1208,7 +1298,7 @@ fn extract_symbol_tones(baseband: &[Complex32], start_index: isize) -> Vec<[Comp
         let segment =
             &baseband[sample_index as usize..sample_index as usize + BASEBAND_SYMBOL_SAMPLES];
         for (tone, slot) in symbol_tones.iter_mut().enumerate() {
-            *slot = correlate_tone(segment, tone, 0.0);
+            *slot = correlate_tone_nominal(segment, tone);
         }
     }
     tones
@@ -1400,9 +1490,21 @@ fn baseband_taper() -> &'static [f32] {
     })
 }
 
-fn correlate_tone(segment: &[Complex32], tone: usize, residual_hz: f32) -> Complex32 {
+fn correlate_tone_nominal(segment: &[Complex32], tone: usize) -> Complex32 {
     let basis = tone_basis();
-    let residual = residual_tweak(residual_hz);
+    let mut acc = Complex32::new(0.0, 0.0);
+    for (index, sample) in segment.iter().copied().enumerate() {
+        acc += sample * basis[tone][index];
+    }
+    acc
+}
+
+fn correlate_tone_residual(
+    segment: &[Complex32],
+    tone: usize,
+    residual: &[Complex32; BASEBAND_SYMBOL_SAMPLES],
+) -> Complex32 {
+    let basis = tone_basis();
     let mut acc = Complex32::new(0.0, 0.0);
     for (index, sample) in segment.iter().copied().enumerate() {
         acc += sample * basis[tone][index] * residual[index];
@@ -1465,10 +1567,11 @@ fn normalize_metric_vector(values: &mut [f32]) {
     }
 }
 
-fn estimate_snr_db(symbols: &[[Complex32; 8]]) -> i32 {
-    let mut maxima = Vec::with_capacity(symbols.len());
-    let mut all = Vec::with_capacity(symbols.len() * 8);
-    for symbol in symbols {
+fn estimate_snr_db(full_tones: &[[Complex32; 8]]) -> i32 {
+    let mut maxima = Vec::with_capacity(crate::protocol::FT8_DATA_POSITIONS.len());
+    let mut all = Vec::with_capacity(crate::protocol::FT8_DATA_POSITIONS.len() * 8);
+    for &symbol_index in crate::protocol::FT8_DATA_POSITIONS.iter() {
+        let symbol = &full_tones[symbol_index];
         let max = symbol
             .iter()
             .map(|tone| tone.norm_sqr())

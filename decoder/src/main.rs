@@ -36,6 +36,9 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         max_successes: usize,
 
+        #[arg(long, default_value_t = 3)]
+        search_passes: usize,
+
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
     },
@@ -92,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_freq_hz,
             max_candidates,
             max_successes,
+            search_passes,
             pretty,
         } => {
             let options = DecodeOptions {
@@ -99,6 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_freq_hz,
                 max_candidates,
                 max_successes,
+                search_passes,
                 ..DecodeOptions::default()
             };
 
