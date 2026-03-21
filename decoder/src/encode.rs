@@ -5,10 +5,10 @@ use num_complex::Complex32;
 use thiserror::Error;
 
 use crate::crc::crc14_ft8;
-use crate::message::{GridReport, ReplyWord};
+use crate::message::{GridReport, ReplyWord, hash_callsign};
 use crate::protocol::{
-    CALL_STANDARD_BASE, FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES,
-    GRAY_TONES_TO_BITS,
+    CALL_NTOKENS, CALL_STANDARD_BASE, FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE,
+    FT8_SYMBOL_SAMPLES, GRAY_TONES_TO_BITS,
 };
 use crate::wave::{AudioBuffer, DecoderError, write_wav};
 
@@ -319,63 +319,97 @@ fn encode_c28(text: &str) -> Result<u32, EncodeError> {
                 }
                 return Err(EncodeError::UnsupportedToken(text.to_string()));
             }
-            Ok(CALL_STANDARD_BASE + encode_standard_callsign(&upper)?)
+            encode_callsign_or_hash(&upper)
         }
     }
 }
 
-fn encode_standard_callsign(callsign: &str) -> Result<u32, EncodeError> {
+fn encode_callsign_or_hash(callsign: &str) -> Result<u32, EncodeError> {
+    let normalized = wsjtx_pack28_workaround(callsign);
+    if normalized.is_empty() {
+        return Err(EncodeError::UnsupportedCallsign(callsign.to_string()));
+    }
+    if let Some(encoded) = encode_standard_callsign(&normalized) {
+        return Ok(CALL_STANDARD_BASE + encoded);
+    }
+    Ok(CALL_NTOKENS + hash_callsign(&normalized, 22) as u32)
+}
+
+fn wsjtx_pack28_workaround(callsign: &str) -> String {
+    let upper = callsign.trim().to_uppercase();
+    if upper.starts_with("3DA0") && upper.len() >= 7 {
+        return format!("3D0{}", &upper[4..7]);
+    }
+    let bytes = upper.as_bytes();
+    if bytes.len() >= 4
+        && bytes[0] == b'3'
+        && bytes[1] == b'X'
+        && bytes[2].is_ascii_uppercase()
+    {
+        let tail_end = upper.len().min(6);
+        return format!("Q{}", &upper[2..tail_end]);
+    }
+    upper
+}
+
+fn encode_standard_callsign(callsign: &str) -> Option<u32> {
     let chars: Vec<char> = callsign.chars().collect();
-    let Some(digit_index) = chars.iter().position(|ch| ch.is_ascii_digit()) else {
-        return Err(EncodeError::UnsupportedCallsign(callsign.to_string()));
-    };
-    if !(digit_index == 1 || digit_index == 2) {
-        return Err(EncodeError::UnsupportedCallsign(callsign.to_string()));
-    }
-    let suffix_len = chars.len().saturating_sub(digit_index + 1);
-    if suffix_len == 0 || suffix_len > 3 || chars.len() > 6 {
-        return Err(EncodeError::UnsupportedCallsign(callsign.to_string()));
+    let digit_indices: Vec<usize> = chars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, ch)| ch.is_ascii_digit().then_some(index))
+        .collect();
+    let &digit_index = digit_indices.last()?;
+    let area_index = digit_index + 1;
+    if !(2..=3).contains(&area_index) {
+        return None;
     }
 
-    let mut packed = [' '; 6];
-    if digit_index == 1 {
-        packed[1] = chars[0];
-        packed[2] = chars[1];
-        for (offset, ch) in chars[2..].iter().copied().enumerate() {
-            packed[3 + offset] = ch;
+    let mut digits_before = 0usize;
+    let mut letters_before = 0usize;
+    for ch in &chars[..digit_index] {
+        if ch.is_ascii_digit() {
+            digits_before += 1;
         }
+        if ch.is_ascii_uppercase() {
+            letters_before += 1;
+        }
+    }
+    let letters_after = chars[digit_index + 1..]
+        .iter()
+        .filter(|ch| ch.is_ascii_uppercase())
+        .count();
+    if letters_before == 0 || digits_before >= digit_index || letters_after > 3 {
+        return None;
+    }
+
+    let trimmed_len = if area_index == 2 { 5 } else { 6 };
+    if chars.len() > trimmed_len {
+        return None;
+    }
+    let body: String = chars.iter().collect();
+    let raw: String = if area_index == 2 {
+        format!(" {:<5}", body)
     } else {
-        packed[0] = chars[0];
-        packed[1] = chars[1];
-        packed[2] = chars[2];
-        for (offset, ch) in chars[3..].iter().copied().enumerate() {
-            packed[3 + offset] = ch;
-        }
+        format!("{body:<6}")
+    };
+    encode_packed_standard_callsign(&raw)
+}
+
+fn encode_packed_standard_callsign(callsign: &str) -> Option<u32> {
+    let padded: Vec<char> = callsign.chars().collect();
+    if padded.len() != 6 {
+        return None;
     }
 
-    let i1 = alphabet37_index(packed[0]).ok_or_else(|| {
-        EncodeError::UnsupportedCallsign(callsign.to_string())
-    })?;
-    let i2 = alphabet36_index(packed[1]).ok_or_else(|| {
-        EncodeError::UnsupportedCallsign(callsign.to_string())
-    })?;
-    let i3 = digit_index_10(packed[2]).ok_or_else(|| {
-        EncodeError::UnsupportedCallsign(callsign.to_string())
-    })?;
-    let i4 = alphabet27_index(packed[3]).ok_or_else(|| {
-        EncodeError::UnsupportedCallsign(callsign.to_string())
-    })?;
-    let i5 = alphabet27_index(packed[4]).ok_or_else(|| {
-        EncodeError::UnsupportedCallsign(callsign.to_string())
-    })?;
-    let i6 = alphabet27_index(packed[5]).ok_or_else(|| {
-        EncodeError::UnsupportedCallsign(callsign.to_string())
-    })?;
+    let i1 = alphabet37_index(padded[0])?;
+    let i2 = alphabet36_index(padded[1])?;
+    let i3 = digit_index_10(padded[2])?;
+    let i4 = alphabet27_index(padded[3])?;
+    let i5 = alphabet27_index(padded[4])?;
+    let i6 = alphabet27_index(padded[5])?;
 
-    Ok(
-        (((((i1 * 36) + i2) * 10 + i3) * 27 + i4) * 27 + i5) * 27
-            + i6,
-    )
+    Some((((((i1 * 36) + i2) * 10 + i3) * 27 + i4) * 27 + i5) * 27 + i6)
 }
 
 fn encode_g15(info: &GridReport) -> Result<u16, EncodeError> {
@@ -485,6 +519,29 @@ mod tests {
         let payload = unpack_message(&frame.codeword_bits).expect("payload");
         let rendered = payload.render(&HashResolver::default());
         assert_eq!(rendered.text, "CQ DX R6WA LN32");
+    }
+
+    #[test]
+    fn encodes_nonstandard_call_as_hash22() {
+        let frame = encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank)
+            .expect("encode");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let mut resolver = HashResolver::default();
+        resolver.insert_callsign("HF19NY");
+        let rendered = payload.render(&resolver);
+        assert_eq!(rendered.text, "CQ HF19NY");
+    }
+
+    #[test]
+    fn encodes_nonstandard_base_callsign_pair() {
+        let frame = encode_standard_message("YO7CGS", "A41ZZ", false, &GridReport::Signal(-11))
+            .expect("encode");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let mut resolver = HashResolver::default();
+        resolver.insert_callsign("YO7CGS");
+        resolver.insert_callsign("A41ZZ");
+        let rendered = payload.render(&resolver);
+        assert_eq!(rendered.text, "YO7CGS A41ZZ -11");
     }
 
     #[test]

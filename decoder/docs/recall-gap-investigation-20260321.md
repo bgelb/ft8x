@@ -48,7 +48,9 @@ This note captures the useful findings from the March 21 investigation round so 
 - `debug-standard-candidate` CLI in [decoder/src/main.rs](/Users/bgelb/ft8-regr/decoder/src/main.rs)
 - `debug_candidate_truth_wav_file` export in [decoder/src/lib.rs](/Users/bgelb/ft8-regr/decoder/src/lib.rs)
 - truth-seeded per-pass diagnostics in [decoder/src/decoder.rs](/Users/bgelb/ft8-regr/decoder/src/decoder.rs)
+- `pack28`-style nonstandard base-call encoding and standard-message hash rendering in [decoder/src/encode.rs](/Users/bgelb/ft8-regr/decoder/src/encode.rs) and [decoder/src/message.rs](/Users/bgelb/ft8-regr/decoder/src/message.rs)
 - These tools are for probing exact truth coordinates and rendered standard messages.
+- This closed a tooling gap for exact-truth probes like `CQ HF19NY` and `YO7CGS A41ZZ -11`, but it did not change the current corpus summary by itself.
 
 ## Important Findings
 
