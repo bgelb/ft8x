@@ -913,7 +913,7 @@ fn collect_candidates(
         if score >= sync_threshold && score.is_finite() {
             raw.push(DecodeCandidate {
                 start_seconds: lag as f32 * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32
-                    + 0.48,
+                    + 0.5,
                 dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32,
                 freq_hz: bin as f32 * SYNC8_BIN_HZ,
                 score,
@@ -929,7 +929,7 @@ fn collect_candidates(
         {
             raw.push(DecodeCandidate {
                 start_seconds: lag as f32 * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32
-                    + 0.48,
+                    + 0.5,
                 dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32,
                 freq_hz: bin as f32 * SYNC8_BIN_HZ,
                 score,
@@ -1106,89 +1106,107 @@ fn try_candidate(
         coarse_freq_hz,
     ) {
         let max_osd = options.max_osd_passes(outer_pass, refined.freq_hz);
-        let mut refined_hit = false;
-        for llrs in &refined.llr_sets {
-            let Some((payload, bits, iterations)) = decode_llr_set(parity, llrs, max_osd, counters)
-            else {
-                continue;
-            };
+        best = try_refined_candidate(
+            &refined,
+            candidate.score,
+            max_osd,
+            allow_ap,
+            parity,
+            counters,
+        );
 
-            let success = SuccessfulDecode {
-                payload,
-                codeword_bits: bits,
-                candidate: DecodeCandidate {
-                    start_seconds: refined.start_seconds,
-                    dt_seconds: refined.start_seconds - 0.5,
-                    freq_hz: refined.freq_hz,
-                    score: refined.sync_score.max(candidate.score),
-                },
-                ldpc_iterations: iterations,
-                snr_db: refined.snr_db,
-            };
-            match &best {
-                Some(existing) if existing.candidate.score >= success.candidate.score => {}
-                _ => best = Some(success),
-            }
-            refined_hit = true;
-            break;
-        }
-
-        if !refined_hit {
-            if let Some((payload, bits, iterations)) =
-                decode_llr_set(parity, &refined.symbol_bit_llrs, max_osd, counters)
+        if best.is_none() && matches!(options.profile, DecodeProfile::Medium) {
+            if let Some(seed) =
+                extract_candidate_from_baseband(&initial_baseband, candidate.start_seconds, coarse_freq_hz)
             {
-                let success = SuccessfulDecode {
-                    payload,
-                    codeword_bits: bits,
-                    candidate: DecodeCandidate {
-                        start_seconds: refined.start_seconds,
-                        dt_seconds: refined.start_seconds - 0.5,
-                        freq_hz: refined.freq_hz,
-                        score: refined.sync_score.max(candidate.score),
-                    },
-                    ldpc_iterations: iterations,
-                    snr_db: refined.snr_db,
-                };
-                match &best {
-                    Some(existing) if existing.candidate.score >= success.candidate.score => {}
-                    _ => best = Some(success),
-                }
-                refined_hit = true;
-            }
-        }
-
-        if allow_ap && !refined_hit && best.is_none() {
-            let ap_magnitude = refined.llr_sets[0]
-                .iter()
-                .map(|value| value.abs())
-                .fold(0.0f32, f32::max)
-                * 1.01;
-            if ap_magnitude > 0.0 {
-                for known_bits in [cq_ap_known_bits(), mycall_ap_known_bits()] {
-                    let ap_llrs =
-                        llrs_with_known_bits(&refined.llr_sets[0], known_bits, ap_magnitude);
-                    if let Some((payload, bits, iterations)) =
-                        decode_llr_set_with_known_bits(parity, &ap_llrs, known_bits, max_osd, counters)
-                    {
-                        best = Some(SuccessfulDecode {
-                            payload,
-                            codeword_bits: bits,
-                            candidate: DecodeCandidate {
-                                start_seconds: refined.start_seconds,
-                                dt_seconds: refined.start_seconds - 0.5,
-                                freq_hz: refined.freq_hz,
-                                score: refined.sync_score.max(candidate.score),
-                            },
-                            ldpc_iterations: iterations,
-                            snr_db: refined.snr_db,
-                        });
-                        break;
-                    }
-                }
+                best = try_refined_candidate(
+                    &seed,
+                    candidate.score,
+                    max_osd,
+                    allow_ap,
+                    parity,
+                    counters,
+                );
             }
         }
     }
     best
+}
+
+fn try_refined_candidate(
+    refined: &RefinedCandidate,
+    candidate_score: f32,
+    max_osd: isize,
+    allow_ap: bool,
+    parity: &ParityMatrix,
+    counters: &mut DecodeCounters,
+) -> Option<SuccessfulDecode> {
+    for llrs in &refined.llr_sets {
+        let Some((payload, bits, iterations)) = decode_llr_set(parity, llrs, max_osd, counters)
+        else {
+            continue;
+        };
+        return Some(SuccessfulDecode {
+            payload,
+            codeword_bits: bits,
+            candidate: DecodeCandidate {
+                start_seconds: refined.start_seconds,
+                dt_seconds: refined.start_seconds - 0.5,
+                freq_hz: refined.freq_hz,
+                score: refined.sync_score.max(candidate_score),
+            },
+            ldpc_iterations: iterations,
+            snr_db: refined.snr_db,
+        });
+    }
+
+    if let Some((payload, bits, iterations)) =
+        decode_llr_set(parity, &refined.symbol_bit_llrs, max_osd, counters)
+    {
+        return Some(SuccessfulDecode {
+            payload,
+            codeword_bits: bits,
+            candidate: DecodeCandidate {
+                start_seconds: refined.start_seconds,
+                dt_seconds: refined.start_seconds - 0.5,
+                freq_hz: refined.freq_hz,
+                score: refined.sync_score.max(candidate_score),
+            },
+            ldpc_iterations: iterations,
+            snr_db: refined.snr_db,
+        });
+    }
+
+    if allow_ap {
+        let ap_magnitude = refined.llr_sets[0]
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0f32, f32::max)
+            * 1.01;
+        if ap_magnitude > 0.0 {
+            for known_bits in [cq_ap_known_bits(), mycall_ap_known_bits()] {
+                let ap_llrs = llrs_with_known_bits(&refined.llr_sets[0], known_bits, ap_magnitude);
+                if let Some((payload, bits, iterations)) =
+                    decode_llr_set_with_known_bits(parity, &ap_llrs, known_bits, max_osd, counters)
+                {
+                    return Some(SuccessfulDecode {
+                        payload,
+                        codeword_bits: bits,
+                        candidate: DecodeCandidate {
+                            start_seconds: refined.start_seconds,
+                            dt_seconds: refined.start_seconds - 0.5,
+                            freq_hz: refined.freq_hz,
+                            score: refined.sync_score.max(candidate_score),
+                        },
+                        ldpc_iterations: iterations,
+                        snr_db: refined.snr_db,
+                    });
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn refine_candidate(
@@ -1278,8 +1296,16 @@ fn extract_candidate_at(
     freq_hz: f32,
 ) -> Option<RefinedCandidate> {
     let baseband = downsample_candidate(long_spectrum, baseband_plan, freq_hz)?;
+    extract_candidate_from_baseband(&baseband, start_seconds, freq_hz)
+}
+
+fn extract_candidate_from_baseband(
+    baseband: &[Complex32],
+    start_seconds: f32,
+    freq_hz: f32,
+) -> Option<RefinedCandidate> {
     let start_index = (start_seconds * BASEBAND_RATE_HZ).round() as isize;
-    let full_tones = extract_symbol_tones(&baseband, start_index);
+    let full_tones = extract_symbol_tones(baseband, start_index);
     if sync_quality(&full_tones) <= 6 {
         return None;
     }
@@ -1288,7 +1314,7 @@ fn extract_candidate_at(
     Some(RefinedCandidate {
         start_seconds,
         freq_hz,
-        sync_score: sync8d(&baseband, start_index, 0.0),
+        sync_score: sync8d(baseband, start_index, 0.0),
         snr_db: estimate_snr_db(&full_tones),
         llr_sets,
         symbol_bit_llrs,
