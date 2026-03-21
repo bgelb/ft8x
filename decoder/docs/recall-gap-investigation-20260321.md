@@ -54,6 +54,25 @@ This note captures the useful findings from the March 21 investigation round so 
 
 ## Important Findings
 
+### 0. One medium "FP" is likely real
+
+- Treat `191111_110215 | GJ0KYZ VK2LAW QF56` as a likely real decode, not obvious junk.
+- Reason:
+  - `GJ0KYZ` is a real Jersey callsign and has independent FT8 activity evidence.
+  - `VK2LAW` is a real Australian callsign with independent FT8 activity evidence.
+  - The `QF56` locator is consistent with `VK2LAW` in multiple public references and on-air logs.
+  - In normal FT8 sequencing, a message of the form `DXCALL MYCALL GRID` carries the responding station's grid, so `QF56` lining up with `VK2LAW` is the expected structure.
+- Public callbooks disagree on the exact stored locator for `VK2LAW`, so treat this as "likely real" rather than absolute proof. The stronger evidence is that at least one public callbook and third-party FT8/QSO references align `VK2LAW` with `QF56`.
+
+### 0b. One other medium "FP" is probably spurious
+
+- Treat `websdr_test4 | GM7DGR 4A5QKM R NH65` as likely bogus and do not relabel it as truth.
+- Reason:
+  - `R EM61`-style messages are valid FT8 structure, so the issue is not syntax alone.
+  - The `NH65` locator is centered near `93E, 14.5S`, which is Indian Ocean geography and does not plausibly match either a `GM7...` Scotland call or a `4A...` Mexico call.
+  - `QRZCQ` returns `CALL_NOT_FOUND` for both exact calls, and `HamQTH` exposes only placeholder entries with no country or locator data.
+  - WSJT-X 2.7.0 does not decode this message on the same sample.
+
 ### 1. Remaining misses are mixed search-side and downstream
 
 - Not all remaining WSJT-X-only misses are downstream failures.
