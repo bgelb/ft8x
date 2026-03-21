@@ -256,17 +256,18 @@ impl ParityMatrix {
         }
 
         for (index, llrs) in saved_llrs.iter().enumerate() {
-            if let Some(bits) = self.decode_osd_medium(llrs, known_bits) {
+            if let Some(bits) = self.decode_osd(llrs, known_bits, 2) {
                 return Some((bits, MAX_ITERS + index + 1));
             }
         }
         None
     }
 
-    fn decode_osd_medium(
+    fn decode_osd(
         &self,
         llrs: &[f32],
         known_bits: Option<&[Option<u8>]>,
+        max_order: usize,
     ) -> Option<Vec<u8>> {
         if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
             return None;
@@ -366,7 +367,34 @@ impl ParityMatrix {
                     let distance = weighted_distance(&codeword2, &hard, &reliabilities);
                     if distance < best_distance {
                         best_distance = distance;
-                        best_codeword = codeword2;
+                        best_codeword = codeword2.clone();
+                    }
+
+                    if max_order >= 3 {
+                        let parity_tail2 = xor_tail(&codeword2, &hard, K);
+                        for third in (0..second).rev() {
+                            if apmask[third] {
+                                continue;
+                            }
+                            let nd3kpt = parity_tail2
+                                .iter()
+                                .zip(genmrb[third][K..].iter())
+                                .take(OSD_NT)
+                                .map(|(&tail_bit, &basis_bit)| (tail_bit ^ basis_bit) as usize)
+                                .sum::<usize>()
+                                + 3;
+                            if nd3kpt > OSD_NTHETA {
+                                continue;
+                            }
+                            let mut message3 = message2.clone();
+                            message3[third] ^= 1;
+                            let codeword3 = encode_mrb(&message3, &genmrb);
+                            let distance = weighted_distance(&codeword3, &hard, &reliabilities);
+                            if distance < best_distance {
+                                best_distance = distance;
+                                best_codeword = codeword3;
+                            }
+                        }
                     }
                 }
             }

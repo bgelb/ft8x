@@ -14,6 +14,19 @@
   - a clean empirical validation against synthetic and corpus data,
   - or a named/tunable configuration point in the Rust implementation.
 
+## Profile Contract
+
+- `medium` and `deepest` are WSJT-X compatibility targets, not open-ended optimization profiles.
+- For those profiles, prefer feature-for-feature alignment with the corresponding WSJT-X decode path before adding custom search, AP, or pruning behavior.
+- If a change would make `medium` or `deepest` materially diverge from WSJT-X behavior, either:
+  - gate it behind a new profile, or
+  - make the divergence explicit and temporary, with a clear plan to restore compatibility.
+- Use `unlimited` for non-WSJT-X experiments, aggressive recall tricks, or any strategy whose purpose is to beat WSJT-X rather than match its feature set.
+- When benchmarking profile changes, compare like-for-like:
+  - `medium` against WSJT-X medium semantics
+  - `deepest` against WSJT-X deepest semantics
+  - `unlimited` against the best available reference, without compatibility constraints
+
 ## Investigation Notes
 
 - Prefer corpus-level A/B runs over intuition. Several plausible-looking changes were neutral or harmful, and the harness results made that obvious quickly.

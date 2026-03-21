@@ -103,9 +103,17 @@ impl DecodeOptions {
             DecodeProfile::Quick => -1,
             DecodeProfile::Medium => 0,
             DecodeProfile::Deepest => {
-                if outer_pass == 0 { 0 } else { 3 }
+                if outer_pass == 0 {
+                    0
+                } else {
+                    3
+                }
             }
         }
+    }
+
+    fn max_candidates_for_pass(&self, _outer_pass: usize) -> usize {
+        self.max_candidates
     }
 }
 
@@ -601,7 +609,9 @@ fn run_decode_search(
 
     for pass in 0..total_passes {
         let long_spectrum = build_long_spectrum(&residual_audio);
-        let candidates = collect_candidates(&residual_audio, options, sync_threshold);
+        let mut pass_options = options.clone();
+        pass_options.max_candidates = options.max_candidates_for_pass(pass);
+        let candidates = collect_candidates(&residual_audio, &pass_options, sync_threshold);
         if pass == 0 {
             top_candidates = candidates.clone();
         }
@@ -965,7 +975,7 @@ fn subtract_candidate(audio: &mut AudioBuffer, success: &SuccessfulDecode, plan:
 }
 
 fn try_candidate(
-    search_grid: SearchGrid,
+    _search_grid: SearchGrid,
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
     candidate: &DecodeCandidate,
@@ -975,22 +985,16 @@ fn try_candidate(
     allow_ap: bool,
     counters: &mut DecodeCounters,
 ) -> Option<SuccessfulDecode> {
-    let base_bin =
-        (candidate.freq_hz / FT8_TONE_SPACING_HZ).round() as isize - search_grid.min_bin as isize;
     let hop_seconds = HOP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32;
+    let coarse_freq_step_hz = SYNC8_BIN_HZ;
 
     let mut best: Option<SuccessfulDecode> = None;
     let mut refined_basebands = Vec::<(i32, Vec<Complex32>)>::new();
-    for bin_delta in -2..=2 {
-        let candidate_bin = base_bin + bin_delta;
-        if candidate_bin < 0 {
+    for bin_delta in -4..=4 {
+        let coarse_freq_hz = candidate.freq_hz + bin_delta as f32 * coarse_freq_step_hz;
+        if coarse_freq_hz < options.min_freq_hz || coarse_freq_hz > options.max_freq_hz {
             continue;
         }
-        let candidate_bin = candidate_bin as usize;
-        if candidate_bin + 7 >= search_grid.usable_bins {
-            continue;
-        }
-        let coarse_freq_hz = (search_grid.min_bin + candidate_bin) as f32 * FT8_TONE_SPACING_HZ;
         let Some(initial_baseband) =
             downsample_candidate(long_spectrum, baseband_plan, coarse_freq_hz)
         else {
