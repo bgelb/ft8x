@@ -13,6 +13,7 @@
   - a protocol or signal-model explanation,
   - a clean empirical validation against synthetic and corpus data,
   - or a named/tunable configuration point in the Rust implementation.
+- Treat corpus "truth" as a high-quality decoder consensus label set, not ground truth from the air interface. When Rust produces an apparent FP that is stable, plausible, or supported by multiple decoders, investigate it as a possible real decode rather than assuming the Rust path regressed.
 
 ## Profile Contract
 
@@ -30,6 +31,7 @@
 ## Investigation Notes
 
 - Prefer corpus-level A/B runs over intuition. Several plausible-looking changes were neutral or harmful, and the harness results made that obvious quickly.
+- Optimize primarily for recall against the labeled corpus and WSJT-X profile peers, but interpret FP deltas carefully. A lower FP count is good, yet a higher FP count is not automatically bad if the extra decodes look physically plausible or repeatedly show up across decoders/runs.
 - After any structural decoder change, inspect worst samples individually and determine whether misses are absent from the candidate list or present-but-failing downstream. That split has been the fastest way to localize the real bottleneck.
 - Compare against the exact WSJT-X path being targeted, not a guessed profile. For FT8 this matters because `quick`, `medium`, and `deepest` differ materially, and single-file `jt9` runs still enable more machinery than they first appear to.
 - When borrowing ideas from WSJT-X, inspect the whole local mechanism around them. Reading only one routine in isolation led to a bad early `sync8` port; reading `sync8`, `ft8_decode`, `ft8b`, `sync8d`, and `ft8_downsample` together was much more effective.

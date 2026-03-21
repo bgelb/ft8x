@@ -278,7 +278,7 @@ fn render_call(field: &CallField, resolver: &HashResolver) -> String {
         CallField::Standard(callsign) => callsign.clone(),
         CallField::Hash22(hash) => resolver
             .resolve22(*hash)
-            .map(|callsign| format!("<{callsign}>"))
+            .map(ToOwned::to_owned)
             .unwrap_or_else(|| "<...>".to_string()),
     }
 }
