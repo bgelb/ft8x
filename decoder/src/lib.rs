@@ -8,8 +8,8 @@ mod wave;
 
 pub use decoder::{
     CandidateDebugReport, CandidatePassDebug, DecodeCandidate, DecodeDiagnostics, DecodeOptions,
-    DecodeProfile, DecodeReport, DecodedMessage, debug_candidate_pcm, debug_candidate_wav_file,
-    decode_pcm, decode_wav_file,
+    DecodeProfile, DecodeReport, DecodedMessage, debug_candidate_pcm,
+    debug_candidate_truth_wav_file, debug_candidate_wav_file, decode_pcm, decode_wav_file,
 };
 pub use encode::{
     EncodeError, EncodedFrame, WaveformOptions, channel_symbols_from_codeword_bits,
