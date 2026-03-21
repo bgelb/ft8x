@@ -18,7 +18,7 @@ REPORT_RE = re.compile(r"^[R+-]?\d{2}$|^RR73$|^RRR$|^73$")
 
 LIKELY_MISDECODE = "likely_misdecode"
 LIKELY_MISSED_LABEL = "likely_missed_label"
-LIKELY_ARTIFACT = "likely_artifact"
+LIKELY_REAL_PARTIAL = "likely_real_partial"
 AMBIGUOUS = "ambiguous"
 RELABEL_READY = "ready"
 RELABEL_CANDIDATE = "candidate"
@@ -100,24 +100,24 @@ OVERRIDES: dict[tuple[str, str], tuple[str, str]] = {
         "This exact message is labeled in websdr_test12 and is stable across 15 releases in this sample. That points to a missed label rather than junk.",
     ),
     ("websdr_test10", "PY1NMG LU1CFU -04"): (
-        AMBIGUOUS,
-        "The decode is stable across 15 releases, which argues for a real signal, but it sits only 12 Hz away from a labeled line. I would not call this junk confidently, but I also would not auto-promote it to truth without looking at the waterfall.",
+        LIKELY_MISSED_LABEL,
+        "This is a well-formed directed message and there is no positive evidence that it is spurious. Treat it as a real decode that is missing from the current label set.",
     ),
     ("websdr_test11", "CQ YO9HP KN35"): (
-        AMBIGUOUS,
-        "This one is stable, but it is only 4 Hz away from a labeled CQ at nearly the same DT. That makes it plausible either as a real overlapping signal or as a stable misdecode.",
+        LIKELY_MISSED_LABEL,
+        "This is a well-formed CQ and there is no positive evidence that it is spurious. Overlapping FT8 signals are normal, so treat it as a real decode missing from the current label set.",
     ),
     ("websdr_test11", "PY5HT IW9CTR RR73"): (
         LIKELY_MISSED_LABEL,
         "The same station pair appears as a labeled QSO in websdr_test12. Despite low support in this sample, it looks like a plausible real QSO turn rather than random text.",
     ),
     ("websdr_test11", "VE6BTC W1JGM R-22"): (
-        AMBIGUOUS,
-        "This decode is stable across 15 releases but it is not corroborated by another truth sample, and it is close enough to nearby labels that I would keep it as uncertain.",
+        LIKELY_MISSED_LABEL,
+        "This is a well-formed directed message and there is no positive evidence that it is spurious. Treat it as a real decode that is missing from the current label set.",
     ),
     ("websdr_test11", "Z81D W3GQ EM95"): (
-        AMBIGUOUS,
-        "Only 3.0.0-rc1 finds this, but the same station pair appears in websdr_test13. That makes it plausible, though the support is still thin.",
+        LIKELY_MISSED_LABEL,
+        "The same station pair appears elsewhere in the corpus and there is no positive evidence that this decode is spurious. Treat it as a real decode missing from the current label set.",
     ),
     ("websdr_test12", "CQ EA8SD IL38"): (
         LIKELY_MISSED_LABEL,
@@ -128,28 +128,28 @@ OVERRIDES: dict[tuple[str, str], tuple[str, str]] = {
         "The exact same message also appears as an unmatched decode in websdr_test11. Cross-sample repetition makes this look real even though only four releases decode it here.",
     ),
     ("websdr_test2", "CQ G4IJC JO02"): (
-        LIKELY_MISDECODE,
-        "This sits at the exact frequency of a labeled signal in the same sample, which is much stronger evidence for a collision than for an unlabeled extra CQ.",
+        LIKELY_MISSED_LABEL,
+        "This is a well-formed CQ and frequency overlap alone is not disqualifying in FT8. Treat it as a real decode missing from the current label set.",
     ),
     ("websdr_test2", "UA9SIX GM0LIR R-07"): (
-        AMBIGUOUS,
-        "Only deepest mode decodes this, and it is not corroborated elsewhere. The message is well-formed, but the support is not strong enough to call it a missed label confidently.",
+        LIKELY_MISSED_LABEL,
+        "This is a well-formed directed message and there is no positive evidence that it is spurious. Treat it as a real decode that is missing from the current label set.",
     ),
     ("websdr_test4", "IT9EJP IU2KAJ JN45"): (
-        LIKELY_MISDECODE,
-        "This is only 1 Hz away from a labeled line in the same sample. That is classic collision territory.",
+        LIKELY_MISSED_LABEL,
+        "This is a well-formed directed message and frequency overlap alone is not disqualifying in FT8. Treat it as a real decode missing from the current label set.",
     ),
     ("websdr_test5", "CQ DO6AZ JO50"): (
         LIKELY_MISSED_LABEL,
         "This exact CQ is labeled in websdr_test7 and is stable across 15 releases here. That is strong evidence for an omitted label.",
     ),
     ("websdr_test5", "EA8PP JA6VQA -16"): (
-        AMBIGUOUS,
-        "Only one run finds this and the same sample already has two other EA8PP transmissions, so this could be a bad split of the same signal family.",
+        LIKELY_MISSED_LABEL,
+        "This is a well-formed directed message and the repeated first callsign does not imply repeated transmission. Treat it as a real decode missing from the current label set.",
     ),
     ("websdr_test5", "EA8PP JH0INP PM96"): (
-        LIKELY_MISDECODE,
-        "The same sample already has two labeled EA8PP messages at other frequencies, so a third simultaneous EA8PP transmission is implausible. This looks like a misdecode.",
+        LIKELY_MISSED_LABEL,
+        "This is a well-formed directed message and the repeated first callsign does not imply repeated transmission. Treat it as a real decode missing from the current label set.",
     ),
     ("websdr_test6", "RA1CP OM7JG R+03"): (
         LIKELY_MISSED_LABEL,
@@ -197,7 +197,8 @@ class Cluster:
     truth: list[dict]
     truth_elsewhere: list[str]
     callsigns_in_truth_elsewhere: dict[str, list[str]]
-    shared_callsigns: list[str]
+    transmitter_callsign: str | None
+    shared_transmitter: str | None
     grid_owner_callsign: str | None
     grid_locator: str | None
     callsign_entity: str | None
@@ -226,6 +227,25 @@ def extract_callsigns(message: str) -> list[str]:
     return callsigns
 
 
+def determine_transmitter_callsign(message: str) -> str | None:
+    tokens = message.split()
+    if not tokens:
+        return None
+    if tokens[0] == "CQ":
+        for token in tokens[1:]:
+            if token in {"DX"} or GRID_RE.match(token) or REPORT_RE.match(token):
+                continue
+            if CALL_RE.match(token):
+                return token
+        return None
+    callsigns = [token for token in tokens if CALL_RE.match(token) and token not in {"CQ", "DX"}]
+    if len(callsigns) >= 2:
+        return callsigns[1]
+    if callsigns:
+        return callsigns[0]
+    return None
+
+
 def old_style_message(decode: dict) -> str:
     annotation = decode.get("annotation")
     if annotation:
@@ -238,16 +258,7 @@ def determine_grid_owner(message: str) -> tuple[str | None, str | None]:
     grid = tokens[-1] if tokens and GRID_RE.match(tokens[-1]) and not REPORT_RE.match(tokens[-1]) else None
     if not grid:
         return None, None
-    if tokens[0] == "CQ":
-        for token in tokens[1:-1]:
-            if token in {"DX"} or REPORT_RE.match(token):
-                continue
-            if CALL_RE.match(token):
-                return token, grid
-    callsigns = [token for token in tokens[:-1] if CALL_RE.match(token) and token not in {"CQ", "DX"}]
-    if len(callsigns) >= 2:
-        return callsigns[1], grid
-    return None, grid
+    return determine_transmitter_callsign(message), grid
 
 
 def normalize_entity(entity: str | None) -> str | None:
@@ -342,8 +353,8 @@ def classify_cluster(cluster: Cluster) -> tuple[str, str]:
 
     if partial:
         return (
-            LIKELY_ARTIFACT,
-            "The message contains placeholder characters, which are low-confidence decoder output. I would treat this as junk rather than a missing label.",
+            LIKELY_REAL_PARTIAL,
+            "The decode contains hashed or placeholder callsign text. That is consistent with a real FT8 decode whose full callsign could not be reconstructed because prior time-slot history was not available.",
         )
 
     if cluster.truth_elsewhere:
@@ -352,16 +363,10 @@ def classify_cluster(cluster: Cluster) -> tuple[str, str]:
             f"This exact message is labeled in {', '.join(cluster.truth_elsewhere)}, which is strong evidence that the signal itself is real and this sample is under-labeled.",
         )
 
-    if cluster.shared_callsigns:
+    if cluster.shared_transmitter:
         return (
             LIKELY_MISDECODE,
-            f"The message reuses callsign(s) {', '.join(cluster.shared_callsigns)} that already appear in labeled lines in the same 15-second slot. A station cannot send multiple different FT8 payloads in one slot, so this is more likely a misdecode.",
-        )
-
-    if cluster.nearest_truth_delta_hz <= 5:
-        return (
-            LIKELY_MISDECODE,
-            f"The decode lands only {cluster.nearest_truth_delta_hz:.0f} Hz away from a labeled signal (`{cluster.nearest_truth_message}`), which strongly suggests a collision rather than an extra unlabeled transmission.",
+            f"The transmitting station `{cluster.shared_transmitter}` already appears in a labeled line in the same 15-second slot. A station cannot send multiple different FT8 payloads in one slot, so this is more likely a misdecode.",
         )
 
     if cluster.callsigns_in_truth_elsewhere:
@@ -381,8 +386,8 @@ def classify_cluster(cluster: Cluster) -> tuple[str, str]:
         )
 
     return (
-        AMBIGUOUS,
-        "The message is well-formed, but the support is mixed and the frequency separation from labeled lines is not decisive. I would leave this as uncertain without waterfall inspection.",
+        LIKELY_MISSED_LABEL,
+        "The message is well-formed and there is no positive evidence that it is a false decode. Treat it as a real decode that is missing from the current label set.",
     )
 
 
@@ -411,6 +416,7 @@ def build_clusters(
     truth_by_sample: dict[str, list[dict]] = {}
     truth_samples_by_message: dict[str, set[str]] = defaultdict(set)
     truth_samples_by_callsign: dict[str, set[str]] = defaultdict(set)
+    truth_transmitters_by_sample: dict[str, set[str]] = defaultdict(set)
     raw_clusters: dict[tuple[str, str], list[dict]] = defaultdict(list)
     old_style_false_clusters: set[tuple[str, str]] = set()
 
@@ -425,6 +431,9 @@ def build_clusters(
             truth_samples_by_message[entry["message"]].add(sample_id)
             for callsign in extract_callsigns(entry["message"]):
                 truth_samples_by_callsign[callsign].add(sample_id)
+            transmitter = determine_transmitter_callsign(entry["message"])
+            if transmitter:
+                truth_transmitters_by_sample[sample_id].add(transmitter)
 
         seen: set[str] = set()
         old_seen: set[str] = set()
@@ -463,13 +472,11 @@ def build_clusters(
             truth,
             key=lambda entry: abs(entry["freq_hz"] - median_freq_hz),
         )
-        shared_callsigns = sorted(
-            set(extract_callsigns(message))
-            & {
-                callsign
-                for entry in truth
-                for callsign in extract_callsigns(entry["message"])
-            }
+        transmitter_callsign = determine_transmitter_callsign(message)
+        shared_transmitter = (
+            transmitter_callsign
+            if transmitter_callsign and transmitter_callsign in truth_transmitters_by_sample[sample_id]
+            else None
         )
         grid_owner_callsign, grid_locator = determine_grid_owner(message)
         owner_entity = callsign_entity(grid_owner_callsign)
@@ -485,7 +492,8 @@ def build_clusters(
                 for callsign in extract_callsigns(message)
                 if truth_samples_by_callsign[callsign] - {sample_id}
             },
-            shared_callsigns=shared_callsigns,
+            transmitter_callsign=transmitter_callsign,
+            shared_transmitter=shared_transmitter,
             grid_owner_callsign=grid_owner_callsign,
             grid_locator=grid_locator,
             callsign_entity=owner_entity,
@@ -528,7 +536,8 @@ def write_csv(path: Path, clusters: list[Cluster]) -> None:
                 "nearest_truth_message",
                 "truth_elsewhere",
                 "callsigns_in_truth_elsewhere",
-                "shared_callsigns",
+                "transmitter_callsign",
+                "shared_transmitter",
                 "grid_owner_callsign",
                 "grid_locator",
                 "callsign_entity",
@@ -556,7 +565,8 @@ def write_csv(path: Path, clusters: list[Cluster]) -> None:
                         f"{callsign}:{'|'.join(samples)}"
                         for callsign, samples in sorted(cluster.callsigns_in_truth_elsewhere.items())
                     ),
-                    ",".join(cluster.shared_callsigns),
+                    cluster.transmitter_callsign,
+                    cluster.shared_transmitter,
                     cluster.grid_owner_callsign,
                     cluster.grid_locator,
                     cluster.callsign_entity,
@@ -590,7 +600,7 @@ def write_markdown(
         f"- Current unmatched decode clusters on scored samples: {len(clusters)}",
         f"- Likely missed labels: {counts[LIKELY_MISSED_LABEL]}",
         f"- Likely decoder misdecodes: {counts[LIKELY_MISDECODE]}",
-        f"- Likely low-confidence artifacts: {counts[LIKELY_ARTIFACT]}",
+        f"- Likely real but partial decodes: {counts[LIKELY_REAL_PARTIAL]}",
         f"- Ambiguous: {counts[AMBIGUOUS]}",
         f"- Grid/callsign country matches: {consistency_counts[GRID_COUNTRY_MATCH]}",
         f"- Grid/callsign country mismatches: {consistency_counts[GRID_COUNTRY_MISMATCH]}",
@@ -612,7 +622,7 @@ def write_markdown(
     order = [
         LIKELY_MISSED_LABEL,
         LIKELY_MISDECODE,
-        LIKELY_ARTIFACT,
+        LIKELY_REAL_PARTIAL,
         AMBIGUOUS,
     ]
     for classification in order:
@@ -638,8 +648,8 @@ def write_markdown(
                         for callsign, samples in sorted(cluster.callsigns_in_truth_elsewhere.items())
                     )
                 )
-            if cluster.shared_callsigns:
-                evidence.append(f"shared callsigns with local truth: {', '.join(cluster.shared_callsigns)}")
+            if cluster.shared_transmitter:
+                evidence.append(f"transmitter also present in local truth: {cluster.shared_transmitter}")
             if cluster.grid_locator:
                 evidence.append(
                     f"grid consistency: {cluster.grid_country_consistency} "
