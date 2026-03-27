@@ -1038,7 +1038,8 @@ fn subtract_candidate(audio: &mut AudioBuffer, success: &SuccessfulDecode, plan:
     let Some(channel_symbols) = channel_symbols_from_codeword_bits(&success.codeword_bits) else {
         return;
     };
-    let start_sample = (success.candidate.start_seconds * FT8_SAMPLE_RATE as f32).round() as isize;
+    let start_sample =
+        ((success.candidate.dt_seconds + 0.5) * FT8_SAMPLE_RATE as f32 + 1.0).trunc() as isize - 1;
     let reference = synthesize_channel_reference(&channel_symbols, success.candidate.freq_hz);
     let frame_len = reference.len();
     let mut envelope = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
@@ -1415,9 +1416,11 @@ impl SubtractionPlan {
 
         let mut edge_correction = Vec::with_capacity(SUBTRACT_FILTER_HALF + 1);
         for edge in 0..=SUBTRACT_FILTER_HALF {
-            let first = SUBTRACT_FILTER_HALF - edge;
-            let available = window[first..].iter().copied().sum::<f32>();
-            edge_correction.push((sumw / available).max(1.0));
+            let missing = window[SUBTRACT_FILTER_HALF + edge..]
+                .iter()
+                .copied()
+                .sum::<f32>();
+            edge_correction.push(1.0 / (1.0 - missing / sumw));
         }
 
         Self {
