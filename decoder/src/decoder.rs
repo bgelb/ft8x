@@ -260,6 +260,7 @@ const LONG_FFT_SAMPLES: usize = 192_000;
 const DOWNSAMPLE_FACTOR: usize = 60;
 const SYNC8_FFT_SAMPLES: usize = FT8_SYMBOL_SAMPLES * 2;
 const SYNC8_STEP_SAMPLES: usize = FT8_SYMBOL_SAMPLES / 4;
+const SYNC8_STEP_SECONDS: f32 = SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32;
 const SYNC8_MAX_LAG: isize = 62;
 const SYNC8_LOCAL_LAG: isize = 10;
 const SYNC8_THRESHOLD: f32 = 1.6;
@@ -887,7 +888,7 @@ fn collect_candidates(
 
     let mut primary = Vec::with_capacity(max_bin - min_bin + 1);
     let mut secondary = Vec::with_capacity(max_bin - min_bin + 1);
-    let nominal_start = (0.5f32 / (SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32)) as isize;
+    let nominal_start = (0.5f32 / SYNC8_STEP_SECONDS) as isize;
 
     for bin in min_bin..=max_bin {
         let mut best_local = (f32::NEG_INFINITY, 0isize);
@@ -914,7 +915,7 @@ fn collect_candidates(
             raw.push(DecodeCandidate {
                 start_seconds: lag as f32 * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32
                     + 0.5,
-                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32,
+                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SECONDS,
                 freq_hz: bin as f32 * SYNC8_BIN_HZ,
                 score,
             });
@@ -930,7 +931,7 @@ fn collect_candidates(
             raw.push(DecodeCandidate {
                 start_seconds: lag as f32 * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32
                     + 0.5,
-                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32,
+                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SECONDS,
                 freq_hz: bin as f32 * SYNC8_BIN_HZ,
                 score,
             });
@@ -953,7 +954,7 @@ fn collect_candidates(
     let mut selected = Vec::new();
     for candidate in prioritized {
         let too_close = selected.iter().any(|existing: &DecodeCandidate| {
-            (existing.dt_seconds - candidate.dt_seconds).abs() < 0.04
+            (existing.dt_seconds - candidate.dt_seconds).abs() < SYNC8_STEP_SECONDS
                 && (existing.freq_hz - candidate.freq_hz).abs() < 4.0
         });
         if too_close {
@@ -1548,7 +1549,8 @@ fn normalize_sync_scores(scores: &mut [(usize, isize, f32)]) {
 
 fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
     let mut sync = 0.0f32;
-    let residual = (residual_hz != 0.0).then(|| residual_tweak(residual_hz));
+    let waveforms = sync8d_waveforms();
+    let tweak = (residual_hz != 0.0).then(|| sync8d_tweak(residual_hz));
     for (offset, tone) in crate::protocol::FT8_COSTAS.iter().copied().enumerate() {
         for block in [0usize, 36, 72] {
             let symbol_start = start_index + ((block + offset) * BASEBAND_SYMBOL_SAMPLES) as isize;
@@ -1558,10 +1560,14 @@ fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
             }
             let segment =
                 &baseband[symbol_start as usize..symbol_start as usize + BASEBAND_SYMBOL_SAMPLES];
-            let corr = match &residual {
-                Some(residual) => correlate_tone_residual(segment, tone, residual),
-                None => correlate_tone_nominal(segment, tone),
-            };
+            let mut corr = Complex32::new(0.0, 0.0);
+            for (index, sample) in segment.iter().copied().enumerate() {
+                let mut sync_wave = waveforms[tone][index];
+                if let Some(tweak) = &tweak {
+                    sync_wave *= tweak[index];
+                }
+                corr += sample * sync_wave.conj();
+            }
             sync += corr.norm_sqr();
         }
     }
@@ -1794,7 +1800,7 @@ fn baseband_taper() -> &'static [f32] {
 }
 
 fn correlate_tone_nominal(segment: &[Complex32], tone: usize) -> Complex32 {
-    let basis = tone_basis();
+    let basis = sync8d_basis();
     let mut acc = Complex32::new(0.0, 0.0);
     for (index, sample) in segment.iter().copied().enumerate() {
         acc += sample * basis[tone][index];
@@ -1802,36 +1808,51 @@ fn correlate_tone_nominal(segment: &[Complex32], tone: usize) -> Complex32 {
     acc
 }
 
-fn correlate_tone_residual(
-    segment: &[Complex32],
-    tone: usize,
-    residual: &[Complex32; BASEBAND_SYMBOL_SAMPLES],
-) -> Complex32 {
-    let basis = tone_basis();
-    let mut acc = Complex32::new(0.0, 0.0);
-    for (index, sample) in segment.iter().copied().enumerate() {
-        acc += sample * basis[tone][index] * residual[index];
-    }
-    acc
-}
-
-fn tone_basis() -> &'static [[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8] {
+fn sync8d_basis() -> &'static [[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8] {
     static BASIS: OnceLock<[[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8]> = OnceLock::new();
     BASIS.get_or_init(|| {
         std::array::from_fn(|tone| {
+            let tone = tone as f32;
+            let mut phase = 0.0f32;
+            let delta = 2.0 * std::f32::consts::PI * tone / BASEBAND_SYMBOL_SAMPLES as f32;
             std::array::from_fn(|index| {
-                let phase = -2.0 * std::f32::consts::PI * tone as f32 * index as f32
-                    / BASEBAND_SYMBOL_SAMPLES as f32;
-                Complex32::new(phase.cos(), phase.sin())
+                let sample = Complex32::new(phase.cos(), -phase.sin());
+                if index + 1 < BASEBAND_SYMBOL_SAMPLES {
+                    phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
+                }
+                sample
             })
         })
     })
 }
 
-fn residual_tweak(residual_hz: f32) -> [Complex32; BASEBAND_SYMBOL_SAMPLES] {
+fn sync8d_waveforms() -> &'static [[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8] {
+    static WAVEFORMS: OnceLock<[[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8]> = OnceLock::new();
+    WAVEFORMS.get_or_init(|| {
+        std::array::from_fn(|tone| {
+            let tone = tone as f32;
+            let mut phase = 0.0f32;
+            let delta = 2.0 * std::f32::consts::PI * tone / BASEBAND_SYMBOL_SAMPLES as f32;
+            std::array::from_fn(|index| {
+                let sample = Complex32::new(phase.cos(), phase.sin());
+                if index + 1 < BASEBAND_SYMBOL_SAMPLES {
+                    phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
+                }
+                sample
+            })
+        })
+    })
+}
+
+fn sync8d_tweak(residual_hz: f32) -> [Complex32; BASEBAND_SYMBOL_SAMPLES] {
+    let mut phase = 0.0f32;
+    let delta = 2.0 * std::f32::consts::PI * residual_hz / BASEBAND_RATE_HZ;
     std::array::from_fn(|index| {
-        let phase = -2.0 * std::f32::consts::PI * residual_hz * index as f32 / BASEBAND_RATE_HZ;
-        Complex32::new(phase.cos(), phase.sin())
+        let sample = Complex32::new(phase.cos(), phase.sin());
+        if index + 1 < BASEBAND_SYMBOL_SAMPLES {
+            phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
+        }
+        sample
     })
 }
 
