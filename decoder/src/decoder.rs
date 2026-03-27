@@ -1605,16 +1605,16 @@ fn compute_bitmetric_passes(full_tones: &[[Complex32; 8]]) -> [Vec<f32>; 4] {
                 let start_bit = (k - 1) * 3 + half * 87;
                 let mut metrics = vec![0.0f32; nt];
                 for (i, metric) in metrics.iter_mut().enumerate() {
-                    let tone0 = graymap[i & 0b111];
+                    let tone0 = graymap[(i >> (3 * (nsym - 1))) & 0b111];
+                    let tone1 = graymap[(i >> (3 * (nsym.saturating_sub(2)))) & 0b111];
                     *metric = full_tones[ks][tone0].norm();
                     if nsym >= 2 {
-                        let tone1 = graymap[(i >> 3) & 0b111];
                         *metric = (full_tones[ks][tone0] + full_tones[ks + 1][tone1]).norm();
                     }
                     if nsym >= 3 {
-                        let tone2 = graymap[(i >> 6) & 0b111];
+                        let tone2 = graymap[i & 0b111];
                         *metric = (full_tones[ks][tone0]
-                            + full_tones[ks + 1][graymap[(i >> 3) & 0b111]]
+                            + full_tones[ks + 1][tone1]
                             + full_tones[ks + 2][tone2])
                             .norm();
                     }
