@@ -155,6 +155,40 @@ pub struct DecodeReport {
     pub diagnostics: DecodeDiagnostics,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecodeStage {
+    Early41,
+    Early47,
+    Full,
+}
+
+impl DecodeStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Early41 => "early41",
+            Self::Early47 => "early47",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn required_samples(self) -> usize {
+        match self {
+            Self::Early41 => EARLY_41_SAMPLES,
+            Self::Early47 => EARLY_47_SAMPLES,
+            Self::Full => LONG_INPUT_SAMPLES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StageDecodeReport {
+    pub stage: DecodeStage,
+    pub report: DecodeReport,
+    pub new_decodes: Vec<DecodedMessage>,
+    pub updated_decodes: Vec<DecodedMessage>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidatePassDebug {
     pub pass_name: String,
@@ -200,12 +234,13 @@ struct RefinedCandidate {
     snr_db: i32,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone)]
 struct DecodeCounters {
     ldpc_codewords: usize,
     parsed_payloads: usize,
 }
 
+#[derive(Debug, Clone)]
 struct SearchResult {
     successes: Vec<SuccessfulDecode>,
     residual_audio: AudioBuffer,
@@ -220,6 +255,14 @@ struct SearchGrid {
     frame_count: usize,
     usable_bins: usize,
     min_bin: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DecoderSession {
+    early41: Option<SearchResult>,
+    early47: Option<SearchResult>,
+    emitted_stages: Vec<DecodeStage>,
+    last_decodes: BTreeMap<String, DecodedMessage>,
 }
 
 #[derive(Debug)]
@@ -282,6 +325,102 @@ pub fn decode_wav_file(
 ) -> Result<DecodeReport, DecoderError> {
     let audio = load_wav(path)?;
     decode_pcm(&audio, options)
+}
+
+impl DecoderSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn emitted_stages(&self) -> &[DecodeStage] {
+        &self.emitted_stages
+    }
+
+    pub fn decode_available(
+        &mut self,
+        audio: &AudioBuffer,
+        options: &DecodeOptions,
+    ) -> Result<Vec<StageDecodeReport>, DecoderError> {
+        validate_audio(audio)?;
+
+        let mut updates = Vec::new();
+        for stage in [DecodeStage::Early41, DecodeStage::Early47, DecodeStage::Full] {
+            if self.emitted_stages.contains(&stage) {
+                continue;
+            }
+            if !stage_is_enabled(stage, options) || audio.samples.len() < stage.required_samples() {
+                continue;
+            }
+            let update = self.decode_stage(audio, options, stage)?;
+            updates.push(update);
+        }
+        Ok(updates)
+    }
+
+    pub fn decode_stage(
+        &mut self,
+        audio: &AudioBuffer,
+        options: &DecodeOptions,
+        stage: DecodeStage,
+    ) -> Result<StageDecodeReport, DecoderError> {
+        validate_audio(audio)?;
+        if !stage_is_enabled(stage, options) {
+            return Err(DecoderError::UnsupportedFormat(format!(
+                "stage {} is not enabled for profile {}",
+                stage.as_str(),
+                options.profile.as_str()
+            )));
+        }
+        if audio.samples.len() < stage.required_samples() {
+            return Err(DecoderError::UnsupportedFormat(format!(
+                "audio too short for stage {}",
+                stage.as_str()
+            )));
+        }
+
+        let search = match stage {
+            DecodeStage::Early41 => {
+                let early_audio = zero_tail(audio, EARLY_41_SAMPLES);
+                let search = run_decode_search(
+                    &early_audio,
+                    options,
+                    None,
+                    Vec::new(),
+                    SYNC8_EARLY_THRESHOLD,
+                    false,
+                );
+                self.early41 = Some(search.clone());
+                search
+            }
+            DecodeStage::Early47 => {
+                let search = run_early47_search(audio, options, self.early41.as_ref());
+                self.early47 = Some(search.clone());
+                search
+            }
+            DecodeStage::Full => run_full_search(audio, options, self.early41.as_ref(), self.early47.as_ref()),
+        };
+
+        let report = build_decode_report(audio, options, search);
+        let (new_decodes, updated_decodes) = diff_decodes(&self.last_decodes, &report.decodes);
+        self.last_decodes = report
+            .decodes
+            .iter()
+            .cloned()
+            .map(|decode| (decode.text.clone(), decode))
+            .collect();
+        self.emitted_stages.push(stage);
+
+        Ok(StageDecodeReport {
+            stage,
+            report,
+            new_decodes,
+            updated_decodes,
+        })
+    }
 }
 
 pub fn debug_candidate_wav_file(
@@ -588,6 +727,18 @@ pub fn decode_pcm(
     audio: &AudioBuffer,
     options: &DecodeOptions,
 ) -> Result<DecodeReport, DecoderError> {
+    let mut session = DecoderSession::new();
+    let mut updates = session.decode_available(audio, options)?;
+    if let Some(update) = updates.pop() {
+        Ok(update.report)
+    } else {
+        Err(DecoderError::UnsupportedFormat(
+            "audio too short for selected decode profile".to_string(),
+        ))
+    }
+}
+
+fn validate_audio(audio: &AudioBuffer) -> Result<(), DecoderError> {
     if audio.sample_rate_hz != FT8_SAMPLE_RATE {
         return Err(DecoderError::UnsupportedFormat(format!(
             "expected {} Hz audio, got {} Hz",
@@ -599,46 +750,51 @@ pub fn decode_pcm(
             "audio too short".to_string(),
         ));
     }
+    Ok(())
+}
 
+fn stage_is_enabled(stage: DecodeStage, options: &DecodeOptions) -> bool {
+    match stage {
+        DecodeStage::Full => true,
+        DecodeStage::Early41 | DecodeStage::Early47 => options.uses_early_decodes(),
+    }
+}
+
+fn run_early47_search(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    early41: Option<&SearchResult>,
+) -> SearchResult {
     let subtraction_plan = SubtractionPlan::global();
-    let early41 = if options.uses_early_decodes() && audio.samples.len() >= EARLY_41_SAMPLES {
-        let early_audio = zero_tail(audio, EARLY_41_SAMPLES);
-        Some(run_decode_search(
-            &early_audio,
-            options,
-            None,
-            Vec::new(),
-            SYNC8_EARLY_THRESHOLD,
-            false,
-        ))
-    } else {
-        None
-    };
-    let early47 = if options.uses_early_decodes() && audio.samples.len() >= EARLY_47_SAMPLES {
-        let mut partial47 = zero_tail(audio, EARLY_47_SAMPLES);
-        if let Some(stage41) = &early41 {
-            for success in &stage41.successes {
-                if success.candidate.dt_seconds < 0.396 {
-                    subtract_candidate(&mut partial47, success, subtraction_plan);
-                }
+    let mut partial47 = zero_tail(audio, EARLY_47_SAMPLES);
+    if let Some(stage41) = early41 {
+        for success in &stage41.successes {
+            if success.candidate.dt_seconds < 0.396 {
+                subtract_candidate(&mut partial47, success, subtraction_plan);
             }
         }
-        let initial_successes = early41
-            .as_ref()
-            .map(|stage| stage.successes.clone())
-            .unwrap_or_default();
-        Some(run_decode_search(
-            &partial47,
-            options,
-            Some(partial47.clone()),
-            initial_successes,
-            options.sync_threshold(),
-            false,
-        ))
-    } else {
-        None
-    };
-    let prepared_full = early47.as_ref().map(|stage47| {
+    }
+    let initial_successes = early41
+        .map(|stage| stage.successes.clone())
+        .unwrap_or_default();
+    run_decode_search(
+        &partial47,
+        options,
+        Some(partial47.clone()),
+        initial_successes,
+        options.sync_threshold(),
+        false,
+    )
+}
+
+fn run_full_search(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    early41: Option<&SearchResult>,
+    early47: Option<&SearchResult>,
+) -> SearchResult {
+    let subtraction_plan = SubtractionPlan::global();
+    let prepared_full = early47.map(|stage47| {
         let mut prepared = audio.clone();
         for success in &stage47.successes {
             subtract_candidate(&mut prepared, success, subtraction_plan);
@@ -648,19 +804,20 @@ pub fn decode_pcm(
         prepared
     });
     let initial_successes = early47
-        .as_ref()
         .map(|stage| stage.successes.clone())
-        .or_else(|| early41.as_ref().map(|stage| stage.successes.clone()))
+        .or_else(|| early41.map(|stage| stage.successes.clone()))
         .unwrap_or_default();
-    let search = run_decode_search(
+    run_decode_search(
         audio,
         options,
         prepared_full,
         initial_successes,
         options.sync_threshold(),
         true,
-    );
+    )
+}
 
+fn build_decode_report(audio: &AudioBuffer, options: &DecodeOptions, search: SearchResult) -> DecodeReport {
     let mut resolver = HashResolver::default();
     for success in &search.successes {
         success.payload.collect_callsigns(&mut resolver);
@@ -701,7 +858,7 @@ pub fn decode_pcm(
             .then_with(|| left.text.cmp(&right.text))
     });
 
-    Ok(DecodeReport {
+    DecodeReport {
         sample_rate_hz: audio.sample_rate_hz,
         duration_seconds: audio.samples.len() as f32 / audio.sample_rate_hz as f32,
         diagnostics: DecodeDiagnostics {
@@ -714,7 +871,30 @@ pub fn decode_pcm(
             top_candidates: search.top_candidates,
         },
         decodes,
-    })
+    }
+}
+
+fn diff_decodes(
+    previous: &BTreeMap<String, DecodedMessage>,
+    current: &[DecodedMessage],
+) -> (Vec<DecodedMessage>, Vec<DecodedMessage>) {
+    let mut new_decodes = Vec::new();
+    let mut updated_decodes = Vec::new();
+    for decode in current {
+        match previous.get(&decode.text) {
+            None => new_decodes.push(decode.clone()),
+            Some(existing)
+                if existing.candidate_score != decode.candidate_score
+                    || existing.dt_seconds != decode.dt_seconds
+                    || existing.freq_hz != decode.freq_hz
+                    || existing.snr_db != decode.snr_db =>
+            {
+                updated_decodes.push(decode.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    (new_decodes, updated_decodes)
 }
 
 fn run_decode_search(
@@ -1972,5 +2152,54 @@ mod tests {
         assert_eq!(options.max_osd_passes(0, 1_500.0), 0);
         assert_eq!(options.max_osd_passes(1, 1_500.0), 3);
         assert_eq!(options.max_osd_passes(1, 1_700.0), 3);
+    }
+
+    #[test]
+    fn session_emits_stages_for_progressively_longer_buffers() {
+        let options = DecodeOptions::default();
+        let mut session = DecoderSession::new();
+
+        let early41 = AudioBuffer {
+            sample_rate_hz: FT8_SAMPLE_RATE,
+            samples: vec![0.0; EARLY_41_SAMPLES],
+        };
+        let updates = session.decode_available(&early41, &options).expect("early41 decode");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].stage, DecodeStage::Early41);
+
+        let early47 = AudioBuffer {
+            sample_rate_hz: FT8_SAMPLE_RATE,
+            samples: vec![0.0; EARLY_47_SAMPLES],
+        };
+        let updates = session.decode_available(&early47, &options).expect("early47 decode");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].stage, DecodeStage::Early47);
+
+        let full = AudioBuffer {
+            sample_rate_hz: FT8_SAMPLE_RATE,
+            samples: vec![0.0; LONG_INPUT_SAMPLES],
+        };
+        let updates = session.decode_available(&full, &options).expect("full decode");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].stage, DecodeStage::Full);
+
+        let updates = session.decode_available(&full, &options).expect("repeat decode");
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn quick_profile_skips_early_stages() {
+        let options = DecodeOptions {
+            profile: DecodeProfile::Quick,
+            ..DecodeOptions::default()
+        };
+        let mut session = DecoderSession::new();
+        let full = AudioBuffer {
+            sample_rate_hz: FT8_SAMPLE_RATE,
+            samples: vec![0.0; LONG_INPUT_SAMPLES],
+        };
+        let updates = session.decode_available(&full, &options).expect("quick decode");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].stage, DecodeStage::Full);
     }
 }
