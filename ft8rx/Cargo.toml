@@ -11,3 +11,6 @@ ft8_decoder = { path = "../decoder" }
 hound = "3.5.1"
 rigctl = { path = "../rigctl" }
 thiserror = "2.0.12"
+
+[profile.dev.package."*"]
+opt-level = 2
