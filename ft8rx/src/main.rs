@@ -656,16 +656,22 @@ fn render(display: &DisplayState) {
     );
     let _ = writeln!(output);
     let _ = writeln!(output, "Early41");
-    let _ = writeln!(output, "UTC    SNR   dT(s)   Freq(Hz)  Message");
-    let _ = writeln!(output, "-----  ----  ------  --------  -------");
+    let _ = writeln!(output, "UTC    SNR   dT(s)   Freq(Hz)  Corr     BER       Message");
+    let _ = writeln!(output, "-----  ----  ------  --------  -------  --------  -------");
     if display.last_decodes.is_empty() {
         let _ = writeln!(output, "no decodes yet");
     } else {
         for decode in &display.last_decodes {
             let _ = writeln!(
                 output,
-                "{:<5}  {:>4}  {:+6.2}  {:>8.0}  {}",
-                decode.utc, decode.snr_db, decode.dt_seconds, decode.freq_hz, decode.text
+                "{:<5}  {:>4}  {:+6.2}  {:>8.0}  {:>7}  {:>8}  {}",
+                decode.utc,
+                decode.snr_db,
+                decode.dt_seconds,
+                decode.freq_hz,
+                format!("{}/{}", decode.corrected_bits, decode.total_bits),
+                format_ber(decode.corrected_bits, decode.total_bits),
+                decode.text
             );
         }
     }
@@ -677,8 +683,8 @@ fn render(display: &DisplayState) {
 fn render_delta_section(output: &mut String, title: &str, deltas: &[DisplayDelta]) {
     let _ = writeln!(output);
     let _ = writeln!(output, "{title}");
-    let _ = writeln!(output, "UTC    SNR   dT(s)   Freq(Hz)  Message");
-    let _ = writeln!(output, "-----  ----  ------  --------  -------");
+    let _ = writeln!(output, "UTC    SNR   dT(s)   Freq(Hz)  Corr     BER       Message");
+    let _ = writeln!(output, "-----  ----  ------  --------  -------  --------  -------");
     if deltas.is_empty() {
         let _ = writeln!(output, "none");
         return;
@@ -686,14 +692,23 @@ fn render_delta_section(output: &mut String, title: &str, deltas: &[DisplayDelta
     for delta in deltas {
         let _ = writeln!(
             output,
-            "{:<5}  {:>4}  {:+6.2}  {:>8.0}  {}",
+            "{:<5}  {:>4}  {:+6.2}  {:>8.0}  {:>7}  {:>8}  {}",
             delta.decode.utc,
             delta.decode.snr_db,
             delta.decode.dt_seconds,
             delta.decode.freq_hz,
+            format!("{}/{}", delta.decode.corrected_bits, delta.decode.total_bits),
+            format_ber(delta.decode.corrected_bits, delta.decode.total_bits),
             delta.decode.text
         );
     }
+}
+
+fn format_ber(corrected_bits: usize, total_bits: usize) -> String {
+    if total_bits == 0 {
+        return "0e0".to_string();
+    }
+    format!("{:.1e}", corrected_bits as f64 / total_bits as f64)
 }
 
 fn summarize_dt(decodes: &[DecodedMessage]) -> (f32, f32) {
