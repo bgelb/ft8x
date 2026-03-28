@@ -1,6 +1,9 @@
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
-use ft8_decoder::{DecodeOptions, DecodeProfile, DecodedMessage, decode_wav_file};
+use ft8_decoder::{
+    AudioBuffer, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage, DecoderSession,
+    StageDecodeReport,
+};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
 use rigctl::{K3s, K3sConfig, RigState, detect_k3s_audio_device};
@@ -12,6 +15,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SLOT_SECONDS: u64 = 15;
+const DECODER_SAMPLE_RATE_HZ: u32 = 12_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8rx")]
@@ -56,6 +60,14 @@ struct DisplayState {
     dropped_slots: u64,
     last_slot_start: Option<SystemTime>,
     last_decodes: Vec<DecodedMessage>,
+    early47_deltas: Vec<DisplayDelta>,
+    full_deltas: Vec<DisplayDelta>,
+}
+
+#[derive(Debug, Clone)]
+struct DisplayDelta {
+    label: &'static str,
+    decode: DecodedMessage,
 }
 
 #[derive(Debug)]
@@ -73,8 +85,15 @@ enum DecodeEvent {
     Finished {
         slot_start: SystemTime,
         wall_ms: u128,
-        result: Result<Vec<DecodedMessage>, AppError>,
+        result: Result<DecodeSummary, AppError>,
     },
+}
+
+#[derive(Debug)]
+struct DecodeSummary {
+    final_decodes: Vec<DecodedMessage>,
+    early47_deltas: Vec<DisplayDelta>,
+    full_deltas: Vec<DisplayDelta>,
 }
 
 fn main() -> Result<(), AppError> {
@@ -131,6 +150,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         dropped_slots: 0,
         last_slot_start: None,
         last_decodes: Vec::new(),
+        early47_deltas: Vec::new(),
+        full_deltas: Vec::new(),
     };
 
     let mut next_slot = next_slot_boundary(SystemTime::now());
@@ -163,13 +184,17 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     display.last_slot_start = Some(slot_start);
                     display.last_decode_wall_ms = Some(wall_ms);
                     match result {
-                        Ok(decodes) => {
-                            display.last_decodes = decodes;
+                        Ok(summary) => {
+                            display.last_decodes = summary.final_decodes;
+                            display.early47_deltas = summary.early47_deltas;
+                            display.full_deltas = summary.full_deltas;
                         }
                         Err(error) => {
                             display.decode_status =
                                 format!("Last decode {} failed: {}", format_slot_time(slot_start), error);
                             display.last_decodes.clear();
+                            display.early47_deltas.clear();
+                            display.full_deltas.clear();
                         }
                     }
                 }
@@ -193,6 +218,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         format!("Capture error for {}: {}", format_slot_time(slot_start), error);
                     display.last_slot_start = Some(slot_start);
                     display.last_decodes.clear();
+                    display.early47_deltas.clear();
+                    display.full_deltas.clear();
                     next_slot += Duration::from_secs(SLOT_SECONDS);
                     continue;
                 }
@@ -212,6 +239,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 );
                 display.last_slot_start = Some(slot_start);
                 display.last_decodes.clear();
+                display.early47_deltas.clear();
+                display.full_deltas.clear();
                 next_slot += Duration::from_secs(SLOT_SECONDS);
                 continue;
             }
@@ -271,13 +300,13 @@ fn run_oneshot(cli: Cli) -> Result<(), AppError> {
         thread::sleep(Duration::from_secs(1));
     }
 
-    let decodes = decode_slot_from_capture(
+    let summary = decode_slot_from_capture(
         &capture,
         target_slot,
         cli.save_raw_wav.as_deref().or(cli.save_wav.as_deref()),
     )?;
-    println!("decodes={}", decodes.len());
-    for decode in decodes {
+    println!("decodes={}", summary.final_decodes.len());
+    for decode in summary.final_decodes {
         println!(
             "{} {:>4} {:+5.2} {:>6.0} {}",
             decode.utc, decode.snr_db, decode.dt_seconds, decode.freq_hz, decode.text
@@ -302,7 +331,7 @@ fn decode_slot_from_capture(
     capture: &SampleStream,
     slot_start: SystemTime,
     save_raw_wav: Option<&Path>,
-) -> Result<Vec<DecodedMessage>, AppError> {
+) -> Result<DecodeSummary, AppError> {
     let samples = extract_slot_capture(capture, slot_start)?;
     let raw_path = save_raw_wav
         .map(Path::to_path_buf)
@@ -322,29 +351,65 @@ fn decode_slot_from_samples_with_raw_path(
     raw_path: &Path,
     keep_raw: bool,
     slot_start: SystemTime,
-) -> Result<Vec<DecodedMessage>, AppError> {
-    write_mono_wav(raw_path, sample_rate_hz, samples)?;
-    let decodes = decode_slot_from_wav(raw_path, slot_start)?;
-    if !keep_raw {
+) -> Result<DecodeSummary, AppError> {
+    if keep_raw {
+        write_mono_wav(raw_path, sample_rate_hz, samples)?;
+    }
+    let decodes = decode_slot_from_samples(samples, sample_rate_hz, slot_start)?;
+    if !keep_raw && raw_path.exists() {
         let _ = std::fs::remove_file(raw_path);
     }
     Ok(decodes)
 }
 
-fn decode_slot_from_wav(path: &Path, slot_start: SystemTime) -> Result<Vec<DecodedMessage>, AppError> {
+fn decode_slot_from_samples(
+    samples: &[i16],
+    sample_rate_hz: u32,
+    slot_start: SystemTime,
+) -> Result<DecodeSummary, AppError> {
     let options = DecodeOptions {
         profile: DecodeProfile::Medium,
         min_freq_hz: 200.0,
         max_freq_hz: 3_500.0,
         ..DecodeOptions::default()
     };
-    let mut best_decodes =
-        decode_wav_file(path, &options).map_err(|error| AppError::Decoder(error.to_string()))?.decodes;
-    let slot_label = format_slot_time(slot_start);
-    for decode in &mut best_decodes {
-        decode.utc = slot_label.clone();
+    let audio = AudioBuffer {
+        sample_rate_hz: DECODER_SAMPLE_RATE_HZ,
+        samples: resample_linear_f32(
+            &samples
+                .iter()
+                .map(|&sample| sample as f32 / i16::MAX as f32)
+                .collect::<Vec<_>>(),
+            sample_rate_hz,
+            DECODER_SAMPLE_RATE_HZ,
+        ),
+    };
+    let mut session = DecoderSession::new();
+    let updates = session
+        .decode_available(&audio, &options)
+        .map_err(|error| AppError::Decoder(error.to_string()))?;
+    let mut final_decodes = Vec::new();
+    let mut early47_deltas = Vec::new();
+    let mut full_deltas = Vec::new();
+    for mut update in updates {
+        relabel_stage_update(&mut update, slot_start);
+        match update.stage {
+            DecodeStage::Early41 => {}
+            DecodeStage::Early47 => {
+                early47_deltas = stage_deltas(&update);
+                final_decodes = update.report.decodes.clone();
+            }
+            DecodeStage::Full => {
+                full_deltas = stage_deltas(&update);
+                final_decodes = update.report.decodes.clone();
+            }
+        }
     }
-    Ok(best_decodes)
+    Ok(DecodeSummary {
+        final_decodes,
+        early47_deltas,
+        full_deltas,
+    })
 }
 
 fn write_mono_wav(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Result<(), AppError> {
@@ -466,7 +531,32 @@ fn render(display: &DisplayState) {
             );
         }
     }
+    render_delta_section(&mut output, "Early47 delta", &display.early47_deltas);
+    render_delta_section(&mut output, "Full delta", &display.full_deltas);
     print!("{output}");
+}
+
+fn render_delta_section(output: &mut String, title: &str, deltas: &[DisplayDelta]) {
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{title}");
+    let _ = writeln!(output, "Delta   UTC    SNR   dT(s)   Freq(Hz)  Message");
+    let _ = writeln!(output, "------  -----  ----  ------  --------  -------");
+    if deltas.is_empty() {
+        let _ = writeln!(output, "none");
+        return;
+    }
+    for delta in deltas {
+        let _ = writeln!(
+            output,
+            "{:<6}  {:<5}  {:>4}  {:+6.2}  {:>8.0}  {}",
+            delta.label,
+            delta.decode.utc,
+            delta.decode.snr_db,
+            delta.decode.dt_seconds,
+            delta.decode.freq_hz,
+            delta.decode.text
+        );
+    }
 }
 
 fn summarize_dt(decodes: &[DecodedMessage]) -> (f32, f32) {
@@ -550,4 +640,59 @@ fn format_status(
             format_slot_time(next_slot)
         ),
     }
+}
+
+fn relabel_stage_update(update: &mut StageDecodeReport, slot_start: SystemTime) {
+    let slot_label = format_slot_time(slot_start);
+    for decode in &mut update.report.decodes {
+        decode.utc = slot_label.clone();
+    }
+    for decode in &mut update.new_decodes {
+        decode.utc = slot_label.clone();
+    }
+    for decode in &mut update.updated_decodes {
+        decode.utc = slot_label.clone();
+    }
+}
+
+fn stage_deltas(update: &StageDecodeReport) -> Vec<DisplayDelta> {
+    let mut deltas = Vec::with_capacity(update.new_decodes.len() + update.updated_decodes.len());
+    for decode in &update.new_decodes {
+        deltas.push(DisplayDelta {
+            label: "new",
+            decode: decode.clone(),
+        });
+    }
+    for decode in &update.updated_decodes {
+        deltas.push(DisplayDelta {
+            label: "update",
+            decode: decode.clone(),
+        });
+    }
+    deltas.sort_by(|left, right| {
+        left.decode
+            .freq_hz
+            .total_cmp(&right.decode.freq_hz)
+            .then_with(|| left.decode.text.cmp(&right.decode.text))
+    });
+    deltas
+}
+
+fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {
+    if samples.is_empty() || src_rate_hz == dst_rate_hz {
+        return samples.to_vec();
+    }
+
+    let output_len =
+        ((samples.len() as u64 * dst_rate_hz as u64) + (src_rate_hz as u64 / 2)) / src_rate_hz as u64;
+    let mut output = Vec::with_capacity(output_len as usize);
+    let scale = src_rate_hz as f64 / dst_rate_hz as f64;
+    for index in 0..output_len as usize {
+        let position = index as f64 * scale;
+        let left = position.floor() as usize;
+        let right = (left + 1).min(samples.len().saturating_sub(1));
+        let frac = (position - left as f64) as f32;
+        output.push(samples[left] * (1.0 - frac) + samples[right] * frac);
+    }
+    output
 }
