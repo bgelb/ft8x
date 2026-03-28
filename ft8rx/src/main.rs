@@ -666,7 +666,7 @@ fn render(display: &DisplayState) {
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "Seen    UTC    SNR   dT(s)   Freq(Hz)  Early                 Mid                   Late                  Message"
+        "Seen    UTC    SNR   dT(s)   Freq(Hz)  Early Margin          Mid Margin            Late Margin           Message"
     );
     let _ = writeln!(
         output,
@@ -684,21 +684,14 @@ fn render(display: &DisplayState) {
                 row.display.snr_db,
                 row.display.dt_seconds,
                 row.display.freq_hz,
-                format_stage_metric(row.early41.as_ref()),
-                format_stage_metric(row.early47.as_ref()),
-                format_stage_metric(row.full.as_ref()),
+                format_stage_metric(row.early41.as_ref(), None),
+                format_stage_metric(row.early47.as_ref(), row.early41.as_ref()),
+                format_stage_metric(row.full.as_ref(), row.early47.as_ref()),
                 row.display.text
             );
         }
     }
     print!("{output}");
-}
-
-fn format_ber(corrected_bits: usize, total_bits: usize) -> String {
-    if total_bits == 0 {
-        return "0e0".to_string();
-    }
-    format!("{:.1e}", corrected_bits as f64 / total_bits as f64)
 }
 
 fn summarize_dt(decodes: &[DecodedMessage]) -> (f32, f32) {
@@ -863,16 +856,36 @@ fn composite_rows(display: &DisplayState) -> Vec<CompositeDecodeRow> {
     rows
 }
 
-fn format_stage_metric(decode: Option<&DecodedMessage>) -> String {
+fn format_stage_metric(
+    decode: Option<&DecodedMessage>,
+    prior_decode: Option<&DecodedMessage>,
+) -> String {
     match decode {
-        Some(decode) => format!(
-            "{}/{} ({})",
-            decode.corrected_bits,
-            decode.total_bits,
-            format_ber(decode.corrected_bits, decode.total_bits)
-        ),
+        Some(decode) => {
+            let margin = format!("{:.2}", decode.mean_abs_llr);
+            let colored_margin = match prior_decode {
+                Some(prior) if (prior.mean_abs_llr - decode.mean_abs_llr).abs() > f32::EPSILON =>
+                {
+                    colorize_metric(
+                        &margin,
+                        decode.mean_abs_llr.partial_cmp(&prior.mean_abs_llr),
+                    )
+                }
+                _ => margin,
+            };
+            format!("{colored_margin} i{}", decode.ldpc_iterations)
+        }
         None => "-".to_string(),
     }
+}
+
+fn colorize_metric(metric: &str, ordering: Option<std::cmp::Ordering>) -> String {
+    let color = match ordering {
+        Some(std::cmp::Ordering::Greater) => "\x1b[32m",
+        Some(std::cmp::Ordering::Less) => "\x1b[31m",
+        Some(std::cmp::Ordering::Equal) | None => "\x1b[33m",
+    };
+    format!("{color}{metric}\x1b[0m")
 }
 
 fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {

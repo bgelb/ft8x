@@ -133,6 +133,7 @@ pub struct DecodedMessage {
     pub text: String,
     pub candidate_score: f32,
     pub ldpc_iterations: usize,
+    pub mean_abs_llr: f32,
     pub corrected_bits: usize,
     pub total_bits: usize,
     pub payload: DecodedPayload,
@@ -242,6 +243,7 @@ struct SuccessfulDecode {
     codeword_bits: Vec<u8>,
     candidate: DecodeCandidate,
     ldpc_iterations: usize,
+    mean_abs_llr: f32,
     corrected_bits: usize,
     total_bits: usize,
     snr_db: i32,
@@ -647,7 +649,7 @@ fn debug_candidate_pcm_inner(
             let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
             let decoded =
                 decode_llr_set_with_known_bits(parity, &llrs, known_bits, 0, &mut counters).map(
-                    |(payload, _, iterations, _, _)| {
+                    |(payload, _, iterations, _, _, _)| {
                         let rendered = payload.render(&resolver);
                         (rendered.text, iterations)
                     },
@@ -716,7 +718,7 @@ fn append_debug_single_pass(
 ) {
     let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
     let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-    let decoded = decode_llr_set(parity, llrs, max_osd, counters).map(|(payload, _, iterations, _, _)| {
+    let decoded = decode_llr_set(parity, llrs, max_osd, counters).map(|(payload, _, iterations, _, _, _)| {
         let rendered = payload.render(resolver);
         (rendered.text, iterations)
     });
@@ -926,6 +928,7 @@ fn build_decode_report_with_resolver(
             text: text.clone(),
             candidate_score: success.candidate.score,
             ldpc_iterations: success.ldpc_iterations,
+            mean_abs_llr: success.mean_abs_llr,
             corrected_bits: success.corrected_bits,
             total_bits: success.total_bits,
             payload,
@@ -1429,7 +1432,7 @@ fn try_refined_candidate(
     counters: &mut DecodeCounters,
 ) -> Option<SuccessfulDecode> {
     for llrs in &refined.llr_sets {
-        let Some((payload, bits, iterations, corrected_bits, total_bits)) =
+        let Some((payload, bits, iterations, mean_abs_llr, corrected_bits, total_bits)) =
             decode_llr_set(parity, llrs, max_osd, counters)
         else {
             continue;
@@ -1444,6 +1447,7 @@ fn try_refined_candidate(
                 score: refined.sync_score.max(candidate_score),
             },
             ldpc_iterations: iterations,
+            mean_abs_llr,
             corrected_bits,
             total_bits,
             snr_db: refined.snr_db,
@@ -1459,7 +1463,7 @@ fn try_refined_candidate(
         if ap_magnitude > 0.0 {
             for known_bits in [cq_ap_known_bits(), mycall_ap_known_bits()] {
                 let ap_llrs = llrs_with_known_bits(&refined.llr_sets[0], known_bits, ap_magnitude);
-                if let Some((payload, bits, iterations, corrected_bits, total_bits)) =
+                if let Some((payload, bits, iterations, mean_abs_llr, corrected_bits, total_bits)) =
                     decode_llr_set_with_known_bits(parity, &ap_llrs, known_bits, max_osd, counters)
                 {
                     return Some(SuccessfulDecode {
@@ -1472,6 +1476,7 @@ fn try_refined_candidate(
                             score: refined.sync_score.max(candidate_score),
                         },
                         ldpc_iterations: iterations,
+                        mean_abs_llr,
                         corrected_bits,
                         total_bits,
                         snr_db: refined.snr_db,
@@ -1970,7 +1975,7 @@ fn decode_llr_set(
     llrs: &[f32],
     max_osd: isize,
     counters: &mut DecodeCounters,
-) -> Option<(Payload, Vec<u8>, usize, usize, usize)> {
+) -> Option<(Payload, Vec<u8>, usize, f32, usize, usize)> {
     let Some((bits, iterations)) = parity.decode_with_maxosd(llrs, max_osd) else {
         return None;
     };
@@ -1985,9 +1990,10 @@ fn decode_llr_set(
         return None;
     }
     counters.parsed_payloads += 1;
+    let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
     let corrected_bits = hard_mismatch_count(llrs, &bits);
     let total_bits = bits.len();
-    Some((payload, bits, iterations, corrected_bits, total_bits))
+    Some((payload, bits, iterations, mean_abs_llr, corrected_bits, total_bits))
 }
 
 fn decode_llr_set_with_known_bits(
@@ -1996,7 +2002,7 @@ fn decode_llr_set_with_known_bits(
     known_bits: &[Option<u8>],
     max_osd: isize,
     counters: &mut DecodeCounters,
-) -> Option<(Payload, Vec<u8>, usize, usize, usize)> {
+) -> Option<(Payload, Vec<u8>, usize, f32, usize, usize)> {
     let Some((bits, iterations)) =
         parity.decode_with_known_bits_and_maxosd(llrs, known_bits, max_osd)
     else {
@@ -2013,9 +2019,10 @@ fn decode_llr_set_with_known_bits(
         return None;
     }
     counters.parsed_payloads += 1;
+    let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
     let corrected_bits = hard_mismatch_count(llrs, &bits);
     let total_bits = bits.len();
-    Some((payload, bits, iterations, corrected_bits, total_bits))
+    Some((payload, bits, iterations, mean_abs_llr, corrected_bits, total_bits))
 }
 
 fn hard_mismatch_count(llrs: &[f32], bits: &[u8]) -> usize {
