@@ -272,6 +272,8 @@ pub struct K3sConfig {
     pub port_path: PathBuf,
     pub baud_rate: u32,
     pub timeout: Duration,
+    pub rts: bool,
+    pub dtr: bool,
 }
 
 impl Default for K3sConfig {
@@ -285,6 +287,8 @@ impl Default for K3sConfig {
             port_path: default_path,
             baud_rate: K3S_BAUD_RATE,
             timeout: DEFAULT_TIMEOUT,
+            rts: false,
+            dtr: false,
         }
     }
 }
@@ -298,11 +302,13 @@ impl K3s {
     pub fn connect(config: K3sConfig) -> Result<Self> {
         let mut port = serialport::new(config.port_path.to_string_lossy().into_owned(), config.baud_rate)
             .timeout(Duration::from_millis(50))
+            .dtr_on_open(config.dtr)
             .open()?;
         // On the attached K3S/FTDI interface, asserting RTS mutes receive audio and likely keys
-        // a PTT-related control path. Force both modem-control outputs low for RX-only CAT use.
-        port.write_request_to_send(false)?;
-        port.write_data_terminal_ready(false)?;
+        // a PTT-related control path. Keep both modem-control outputs low by default for RX-only
+        // CAT use unless a caller explicitly overrides them in K3sConfig.
+        port.write_request_to_send(config.rts)?;
+        port.write_data_terminal_ready(config.dtr)?;
         Ok(Self {
             port,
             timeout: config.timeout,
