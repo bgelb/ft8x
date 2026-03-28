@@ -296,9 +296,13 @@ pub struct K3s {
 
 impl K3s {
     pub fn connect(config: K3sConfig) -> Result<Self> {
-        let port = serialport::new(config.port_path.to_string_lossy().into_owned(), config.baud_rate)
+        let mut port = serialport::new(config.port_path.to_string_lossy().into_owned(), config.baud_rate)
             .timeout(Duration::from_millis(50))
             .open()?;
+        // On the attached K3S/FTDI interface, asserting RTS mutes receive audio and likely keys
+        // a PTT-related control path. Force both modem-control outputs low for RX-only CAT use.
+        port.write_request_to_send(false)?;
+        port.write_data_terminal_ready(false)?;
         Ok(Self {
             port,
             timeout: config.timeout,
