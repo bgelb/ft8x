@@ -1,0 +1,14 @@
+[package]
+name = "ft8rx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alsa = "0.9.1"
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+ctrlc = "3.5.0"
+clap = { version = "4.5.40", features = ["derive"] }
+ft8_decoder = { path = "../decoder" }
+hound = "3.5.1"
+rigctl = { path = "../rigctl" }
+thiserror = "2.0.12"
