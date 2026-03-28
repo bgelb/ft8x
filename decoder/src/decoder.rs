@@ -1162,23 +1162,6 @@ fn try_refined_candidate(
         });
     }
 
-    if let Some((payload, bits, iterations)) =
-        decode_llr_set(parity, &refined.symbol_bit_llrs, max_osd, counters)
-    {
-        return Some(SuccessfulDecode {
-            payload,
-            codeword_bits: bits,
-            candidate: DecodeCandidate {
-                start_seconds: refined.start_seconds,
-                dt_seconds: refined.start_seconds - 0.5,
-                freq_hz: refined.freq_hz,
-                score: refined.sync_score.max(candidate_score),
-            },
-            ldpc_iterations: iterations,
-            snr_db: refined.snr_db,
-        });
-    }
-
     if allow_ap {
         let ap_magnitude = refined.llr_sets[0]
             .iter()
