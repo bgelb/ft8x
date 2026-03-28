@@ -912,10 +912,10 @@ fn collect_candidates(
     let mut raw = Vec::<DecodeCandidate>::new();
     for &(bin, lag, score) in &primary {
         if score >= sync_threshold && score.is_finite() {
+            let dt_seconds = (lag as f32 - 0.5) * SYNC8_STEP_SECONDS;
             raw.push(DecodeCandidate {
-                start_seconds: lag as f32 * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32
-                    + 0.5,
-                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SECONDS,
+                start_seconds: dt_seconds + 0.5,
+                dt_seconds,
                 freq_hz: bin as f32 * SYNC8_BIN_HZ,
                 score,
             });
@@ -928,10 +928,10 @@ fn collect_candidates(
                 .iter()
                 .any(|&(b, local_lag, _)| b == bin && local_lag == lag)
         {
+            let dt_seconds = (lag as f32 - 0.5) * SYNC8_STEP_SECONDS;
             raw.push(DecodeCandidate {
-                start_seconds: lag as f32 * SYNC8_STEP_SAMPLES as f32 / FT8_SAMPLE_RATE as f32
-                    + 0.5,
-                dt_seconds: (lag as f32 - 0.5) * SYNC8_STEP_SECONDS,
+                start_seconds: dt_seconds + 0.5,
+                dt_seconds,
                 freq_hz: bin as f32 * SYNC8_BIN_HZ,
                 score,
             });
