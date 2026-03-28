@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use num_complex::Complex32;
-use rayon::prelude::*;
 use realfft::{RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftPlanner};
 use serde::Serialize;
@@ -534,6 +533,41 @@ fn append_debug_single_pass(
     });
 }
 
+fn success_resolver(successes: &[SuccessfulDecode]) -> HashResolver {
+    let mut resolver = HashResolver::default();
+    for success in successes {
+        success.payload.collect_callsigns(&mut resolver);
+    }
+    resolver
+}
+
+fn rendered_success_key(success: &SuccessfulDecode, resolver: &HashResolver) -> String {
+    let rendered = success.payload.render(resolver);
+    if rendered.text.trim().is_empty() {
+        format!("{:?}", success.payload)
+    } else {
+        rendered.text
+    }
+}
+
+fn is_new_success(
+    existing: &[SuccessfulDecode],
+    current_pass: &[SuccessfulDecode],
+    candidate: &SuccessfulDecode,
+) -> bool {
+    let mut combined = Vec::with_capacity(existing.len() + current_pass.len() + 1);
+    combined.extend(existing.iter().cloned());
+    combined.extend(current_pass.iter().cloned());
+    combined.push(candidate.clone());
+    let resolver = success_resolver(&combined);
+    let candidate_key = rendered_success_key(candidate, &resolver);
+    let mut seen = HashSet::<String>::new();
+    for success in existing.iter().chain(current_pass.iter()) {
+        seen.insert(rendered_success_key(success, &resolver));
+    }
+    !seen.contains(&candidate_key)
+}
+
 fn truth_metrics(llrs: &[f32], truth_codeword_bits: &[u8]) -> Option<(Option<usize>, Option<f32>)> {
     if llrs.len() != 174 || truth_codeword_bits.len() < 174 {
         return None;
@@ -722,44 +756,33 @@ fn run_decode_search(
             break;
         }
 
-        let attempts: Vec<_> = candidates
-            .par_iter()
-            .map(|candidate| {
-                let mut local_counters = DecodeCounters::default();
-                let success = try_candidate(
-                    search_grid,
-                    &long_spectrum,
-                    &baseband_plan,
-                    candidate,
-                    options,
-                    pass,
-                    parity,
-                    allow_ap,
-                    &mut local_counters,
-                );
-                (success, local_counters)
-            })
-            .collect();
-
         let mut pass_successes = Vec::<SuccessfulDecode>::new();
-        for (success, local_counters) in attempts {
+        for candidate in &candidates {
+            let mut local_counters = DecodeCounters::default();
+            let success = try_candidate(
+                search_grid,
+                &long_spectrum,
+                &baseband_plan,
+                candidate,
+                options,
+                pass,
+                parity,
+                allow_ap,
+                &mut local_counters,
+            );
             counters.ldpc_codewords += local_counters.ldpc_codewords;
             counters.parsed_payloads += local_counters.parsed_payloads;
             if let Some(success) = success {
+                subtract_candidate(&mut residual_audio, &success, subtraction_plan);
+                if !is_new_success(&successes, &pass_successes, &success) {
+                    continue;
+                }
                 pass_successes.push(success);
             }
         }
         if pass_successes.is_empty() {
             break;
         }
-
-        pass_successes.sort_by(|left, right| {
-            right
-                .candidate
-                .score
-                .total_cmp(&left.candidate.score)
-                .then_with(|| left.candidate.freq_hz.total_cmp(&right.candidate.freq_hz))
-        });
 
         let remaining = options.max_successes.saturating_sub(successes.len());
         if remaining == 0 {
@@ -768,19 +791,7 @@ fn run_decode_search(
         if pass_successes.len() > remaining {
             pass_successes.truncate(remaining);
         }
-
-        let will_run_next_pass = pass + 1 < total_passes;
-
-        if will_run_next_pass {
-            for success in &pass_successes {
-                subtract_candidate(&mut residual_audio, success, subtraction_plan);
-            }
-        }
         successes.extend(pass_successes);
-
-        if !will_run_next_pass {
-            break;
-        }
     }
 
     SearchResult {
