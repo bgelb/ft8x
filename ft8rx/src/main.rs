@@ -7,7 +7,7 @@ use rigctl::{K3s, K3sConfig, RigState, detect_k3s_audio_device};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ const PRE_ROLL_MS: i64 = 1_200;
 const POST_ROLL_MS: i64 = 1_800;
 const SLOT_OFFSET_MS: usize = 1_200;
 const SLOT_SEARCH_OFFSETS_MS: [usize; 5] = [0, 600, 1_200, 1_800, 2_400];
+const DECODE_PROGRESS_SECONDS: f32 = 8.0;
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8rx")]
@@ -113,19 +114,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 break;
             }
 
-            display.status = format!("Decoding slot {}", format_slot_time(next_slot));
-            render(&display);
-            match decode_slot_from_capture(
-                &capture,
-                next_slot,
-                cli.save_raw_wav.as_deref(),
-                cli.save_wav.as_deref(),
-            ) {
-                Ok(decodes) => {
-                    display.last_slot_start = Some(next_slot);
-                    display.last_decodes = decodes;
-                    display.status = format!("Decoded slot {}", format_slot_time(next_slot));
-                }
+            let raw = match extract_raw_window(&capture, next_slot) {
+                Ok(raw) => raw,
                 Err(AppError::Audio(rigctl::audio::Error::WindowNotReady)) => {
                     display.status = format!("Waiting for slot {}", format_slot_time(next_slot));
                     break;
@@ -134,8 +124,75 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     display.status = format!("Decode error for {}: {}", format_slot_time(next_slot), error);
                     display.last_slot_start = Some(next_slot);
                     display.last_decodes.clear();
+                    next_slot += Duration::from_secs(SLOT_SECONDS);
+                    continue;
+                }
+            };
+
+            let raw_path = cli
+                .save_raw_wav
+                .clone()
+                .unwrap_or_else(|| temp_path("ft8rx-raw.wav"));
+            let slot_path = cli
+                .save_wav
+                .clone()
+                .unwrap_or_else(|| temp_path("ft8rx-slot.wav"));
+            let keep_raw = cli.save_raw_wav.is_some();
+            let keep_slot = cli.save_wav.is_some();
+            let sample_rate_hz = capture.config().sample_rate_hz;
+            let slot_start = next_slot;
+
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let result = decode_slot_from_raw_with_paths(
+                    raw,
+                    sample_rate_hz,
+                    &raw_path,
+                    keep_raw,
+                    &slot_path,
+                    keep_slot,
+                    slot_start,
+                );
+                let _ = tx.send(result);
+            });
+
+            let decode_started = SystemTime::now();
+            loop {
+                display.status = format!(
+                    "Decoding slot {} {}",
+                    format_slot_time(next_slot),
+                    decode_progress_bar(decode_started)
+                );
+                render(&display);
+
+                match rx.recv_timeout(Duration::from_millis(120)) {
+                    Ok(Ok(decodes)) => {
+                        display.last_slot_start = Some(next_slot);
+                        display.last_decodes = decodes;
+                        display.status = format!("Decoded slot {}", format_slot_time(next_slot));
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        display.status = format!("Decode error for {}: {}", format_slot_time(next_slot), error);
+                        display.last_slot_start = Some(next_slot);
+                        display.last_decodes.clear();
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        display.status =
+                            format!("Decode error for {}: decoder worker exited", format_slot_time(next_slot));
+                        display.last_slot_start = Some(next_slot);
+                        display.last_decodes.clear();
+                        break;
+                    }
+                }
+
+                if stop.load(Ordering::Relaxed) {
+                    break;
                 }
             }
+
             next_slot += Duration::from_secs(SLOT_SECONDS);
         }
 
@@ -203,29 +260,52 @@ fn read_rig_state() -> Result<RigState, AppError> {
     Ok(rig.read_state()?)
 }
 
+fn extract_raw_window(capture: &SampleStream, slot_start: SystemTime) -> Result<Vec<i16>, AppError> {
+    let raw_start = shift_time(slot_start, -PRE_ROLL_MS)?;
+    let raw_sample_count = (RAW_WINDOW_SECONDS as usize) * capture.config().sample_rate_hz as usize;
+    Ok(capture.extract_window(raw_start, raw_sample_count)?)
+}
+
 fn decode_slot_from_capture(
     capture: &SampleStream,
     slot_start: SystemTime,
     save_raw_wav: Option<&Path>,
     save_slot_wav: Option<&Path>,
 ) -> Result<Vec<DecodedMessage>, AppError> {
-    let raw_start = shift_time(slot_start, -PRE_ROLL_MS)?;
-    let raw_sample_count = (RAW_WINDOW_SECONDS as usize) * capture.config().sample_rate_hz as usize;
-    let raw = capture.extract_window(raw_start, raw_sample_count)?;
-
+    let raw = extract_raw_window(capture, slot_start)?;
     let raw_path = save_raw_wav
         .map(Path::to_path_buf)
         .unwrap_or_else(|| temp_path("ft8rx-raw.wav"));
     let slot_path = save_slot_wav
         .map(Path::to_path_buf)
         .unwrap_or_else(|| temp_path("ft8rx-slot.wav"));
-    write_mono_wav(&raw_path, capture.config().sample_rate_hz, &raw)?;
-    let decodes = decode_slot_from_raw(&raw, capture.config().sample_rate_hz, &slot_path, slot_start)?;
-    if save_raw_wav.is_none() {
-        let _ = std::fs::remove_file(&raw_path);
+    decode_slot_from_raw_with_paths(
+        raw,
+        capture.config().sample_rate_hz,
+        &raw_path,
+        save_raw_wav.is_some(),
+        &slot_path,
+        save_slot_wav.is_some(),
+        slot_start,
+    )
+}
+
+fn decode_slot_from_raw_with_paths(
+    raw: Vec<i16>,
+    sample_rate_hz: u32,
+    raw_path: &Path,
+    keep_raw: bool,
+    slot_path: &Path,
+    keep_slot: bool,
+    slot_start: SystemTime,
+) -> Result<Vec<DecodedMessage>, AppError> {
+    write_mono_wav(raw_path, sample_rate_hz, &raw)?;
+    let decodes = decode_slot_from_raw(&raw, sample_rate_hz, slot_path, slot_start)?;
+    if !keep_raw {
+        let _ = std::fs::remove_file(raw_path);
     }
-    if save_slot_wav.is_none() {
-        let _ = std::fs::remove_file(&slot_path);
+    if !keep_slot {
+        let _ = std::fs::remove_file(slot_path);
     }
     Ok(decodes)
 }
@@ -306,6 +386,22 @@ fn slice_rms_dbfs(samples: &[i16]) -> f32 {
         / samples.len() as f32)
         .sqrt();
     20.0 * rms.max(1e-9).log10()
+}
+
+fn decode_progress_bar(started_at: SystemTime) -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(started_at)
+        .unwrap_or_default()
+        .as_secs_f32();
+    let progress = (elapsed / DECODE_PROGRESS_SECONDS).clamp(0.0, 1.0);
+    let width: usize = 16;
+    let filled = (progress * width as f32).round() as usize;
+    format!(
+        "[{}{}] {:>3}%",
+        "#".repeat(filled),
+        ".".repeat(width.saturating_sub(filled)),
+        (progress * 100.0).round() as i32
+    )
 }
 
 fn render(display: &DisplayState) {
