@@ -66,34 +66,78 @@ struct DisplayState {
 
 #[derive(Debug, Clone)]
 struct DisplayDelta {
-    label: &'static str,
     decode: DecodedMessage,
 }
 
 #[derive(Debug)]
 struct DecodeJob {
     slot_start: SystemTime,
+    stage: DecodeStage,
     capture_end: SystemTime,
     samples: Vec<i16>,
     sample_rate_hz: u32,
-    raw_path: PathBuf,
-    keep_raw: bool,
+    raw_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 enum DecodeEvent {
     Finished {
         slot_start: SystemTime,
+        stage: DecodeStage,
         wall_ms: u128,
-        result: Result<DecodeSummary, AppError>,
+        result: Result<StageDecodeReport, AppError>,
     },
 }
 
 #[derive(Debug)]
 struct DecodeSummary {
     final_decodes: Vec<DecodedMessage>,
-    early47_deltas: Vec<DisplayDelta>,
-    full_deltas: Vec<DisplayDelta>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SlotStageState {
+    early41: bool,
+    early47: bool,
+    full: bool,
+}
+
+impl SlotStageState {
+    fn is_handled(self, stage: DecodeStage) -> bool {
+        match stage {
+            DecodeStage::Early41 => self.early41,
+            DecodeStage::Early47 => self.early47,
+            DecodeStage::Full => self.full,
+        }
+    }
+
+    fn mark_handled(&mut self, stage: DecodeStage) {
+        match stage {
+            DecodeStage::Early41 => self.early41 = true,
+            DecodeStage::Early47 => self.early47 = true,
+            DecodeStage::Full => self.full = true,
+        }
+    }
+
+    fn next_due_stage(self, slot_start: SystemTime, latest_sample_time: Option<SystemTime>) -> Option<DecodeStage> {
+        let latest_sample_time = latest_sample_time?;
+        for stage in [DecodeStage::Early41, DecodeStage::Early47, DecodeStage::Full] {
+            if self.is_handled(stage) {
+                continue;
+            }
+            let ready_at = stage_capture_end(slot_start, stage).ok()?;
+            if latest_sample_time >= ready_at {
+                return Some(stage);
+            }
+            return None;
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveDecodeJob {
+    slot_start: SystemTime,
+    stage: DecodeStage,
 }
 
 fn main() -> Result<(), AppError> {
@@ -108,16 +152,23 @@ fn main() -> Result<(), AppError> {
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let audio = detect_k3s_audio_device(cli.device.as_deref())?;
     let capture = SampleStream::start(audio.clone(), AudioStreamConfig::default())?;
-    let (job_tx, job_rx) = mpsc::channel::<DecodeJob>();
+    let (job_tx, job_rx) = mpsc::sync_channel::<DecodeJob>(1);
     let (event_tx, event_rx) = mpsc::channel::<DecodeEvent>();
     thread::spawn(move || {
+        let mut session_slot: Option<SystemTime> = None;
+        let mut session = DecoderSession::new();
         while let Ok(job) = job_rx.recv() {
-            let result = decode_slot_from_samples_with_raw_path(
+            if session_slot != Some(job.slot_start) {
+                session.reset();
+                session_slot = Some(job.slot_start);
+            }
+            let result = decode_stage_from_samples(
+                &mut session,
                 &job.samples,
                 job.sample_rate_hz,
-                &job.raw_path,
-                job.keep_raw,
+                job.stage,
                 job.slot_start,
+                job.raw_path.as_deref(),
             );
             let wall_ms = SystemTime::now()
                 .duration_since(job.capture_end)
@@ -125,9 +176,14 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 .as_millis();
             let _ = event_tx.send(DecodeEvent::Finished {
                 slot_start: job.slot_start,
+                stage: job.stage,
                 wall_ms,
                 result,
             });
+            if job.stage == DecodeStage::Full {
+                session.reset();
+                session_slot = None;
+            }
         }
     });
     let stop = Arc::new(AtomicBool::new(false));
@@ -155,8 +211,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     };
 
     let mut next_slot = next_slot_boundary(SystemTime::now());
+    let mut next_slot_stages = SlotStageState::default();
     let mut last_rig_poll = UNIX_EPOCH;
-    let mut active_decode_slot: Option<SystemTime> = None;
+    let mut active_decode: Option<ActiveDecodeJob> = None;
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
@@ -177,88 +234,128 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             match event {
                 DecodeEvent::Finished {
                     slot_start,
+                    stage,
                     wall_ms,
                     result,
                 } => {
-                    active_decode_slot = None;
-                    display.last_slot_start = Some(slot_start);
-                    display.last_decode_wall_ms = Some(wall_ms);
+                    active_decode = None;
                     match result {
-                        Ok(summary) => {
-                            display.last_decodes = summary.final_decodes;
-                            display.early47_deltas = summary.early47_deltas;
-                            display.full_deltas = summary.full_deltas;
+                        Ok(update) => {
+                            match stage {
+                                DecodeStage::Early41 => {
+                                    display.last_decodes = update.report.decodes.clone();
+                                }
+                                DecodeStage::Early47 => {
+                                    display.early47_deltas = stage_deltas(&update);
+                                }
+                                DecodeStage::Full => {
+                                    display.last_slot_start = Some(slot_start);
+                                    display.last_decode_wall_ms = Some(wall_ms);
+                                    display.full_deltas = stage_deltas(&update);
+                                }
+                            }
                         }
                         Err(error) => {
                             display.decode_status =
-                                format!("Last decode {} failed: {}", format_slot_time(slot_start), error);
-                            display.last_decodes.clear();
-                            display.early47_deltas.clear();
-                            display.full_deltas.clear();
+                                format!("Last {} {} failed: {}", stage.as_str(), format_slot_time(slot_start), error);
+                            if stage == DecodeStage::Full {
+                                display.last_slot_start = Some(slot_start);
+                                display.last_decode_wall_ms = Some(wall_ms);
+                                display.last_decodes.clear();
+                                display.early47_deltas.clear();
+                                display.full_deltas.clear();
+                            }
                         }
                     }
                 }
             }
         }
 
-        while let Some(latest_slot) = latest_ready_capture_slot(display.capture_latest_sample_time) {
-            if next_slot > latest_slot {
-                break;
-            }
-
+        while let Some(stage) = next_slot_stages.next_due_stage(next_slot, display.capture_latest_sample_time) {
             let slot_start = next_slot;
-            let capture_end = slot_capture_end(slot_start, capture.config().sample_rate_hz)?;
-            let samples = match extract_slot_capture(&capture, slot_start) {
+            let capture_end = stage_capture_end(slot_start, stage)?;
+            let samples = match extract_stage_capture(&capture, slot_start, stage) {
                 Ok(raw) => raw,
                 Err(AppError::Audio(rigctl::audio::Error::WindowNotReady)) => {
                     break;
                 }
                 Err(error) => {
-                    display.decode_status =
-                        format!("Capture error for {}: {}", format_slot_time(slot_start), error);
-                    display.last_slot_start = Some(slot_start);
-                    display.last_decodes.clear();
-                    display.early47_deltas.clear();
-                    display.full_deltas.clear();
-                    next_slot += Duration::from_secs(SLOT_SECONDS);
+                    display.decode_status = format!(
+                        "Capture error for {} {}: {}",
+                        stage.as_str(),
+                        format_slot_time(slot_start),
+                        error
+                    );
+                    next_slot_stages.mark_handled(stage);
+                    if stage == DecodeStage::Full {
+                        display.last_slot_start = Some(slot_start);
+                        display.last_decodes.clear();
+                        display.early47_deltas.clear();
+                        display.full_deltas.clear();
+                        next_slot += Duration::from_secs(SLOT_SECONDS);
+                        next_slot_stages = SlotStageState::default();
+                    }
                     continue;
                 }
             };
 
-            let raw_path = cli
-                .save_raw_wav
-                .clone()
-                .unwrap_or_else(|| temp_path("ft8rx-raw.wav"));
-            if active_decode_slot.is_some() {
-                display.dropped_slots += 1;
-                display.decode_status = format!(
-                    "capture=idle decode=busy dropping={} drops={} next={}",
-                    format_slot_time(slot_start),
-                    display.dropped_slots,
-                    format_slot_time(next_slot + Duration::from_secs(SLOT_SECONDS))
-                );
-                display.last_slot_start = Some(slot_start);
-                display.last_decodes.clear();
-                display.early47_deltas.clear();
-                display.full_deltas.clear();
-                next_slot += Duration::from_secs(SLOT_SECONDS);
-                continue;
-            }
-            active_decode_slot = Some(slot_start);
-            let _ = job_tx.send(DecodeJob {
+            let raw_path = if stage == DecodeStage::Full {
+                Some(
+                    cli.save_raw_wav
+                        .clone()
+                        .unwrap_or_else(|| temp_path("ft8rx-raw.wav")),
+                )
+            } else {
+                None
+            };
+
+            let send_result = job_tx.try_send(DecodeJob {
                 slot_start,
+                stage,
                 capture_end,
                 samples,
                 sample_rate_hz: capture.config().sample_rate_hz,
                 raw_path,
-                keep_raw: cli.save_raw_wav.is_some(),
             });
+            next_slot_stages.mark_handled(stage);
+            match send_result {
+                Ok(()) => {
+                    if stage == DecodeStage::Early41 {
+                        display.early47_deltas.clear();
+                        display.full_deltas.clear();
+                    }
+                    active_decode = Some(ActiveDecodeJob { slot_start, stage });
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if stage == DecodeStage::Full {
+                        display.dropped_slots += 1;
+                        display.decode_status = format!(
+                            "capture=active decode=busy dropping={} drops={} next={}",
+                            format_slot_time(slot_start),
+                            display.dropped_slots,
+                            format_slot_time(next_slot + Duration::from_secs(SLOT_SECONDS))
+                        );
+                        display.last_slot_start = Some(slot_start);
+                        display.early47_deltas.clear();
+                        display.full_deltas.clear();
+                    }
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(AppError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "decode worker disconnected",
+                    )));
+                }
+            }
 
-            next_slot += Duration::from_secs(SLOT_SECONDS);
+            if stage == DecodeStage::Full {
+                next_slot += Duration::from_secs(SLOT_SECONDS);
+                next_slot_stages = SlotStageState::default();
+            }
         }
 
         display.decode_status = format_status(
-            active_decode_slot,
+            active_decode,
             next_slot,
             display.dropped_slots,
             capture.config().sample_rate_hz,
@@ -327,6 +424,17 @@ fn extract_slot_capture(capture: &SampleStream, slot_start: SystemTime) -> Resul
     )?)
 }
 
+fn extract_stage_capture(
+    capture: &SampleStream,
+    slot_start: SystemTime,
+    stage: DecodeStage,
+) -> Result<Vec<i16>, AppError> {
+    Ok(capture.extract_window(
+        slot_start,
+        stage_sample_count(capture.config().sample_rate_hz, stage),
+    )?)
+}
+
 fn decode_slot_from_capture(
     capture: &SampleStream,
     slot_start: SystemTime,
@@ -362,6 +470,41 @@ fn decode_slot_from_samples_with_raw_path(
     Ok(decodes)
 }
 
+fn decode_stage_from_samples(
+    session: &mut DecoderSession,
+    samples: &[i16],
+    sample_rate_hz: u32,
+    stage: DecodeStage,
+    slot_start: SystemTime,
+    raw_path: Option<&Path>,
+) -> Result<StageDecodeReport, AppError> {
+    if let Some(raw_path) = raw_path {
+        write_mono_wav(raw_path, sample_rate_hz, samples)?;
+    }
+    let options = DecodeOptions {
+        profile: DecodeProfile::Medium,
+        min_freq_hz: 200.0,
+        max_freq_hz: 3_500.0,
+        ..DecodeOptions::default()
+    };
+    let audio = AudioBuffer {
+        sample_rate_hz: DECODER_SAMPLE_RATE_HZ,
+        samples: resample_linear_f32(
+            &samples
+                .iter()
+                .map(|&sample| sample as f32 / i16::MAX as f32)
+                .collect::<Vec<_>>(),
+            sample_rate_hz,
+            DECODER_SAMPLE_RATE_HZ,
+        ),
+    };
+    let mut update = session
+        .decode_stage(&audio, &options, stage)
+        .map_err(|error| AppError::Decoder(error.to_string()))?;
+    relabel_stage_update(&mut update, slot_start);
+    Ok(update)
+}
+
 fn decode_slot_from_samples(
     samples: &[i16],
     sample_rate_hz: u32,
@@ -389,26 +532,20 @@ fn decode_slot_from_samples(
         .decode_available(&audio, &options)
         .map_err(|error| AppError::Decoder(error.to_string()))?;
     let mut final_decodes = Vec::new();
-    let mut early47_deltas = Vec::new();
-    let mut full_deltas = Vec::new();
     for mut update in updates {
         relabel_stage_update(&mut update, slot_start);
         match update.stage {
             DecodeStage::Early41 => {}
             DecodeStage::Early47 => {
-                early47_deltas = stage_deltas(&update);
                 final_decodes = update.report.decodes.clone();
             }
             DecodeStage::Full => {
-                full_deltas = stage_deltas(&update);
                 final_decodes = update.report.decodes.clone();
             }
         }
     }
     Ok(DecodeSummary {
         final_decodes,
-        early47_deltas,
-        full_deltas,
     })
 }
 
@@ -518,6 +655,7 @@ fn render(display: &DisplayState) {
         display.last_decodes.len()
     );
     let _ = writeln!(output);
+    let _ = writeln!(output, "Early41");
     let _ = writeln!(output, "UTC    SNR   dT(s)   Freq(Hz)  Message");
     let _ = writeln!(output, "-----  ----  ------  --------  -------");
     if display.last_decodes.is_empty() {
@@ -539,8 +677,8 @@ fn render(display: &DisplayState) {
 fn render_delta_section(output: &mut String, title: &str, deltas: &[DisplayDelta]) {
     let _ = writeln!(output);
     let _ = writeln!(output, "{title}");
-    let _ = writeln!(output, "Delta   UTC    SNR   dT(s)   Freq(Hz)  Message");
-    let _ = writeln!(output, "------  -----  ----  ------  --------  -------");
+    let _ = writeln!(output, "UTC    SNR   dT(s)   Freq(Hz)  Message");
+    let _ = writeln!(output, "-----  ----  ------  --------  -------");
     if deltas.is_empty() {
         let _ = writeln!(output, "none");
         return;
@@ -548,8 +686,7 @@ fn render_delta_section(output: &mut String, title: &str, deltas: &[DisplayDelta
     for delta in deltas {
         let _ = writeln!(
             output,
-            "{:<6}  {:<5}  {:>4}  {:+6.2}  {:>8.0}  {}",
-            delta.label,
+            "{:<5}  {:>4}  {:+6.2}  {:>8.0}  {}",
             delta.decode.utc,
             delta.decode.snr_db,
             delta.decode.dt_seconds,
@@ -585,11 +722,6 @@ fn current_slot_boundary(now: SystemTime) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(current)
 }
 
-fn latest_ready_capture_slot(latest_sample_time: Option<SystemTime>) -> Option<SystemTime> {
-    let latest_sample_time = latest_sample_time?;
-    current_slot_boundary(latest_sample_time).checked_sub(Duration::from_secs(SLOT_SECONDS))
-}
-
 fn format_slot_time(time: SystemTime) -> String {
     let utc: DateTime<Utc> = time.into();
     utc.format("%H%M%S").to_string()
@@ -603,6 +735,11 @@ fn full_slot_sample_count(sample_rate_hz: u32) -> usize {
     SLOT_SECONDS as usize * sample_rate_hz as usize
 }
 
+fn stage_sample_count(sample_rate_hz: u32, stage: DecodeStage) -> usize {
+    (((stage.required_samples() as u64 * sample_rate_hz as u64) + (DECODER_SAMPLE_RATE_HZ as u64 / 2))
+        / DECODER_SAMPLE_RATE_HZ as u64) as usize
+}
+
 fn capture_window_duration(sample_rate_hz: u32) -> Duration {
     Duration::from_secs_f64(full_slot_sample_count(sample_rate_hz) as f64 / sample_rate_hz as f64)
 }
@@ -613,8 +750,16 @@ fn slot_capture_end(slot_start: SystemTime, sample_rate_hz: u32) -> Result<Syste
         .ok_or(AppError::Clock)
 }
 
+fn stage_capture_end(slot_start: SystemTime, stage: DecodeStage) -> Result<SystemTime, AppError> {
+    slot_start
+        .checked_add(Duration::from_secs_f64(
+            stage.required_samples() as f64 / DECODER_SAMPLE_RATE_HZ as f64,
+        ))
+        .ok_or(AppError::Clock)
+}
+
 fn format_status(
-    active_decode_slot: Option<SystemTime>,
+    active_decode: Option<ActiveDecodeJob>,
     next_slot: SystemTime,
     dropped_slots: u64,
     sample_rate_hz: u32,
@@ -625,11 +770,12 @@ fn format_status(
         Err(_) => false,
     };
     let capture_state = if capture_active { "active" } else { "idle" };
-    match active_decode_slot {
-        Some(slot) => format!(
-            "capture={} decode=active slot={} drops={} next={}",
+    match active_decode {
+        Some(active) => format!(
+            "capture={} decode={} slot={} drops={} next={}",
             capture_state,
-            format_slot_time(slot),
+            active.stage.as_str(),
+            format_slot_time(active.slot_start),
             dropped_slots,
             format_slot_time(next_slot)
         ),
@@ -659,13 +805,11 @@ fn stage_deltas(update: &StageDecodeReport) -> Vec<DisplayDelta> {
     let mut deltas = Vec::with_capacity(update.new_decodes.len() + update.updated_decodes.len());
     for decode in &update.new_decodes {
         deltas.push(DisplayDelta {
-            label: "new",
             decode: decode.clone(),
         });
     }
     for decode in &update.updated_decodes {
         deltas.push(DisplayDelta {
-            label: "update",
             decode: decode.clone(),
         });
     }
