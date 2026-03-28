@@ -57,6 +57,9 @@ struct DisplayState {
     capture_channel: usize,
     capture_recoveries: u64,
     decode_status: String,
+    early41_wall_ms: Option<u128>,
+    early47_wall_ms: Option<u128>,
+    full_wall_ms: Option<u128>,
     last_decode_wall_ms: Option<u128>,
     dropped_slots: u64,
     last_slot_start: Option<SystemTime>,
@@ -204,6 +207,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         capture_channel: 0,
         capture_recoveries: 0,
         decode_status: "Idle".to_string(),
+        early41_wall_ms: None,
+        early47_wall_ms: None,
+        full_wall_ms: None,
         last_decode_wall_ms: None,
         dropped_slots: 0,
         last_slot_start: None,
@@ -245,13 +251,16 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         Ok(update) => {
                             match stage {
                                 DecodeStage::Early41 => {
+                                    display.early41_wall_ms = Some(wall_ms);
                                     display.early41_decodes = update.report.decodes.clone();
                                 }
                                 DecodeStage::Early47 => {
+                                    display.early47_wall_ms = Some(wall_ms);
                                     display.early47_decodes = update.report.decodes.clone();
                                 }
                                 DecodeStage::Full => {
                                     display.last_slot_start = Some(slot_start);
+                                    display.full_wall_ms = Some(wall_ms);
                                     display.last_decode_wall_ms = Some(wall_ms);
                                     display.full_decodes = update.report.decodes.clone();
                                 }
@@ -262,6 +271,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 format!("Last {} {} failed: {}", stage.as_str(), format_slot_time(slot_start), error);
                             if stage == DecodeStage::Full {
                                 display.last_slot_start = Some(slot_start);
+                                display.full_wall_ms = Some(wall_ms);
                                 display.last_decode_wall_ms = Some(wall_ms);
                                 display.early41_decodes.clear();
                                 display.early47_decodes.clear();
@@ -323,6 +333,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             match send_result {
                 Ok(()) => {
                     if stage == DecodeStage::Early41 {
+                        display.early41_wall_ms = None;
+                        display.early47_wall_ms = None;
+                        display.full_wall_ms = None;
+                        display.last_decode_wall_ms = None;
                         display.early41_decodes.clear();
                         display.early47_decodes.clear();
                         display.full_decodes.clear();
@@ -632,6 +646,13 @@ fn render(display: &DisplayState) {
             .map(|ms| format!(" last={:.2}s", ms as f32 / 1000.0))
             .unwrap_or_default()
     );
+    let _ = writeln!(
+        output,
+        "DecodeT  early={} mid={} late={}",
+        format_wall_time(display.early41_wall_ms),
+        format_wall_time(display.early47_wall_ms),
+        format_wall_time(display.full_wall_ms)
+    );
     if let Some(slot_start) = display.last_slot_start {
         let _ = writeln!(
             output,
@@ -702,6 +723,12 @@ fn summarize_dt(decodes: &[DecodedMessage]) -> (f32, f32) {
         .sum::<f32>()
         / decodes.len() as f32;
     (mean, variance.sqrt())
+}
+
+fn format_wall_time(wall_ms: Option<u128>) -> String {
+    wall_ms
+        .map(|ms| format!("{:.2}s", ms as f32 / 1000.0))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn next_slot_boundary(now: SystemTime) -> SystemTime {
