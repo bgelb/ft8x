@@ -4,7 +4,6 @@ use ft8_decoder::{DecodeOptions, DecodeProfile, DecodedMessage, decode_wav_file}
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
 use rigctl::{K3s, K3sConfig, RigState, detect_k3s_audio_device};
-use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,12 +12,6 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SLOT_SECONDS: u64 = 15;
-const RAW_WINDOW_SECONDS: u64 = 17;
-const PRE_ROLL_MS: i64 = 1_200;
-const POST_ROLL_MS: i64 = 900;
-const SLOT_OFFSET_MS: usize = 1_200;
-const SLOT_SEARCH_OFFSETS_MS: [usize; 5] = [0, 600, 1_200, 1_800, 2_400];
-const DECODE_PROGRESS_SECONDS: f32 = 8.0;
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8rx")]
@@ -54,12 +47,13 @@ struct DisplayState {
     rig: Option<RigState>,
     audio: AudioDevice,
     capture_rms_dbfs: f32,
+    capture_latest_sample_time: Option<SystemTime>,
     capture_channel_rms_dbfs: Vec<f32>,
     capture_channel: usize,
     capture_recoveries: u64,
-    capture_status: String,
     decode_status: String,
     last_decode_wall_ms: Option<u128>,
+    dropped_slots: u64,
     last_slot_start: Option<SystemTime>,
     last_decodes: Vec<DecodedMessage>,
 }
@@ -67,20 +61,15 @@ struct DisplayState {
 #[derive(Debug)]
 struct DecodeJob {
     slot_start: SystemTime,
-    raw: Vec<i16>,
+    capture_end: SystemTime,
+    samples: Vec<i16>,
     sample_rate_hz: u32,
     raw_path: PathBuf,
     keep_raw: bool,
-    slot_path: PathBuf,
-    keep_slot: bool,
 }
 
 #[derive(Debug)]
 enum DecodeEvent {
-    Started {
-        slot_start: SystemTime,
-        started_at: SystemTime,
-    },
     Finished {
         slot_start: SystemTime,
         wall_ms: u128,
@@ -104,22 +93,15 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let (event_tx, event_rx) = mpsc::channel::<DecodeEvent>();
     thread::spawn(move || {
         while let Ok(job) = job_rx.recv() {
-            let started_at = SystemTime::now();
-            let _ = event_tx.send(DecodeEvent::Started {
-                slot_start: job.slot_start,
-                started_at,
-            });
-            let result = decode_slot_from_raw_with_paths(
-                job.raw,
+            let result = decode_slot_from_samples_with_raw_path(
+                &job.samples,
                 job.sample_rate_hz,
                 &job.raw_path,
                 job.keep_raw,
-                &job.slot_path,
-                job.keep_slot,
                 job.slot_start,
             );
             let wall_ms = SystemTime::now()
-                .duration_since(started_at)
+                .duration_since(job.capture_end)
                 .unwrap_or_default()
                 .as_millis();
             let _ = event_tx.send(DecodeEvent::Finished {
@@ -140,26 +122,26 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         rig: read_rig_state().ok(),
         audio,
         capture_rms_dbfs: -120.0,
+        capture_latest_sample_time: None,
         capture_channel_rms_dbfs: vec![-120.0; capture.config().channels],
         capture_channel: 0,
         capture_recoveries: 0,
-        capture_status: "Capturing audio".to_string(),
         decode_status: "Idle".to_string(),
         last_decode_wall_ms: None,
+        dropped_slots: 0,
         last_slot_start: None,
         last_decodes: Vec::new(),
     };
 
     let mut next_slot = next_slot_boundary(SystemTime::now());
     let mut last_rig_poll = UNIX_EPOCH;
-    let mut queued_slots = VecDeque::<SystemTime>::new();
     let mut active_decode_slot: Option<SystemTime> = None;
-    let mut active_decode_started_at: Option<SystemTime> = None;
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
         let stats = capture.stats();
         display.capture_rms_dbfs = stats.last_chunk_rms_dbfs;
+        display.capture_latest_sample_time = stats.latest_sample_time;
         display.capture_channel_rms_dbfs = stats.channel_rms_dbfs;
         display.capture_channel = stats.selected_channel;
         display.capture_recoveries = stats.recoveries;
@@ -172,23 +154,12 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
         while let Ok(event) = event_rx.try_recv() {
             match event {
-                DecodeEvent::Started {
-                    slot_start,
-                    started_at,
-                } => {
-                    if matches!(queued_slots.front(), Some(front) if *front == slot_start) {
-                        queued_slots.pop_front();
-                    }
-                    active_decode_slot = Some(slot_start);
-                    active_decode_started_at = Some(started_at);
-                }
                 DecodeEvent::Finished {
                     slot_start,
                     wall_ms,
                     result,
                 } => {
                     active_decode_slot = None;
-                    active_decode_started_at = None;
                     display.last_slot_start = Some(slot_start);
                     display.last_decode_wall_ms = Some(wall_ms);
                     match result {
@@ -205,20 +176,21 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             }
         }
 
-        while let Some(latest_slot) = latest_decodable_slot_start(SystemTime::now()) {
+        while let Some(latest_slot) = latest_ready_capture_slot(display.capture_latest_sample_time) {
             if next_slot > latest_slot {
                 break;
             }
 
             let slot_start = next_slot;
-            let raw = match extract_raw_window(&capture, slot_start) {
+            let capture_end = slot_capture_end(slot_start, capture.config().sample_rate_hz)?;
+            let samples = match extract_slot_capture(&capture, slot_start) {
                 Ok(raw) => raw,
                 Err(AppError::Audio(rigctl::audio::Error::WindowNotReady)) => {
-                    display.capture_status = format!("Waiting for slot {}", format_slot_time(slot_start));
                     break;
                 }
                 Err(error) => {
-                    display.capture_status = format!("Capture error for {}: {}", format_slot_time(slot_start), error);
+                    display.decode_status =
+                        format!("Capture error for {}: {}", format_slot_time(slot_start), error);
                     display.last_slot_start = Some(slot_start);
                     display.last_decodes.clear();
                     next_slot += Duration::from_secs(SLOT_SECONDS);
@@ -230,45 +202,38 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 .save_raw_wav
                 .clone()
                 .unwrap_or_else(|| temp_path("ft8rx-raw.wav"));
-            let slot_path = cli
-                .save_wav
-                .clone()
-                .unwrap_or_else(|| temp_path("ft8rx-slot.wav"));
+            if active_decode_slot.is_some() {
+                display.dropped_slots += 1;
+                display.decode_status = format!(
+                    "capture=idle decode=busy dropping={} drops={} next={}",
+                    format_slot_time(slot_start),
+                    display.dropped_slots,
+                    format_slot_time(next_slot + Duration::from_secs(SLOT_SECONDS))
+                );
+                display.last_slot_start = Some(slot_start);
+                display.last_decodes.clear();
+                next_slot += Duration::from_secs(SLOT_SECONDS);
+                continue;
+            }
+            active_decode_slot = Some(slot_start);
             let _ = job_tx.send(DecodeJob {
                 slot_start,
-                raw,
+                capture_end,
+                samples,
                 sample_rate_hz: capture.config().sample_rate_hz,
                 raw_path,
                 keep_raw: cli.save_raw_wav.is_some(),
-                slot_path,
-                keep_slot: cli.save_wav.is_some(),
             });
-            queued_slots.push_back(slot_start);
 
             next_slot += Duration::from_secs(SLOT_SECONDS);
         }
 
-        display.capture_status = format!(
-            "queued={} next={}",
-            queued_slots.len() + usize::from(active_decode_slot.is_some()),
-            format_slot_time(next_slot)
+        display.decode_status = format_status(
+            active_decode_slot,
+            next_slot,
+            display.dropped_slots,
+            capture.config().sample_rate_hz,
         );
-        display.decode_status = match (active_decode_slot, active_decode_started_at) {
-            (Some(slot), Some(started_at)) => format!(
-                "{} {} pending={}",
-                format_slot_time(slot),
-                decode_progress_bar(started_at),
-                queued_slots.len()
-            ),
-            _ => match display.last_slot_start {
-                Some(slot) => format!(
-                    "idle last={} pending={}",
-                    format_slot_time(slot),
-                    queued_slots.len()
-                ),
-                None => format!("idle pending={}", queued_slots.len()),
-            },
-        };
         render(&display);
         thread::sleep(Duration::from_millis(50));
     }
@@ -285,7 +250,7 @@ fn run_oneshot(cli: Cli) -> Result<(), AppError> {
     println!("audio=\"{}\" spec={}", audio.name, audio.spec);
     println!("target_slot={}", format_slot_time(target_slot));
 
-    let ready_at = shift_time(target_slot, SLOT_SECONDS as i64 * 1_000 + POST_ROLL_MS)?;
+    let ready_at = slot_capture_end(target_slot, capture.config().sample_rate_hz)?;
     while SystemTime::now() < ready_at {
         let stats = capture.stats();
         let latest = stats
@@ -309,8 +274,7 @@ fn run_oneshot(cli: Cli) -> Result<(), AppError> {
     let decodes = decode_slot_from_capture(
         &capture,
         target_slot,
-        cli.save_raw_wav.as_deref(),
-        cli.save_wav.as_deref(),
+        cli.save_raw_wav.as_deref().or(cli.save_wav.as_deref()),
     )?;
     println!("decodes={}", decodes.len());
     for decode in decodes {
@@ -327,96 +291,55 @@ fn read_rig_state() -> Result<RigState, AppError> {
     Ok(rig.read_state()?)
 }
 
-fn extract_raw_window(capture: &SampleStream, slot_start: SystemTime) -> Result<Vec<i16>, AppError> {
-    let raw_start = shift_time(slot_start, -PRE_ROLL_MS)?;
-    let raw_sample_count = (RAW_WINDOW_SECONDS as usize) * capture.config().sample_rate_hz as usize;
-    Ok(capture.extract_window(raw_start, raw_sample_count)?)
+fn extract_slot_capture(capture: &SampleStream, slot_start: SystemTime) -> Result<Vec<i16>, AppError> {
+    Ok(capture.extract_window(
+        slot_start,
+        full_slot_sample_count(capture.config().sample_rate_hz),
+    )?)
 }
 
 fn decode_slot_from_capture(
     capture: &SampleStream,
     slot_start: SystemTime,
     save_raw_wav: Option<&Path>,
-    save_slot_wav: Option<&Path>,
 ) -> Result<Vec<DecodedMessage>, AppError> {
-    let raw = extract_raw_window(capture, slot_start)?;
+    let samples = extract_slot_capture(capture, slot_start)?;
     let raw_path = save_raw_wav
         .map(Path::to_path_buf)
         .unwrap_or_else(|| temp_path("ft8rx-raw.wav"));
-    let slot_path = save_slot_wav
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| temp_path("ft8rx-slot.wav"));
-    decode_slot_from_raw_with_paths(
-        raw,
+    decode_slot_from_samples_with_raw_path(
+        &samples,
         capture.config().sample_rate_hz,
         &raw_path,
         save_raw_wav.is_some(),
-        &slot_path,
-        save_slot_wav.is_some(),
         slot_start,
     )
 }
 
-fn decode_slot_from_raw_with_paths(
-    raw: Vec<i16>,
+fn decode_slot_from_samples_with_raw_path(
+    samples: &[i16],
     sample_rate_hz: u32,
     raw_path: &Path,
     keep_raw: bool,
-    slot_path: &Path,
-    keep_slot: bool,
     slot_start: SystemTime,
 ) -> Result<Vec<DecodedMessage>, AppError> {
-    write_mono_wav(raw_path, sample_rate_hz, &raw)?;
-    let decodes = decode_slot_from_raw(&raw, sample_rate_hz, slot_path, slot_start)?;
+    write_mono_wav(raw_path, sample_rate_hz, samples)?;
+    let decodes = decode_slot_from_wav(raw_path, slot_start)?;
     if !keep_raw {
         let _ = std::fs::remove_file(raw_path);
-    }
-    if !keep_slot {
-        let _ = std::fs::remove_file(slot_path);
     }
     Ok(decodes)
 }
 
-fn decode_slot_from_raw(
-    raw: &[i16],
-    sample_rate_hz: u32,
-    slot_path: &Path,
-    slot_start: SystemTime,
-) -> Result<Vec<DecodedMessage>, AppError> {
+fn decode_slot_from_wav(path: &Path, slot_start: SystemTime) -> Result<Vec<DecodedMessage>, AppError> {
     let options = DecodeOptions {
-        profile: DecodeProfile::Quick,
+        profile: DecodeProfile::Medium,
         min_freq_hz: 200.0,
         max_freq_hz: 3_500.0,
         ..DecodeOptions::default()
     };
-    let slot_len = SLOT_SECONDS as usize * sample_rate_hz as usize;
-    let mut best_decodes = Vec::new();
-    let mut best_offset = SLOT_OFFSET_MS;
-    let mut best_rms = f32::NEG_INFINITY;
-
-    for offset_ms in SLOT_SEARCH_OFFSETS_MS {
-        let start = offset_ms * sample_rate_hz as usize / 1_000;
-        if start + slot_len > raw.len() {
-            continue;
-        }
-        let slice = &raw[start..start + slot_len];
-        write_mono_wav(slot_path, sample_rate_hz, slice)?;
-        let rms = slice_rms_dbfs(slice);
-        let report =
-            decode_wav_file(slot_path, &options).map_err(|error| AppError::Decoder(error.to_string()))?;
-        if report.decodes.len() > best_decodes.len()
-            || (report.decodes.len() == best_decodes.len() && rms > best_rms)
-        {
-            best_decodes = report.decodes;
-            best_offset = offset_ms;
-            best_rms = rms;
-        }
-    }
-
-    let start = best_offset * sample_rate_hz as usize / 1_000;
-    let slice = &raw[start..start + slot_len];
-    write_mono_wav(slot_path, sample_rate_hz, slice)?;
-
+    let mut best_decodes =
+        decode_wav_file(path, &options).map_err(|error| AppError::Decoder(error.to_string()))?.decodes;
     let slot_label = format_slot_time(slot_start);
     for decode in &mut best_decodes {
         decode.utc = slot_label.clone();
@@ -439,28 +362,13 @@ fn write_mono_wav(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Result<(
     Ok(())
 }
 
-fn slice_rms_dbfs(samples: &[i16]) -> f32 {
-    if samples.is_empty() {
-        return -120.0;
-    }
-    let rms = (samples
-        .iter()
-        .map(|&sample| {
-            let value = sample as f32 / i16::MAX as f32;
-            value * value
-        })
-        .sum::<f32>()
-        / samples.len() as f32)
-        .sqrt();
-    20.0 * rms.max(1e-9).log10()
-}
-
-fn decode_progress_bar(started_at: SystemTime) -> String {
-    let elapsed = SystemTime::now()
-        .duration_since(started_at)
+fn slot_progress_bar(now: SystemTime) -> String {
+    let slot_start = current_slot_boundary(now);
+    let elapsed = now
+        .duration_since(slot_start)
         .unwrap_or_default()
         .as_secs_f32();
-    let progress = (elapsed / DECODE_PROGRESS_SECONDS).clamp(0.0, 1.0);
+    let progress = (elapsed / SLOT_SECONDS as f32).clamp(0.0, 1.0);
     let width: usize = 16;
     let filled = (progress * width as f32).round() as usize;
     format!(
@@ -473,6 +381,8 @@ fn decode_progress_bar(started_at: SystemTime) -> String {
 
 fn render(display: &DisplayState) {
     let now_local: DateTime<Local> = SystemTime::now().into();
+    let now = SystemTime::now();
+    let current_slot = current_slot_boundary(now);
     let rig_frequency = display
         .rig
         .as_ref()
@@ -491,6 +401,10 @@ fn render(display: &DisplayState) {
     let dt_stats = summarize_dt(&display.last_decodes);
     let left = display.capture_channel_rms_dbfs.first().copied().unwrap_or(-120.0);
     let right = display.capture_channel_rms_dbfs.get(1).copied().unwrap_or(-120.0);
+    let latest_sample = display
+        .capture_latest_sample_time
+        .map(format_slot_time)
+        .unwrap_or_else(|| "------".to_string());
 
     let mut output = String::new();
     let _ = writeln!(output, "\x1b[2J\x1b[HFT8RX    {}", now_local.format("%Y-%m-%d %H:%M:%S %Z"));
@@ -498,18 +412,12 @@ fn render(display: &DisplayState) {
     let _ = writeln!(output, "Audio    {} ({})", display.audio.name, display.audio.spec);
     let _ = writeln!(
         output,
-        "Capture  last={:.1} dBFS recoveries={}",
-        display.capture_rms_dbfs, display.capture_recoveries
+        "Chan     latest={} selected={} left={:.1} dBFS right={:.1} dBFS",
+        latest_sample, display.capture_channel, left, right
     );
     let _ = writeln!(
         output,
-        "Chan     selected={} left={:.1} dBFS right={:.1} dBFS",
-        display.capture_channel, left, right
-    );
-    let _ = writeln!(output, "Capture  {}", display.capture_status);
-    let _ = writeln!(
-        output,
-        "Decode   {}{}",
+        "Status   {}{}",
         display.decode_status,
         display
             .last_decode_wall_ms
@@ -517,14 +425,26 @@ fn render(display: &DisplayState) {
             .unwrap_or_default()
     );
     if let Some(slot_start) = display.last_slot_start {
-        let _ = writeln!(output, "Slot     {}", format_slot_time(slot_start));
+        let _ = writeln!(
+            output,
+            "Slot     {} {} last_done={}",
+            format_slot_time(current_slot),
+            slot_progress_bar(now),
+            format_slot_time(slot_start)
+        );
     } else {
         let _ = writeln!(
             output,
-            "Slot     waiting for {}",
-            format_slot_time(next_slot_boundary(SystemTime::now()))
+            "Slot     {} {}",
+            format_slot_time(current_slot),
+            slot_progress_bar(now)
         );
     }
+    let _ = writeln!(
+        output,
+        "AudioLvl last={:.1} dBFS recoveries={}",
+        display.capture_rms_dbfs, display.capture_recoveries
+    );
     let _ = writeln!(
         output,
         "dT stats avg={:+.2}s stddev={:.2}s count={}",
@@ -566,22 +486,18 @@ fn summarize_dt(decodes: &[DecodedMessage]) -> (f32, f32) {
 }
 
 fn next_slot_boundary(now: SystemTime) -> SystemTime {
-    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let next = ((since_epoch.as_secs() / SLOT_SECONDS) + 1) * SLOT_SECONDS;
-    UNIX_EPOCH + Duration::from_secs(next)
+    current_slot_boundary(now) + Duration::from_secs(SLOT_SECONDS)
 }
 
-fn latest_decodable_slot_start(now: SystemTime) -> Option<SystemTime> {
-    let since_epoch = now.duration_since(UNIX_EPOCH).ok()?;
-    let current_boundary_secs = (since_epoch.as_secs() / SLOT_SECONDS) * SLOT_SECONDS;
-    let current_boundary = UNIX_EPOCH + Duration::from_secs(current_boundary_secs);
-    let elapsed_since_boundary = now.duration_since(current_boundary).ok()?;
-    let completed_boundary = if elapsed_since_boundary >= Duration::from_millis(POST_ROLL_MS as u64) {
-        current_boundary
-    } else {
-        current_boundary.checked_sub(Duration::from_secs(SLOT_SECONDS))?
-    };
-    completed_boundary.checked_sub(Duration::from_secs(SLOT_SECONDS))
+fn current_slot_boundary(now: SystemTime) -> SystemTime {
+    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let current = (since_epoch.as_secs() / SLOT_SECONDS) * SLOT_SECONDS;
+    UNIX_EPOCH + Duration::from_secs(current)
+}
+
+fn latest_ready_capture_slot(latest_sample_time: Option<SystemTime>) -> Option<SystemTime> {
+    let latest_sample_time = latest_sample_time?;
+    current_slot_boundary(latest_sample_time).checked_sub(Duration::from_secs(SLOT_SECONDS))
 }
 
 fn format_slot_time(time: SystemTime) -> String {
@@ -593,10 +509,45 @@ fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}-{}", std::process::id(), name))
 }
 
-fn shift_time(time: SystemTime, millis: i64) -> Result<SystemTime, AppError> {
-    if millis >= 0 {
-        time.checked_add(Duration::from_millis(millis as u64)).ok_or(AppError::Clock)
-    } else {
-        time.checked_sub(Duration::from_millis((-millis) as u64)).ok_or(AppError::Clock)
+fn full_slot_sample_count(sample_rate_hz: u32) -> usize {
+    SLOT_SECONDS as usize * sample_rate_hz as usize
+}
+
+fn capture_window_duration(sample_rate_hz: u32) -> Duration {
+    Duration::from_secs_f64(full_slot_sample_count(sample_rate_hz) as f64 / sample_rate_hz as f64)
+}
+
+fn slot_capture_end(slot_start: SystemTime, sample_rate_hz: u32) -> Result<SystemTime, AppError> {
+    slot_start
+        .checked_add(capture_window_duration(sample_rate_hz))
+        .ok_or(AppError::Clock)
+}
+
+fn format_status(
+    active_decode_slot: Option<SystemTime>,
+    next_slot: SystemTime,
+    dropped_slots: u64,
+    sample_rate_hz: u32,
+) -> String {
+    let now = SystemTime::now();
+    let capture_active = match slot_capture_end(current_slot_boundary(now), sample_rate_hz) {
+        Ok(capture_end) => now < capture_end,
+        Err(_) => false,
+    };
+    let capture_state = if capture_active { "active" } else { "idle" };
+    match active_decode_slot {
+        Some(slot) => format!(
+            "capture={} decode=active slot={} drops={} next={}",
+            capture_state,
+            format_slot_time(slot),
+            dropped_slots,
+            format_slot_time(next_slot)
+        ),
+        None => format!(
+            "capture={} decode=idle drops={} next={}",
+            capture_state,
+            dropped_slots,
+            format_slot_time(next_slot)
+        ),
     }
 }
