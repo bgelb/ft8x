@@ -4,6 +4,7 @@ use ft8_decoder::{DecodeOptions, DecodeProfile, DecodedMessage, decode_wav_file}
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
 use rigctl::{K3s, K3sConfig, RigState, detect_k3s_audio_device};
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const SLOT_SECONDS: u64 = 15;
 const RAW_WINDOW_SECONDS: u64 = 17;
 const PRE_ROLL_MS: i64 = 1_200;
-const POST_ROLL_MS: i64 = 1_800;
+const POST_ROLL_MS: i64 = 900;
 const SLOT_OFFSET_MS: usize = 1_200;
 const SLOT_SEARCH_OFFSETS_MS: [usize; 5] = [0, 600, 1_200, 1_800, 2_400];
 const DECODE_PROGRESS_SECONDS: f32 = 8.0;
@@ -56,9 +57,35 @@ struct DisplayState {
     capture_channel_rms_dbfs: Vec<f32>,
     capture_channel: usize,
     capture_recoveries: u64,
-    status: String,
+    capture_status: String,
+    decode_status: String,
+    last_decode_wall_ms: Option<u128>,
     last_slot_start: Option<SystemTime>,
     last_decodes: Vec<DecodedMessage>,
+}
+
+#[derive(Debug)]
+struct DecodeJob {
+    slot_start: SystemTime,
+    raw: Vec<i16>,
+    sample_rate_hz: u32,
+    raw_path: PathBuf,
+    keep_raw: bool,
+    slot_path: PathBuf,
+    keep_slot: bool,
+}
+
+#[derive(Debug)]
+enum DecodeEvent {
+    Started {
+        slot_start: SystemTime,
+        started_at: SystemTime,
+    },
+    Finished {
+        slot_start: SystemTime,
+        wall_ms: u128,
+        result: Result<Vec<DecodedMessage>, AppError>,
+    },
 }
 
 fn main() -> Result<(), AppError> {
@@ -73,6 +100,35 @@ fn main() -> Result<(), AppError> {
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let audio = detect_k3s_audio_device(cli.device.as_deref())?;
     let capture = SampleStream::start(audio.clone(), AudioStreamConfig::default())?;
+    let (job_tx, job_rx) = mpsc::channel::<DecodeJob>();
+    let (event_tx, event_rx) = mpsc::channel::<DecodeEvent>();
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let started_at = SystemTime::now();
+            let _ = event_tx.send(DecodeEvent::Started {
+                slot_start: job.slot_start,
+                started_at,
+            });
+            let result = decode_slot_from_raw_with_paths(
+                job.raw,
+                job.sample_rate_hz,
+                &job.raw_path,
+                job.keep_raw,
+                &job.slot_path,
+                job.keep_slot,
+                job.slot_start,
+            );
+            let wall_ms = SystemTime::now()
+                .duration_since(started_at)
+                .unwrap_or_default()
+                .as_millis();
+            let _ = event_tx.send(DecodeEvent::Finished {
+                slot_start: job.slot_start,
+                wall_ms,
+                result,
+            });
+        }
+    });
     let stop = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&stop);
     ctrlc::set_handler(move || {
@@ -87,13 +143,18 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         capture_channel_rms_dbfs: vec![-120.0; capture.config().channels],
         capture_channel: 0,
         capture_recoveries: 0,
-        status: "Capturing audio".to_string(),
+        capture_status: "Capturing audio".to_string(),
+        decode_status: "Idle".to_string(),
+        last_decode_wall_ms: None,
         last_slot_start: None,
         last_decodes: Vec::new(),
     };
 
     let mut next_slot = next_slot_boundary(SystemTime::now());
     let mut last_rig_poll = UNIX_EPOCH;
+    let mut queued_slots = VecDeque::<SystemTime>::new();
+    let mut active_decode_slot: Option<SystemTime> = None;
+    let mut active_decode_started_at: Option<SystemTime> = None;
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
@@ -109,20 +170,56 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             last_rig_poll = now;
         }
 
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                DecodeEvent::Started {
+                    slot_start,
+                    started_at,
+                } => {
+                    if matches!(queued_slots.front(), Some(front) if *front == slot_start) {
+                        queued_slots.pop_front();
+                    }
+                    active_decode_slot = Some(slot_start);
+                    active_decode_started_at = Some(started_at);
+                }
+                DecodeEvent::Finished {
+                    slot_start,
+                    wall_ms,
+                    result,
+                } => {
+                    active_decode_slot = None;
+                    active_decode_started_at = None;
+                    display.last_slot_start = Some(slot_start);
+                    display.last_decode_wall_ms = Some(wall_ms);
+                    match result {
+                        Ok(decodes) => {
+                            display.last_decodes = decodes;
+                        }
+                        Err(error) => {
+                            display.decode_status =
+                                format!("Last decode {} failed: {}", format_slot_time(slot_start), error);
+                            display.last_decodes.clear();
+                        }
+                    }
+                }
+            }
+        }
+
         while let Some(latest_slot) = latest_decodable_slot_start(SystemTime::now()) {
             if next_slot > latest_slot {
                 break;
             }
 
-            let raw = match extract_raw_window(&capture, next_slot) {
+            let slot_start = next_slot;
+            let raw = match extract_raw_window(&capture, slot_start) {
                 Ok(raw) => raw,
                 Err(AppError::Audio(rigctl::audio::Error::WindowNotReady)) => {
-                    display.status = format!("Waiting for slot {}", format_slot_time(next_slot));
+                    display.capture_status = format!("Waiting for slot {}", format_slot_time(slot_start));
                     break;
                 }
                 Err(error) => {
-                    display.status = format!("Decode error for {}: {}", format_slot_time(next_slot), error);
-                    display.last_slot_start = Some(next_slot);
+                    display.capture_status = format!("Capture error for {}: {}", format_slot_time(slot_start), error);
+                    display.last_slot_start = Some(slot_start);
                     display.last_decodes.clear();
                     next_slot += Duration::from_secs(SLOT_SECONDS);
                     continue;
@@ -137,73 +234,43 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 .save_wav
                 .clone()
                 .unwrap_or_else(|| temp_path("ft8rx-slot.wav"));
-            let keep_raw = cli.save_raw_wav.is_some();
-            let keep_slot = cli.save_wav.is_some();
-            let sample_rate_hz = capture.config().sample_rate_hz;
-            let slot_start = next_slot;
-
-            let (tx, rx) = mpsc::channel();
-            thread::spawn(move || {
-                let result = decode_slot_from_raw_with_paths(
-                    raw,
-                    sample_rate_hz,
-                    &raw_path,
-                    keep_raw,
-                    &slot_path,
-                    keep_slot,
-                    slot_start,
-                );
-                let _ = tx.send(result);
+            let _ = job_tx.send(DecodeJob {
+                slot_start,
+                raw,
+                sample_rate_hz: capture.config().sample_rate_hz,
+                raw_path,
+                keep_raw: cli.save_raw_wav.is_some(),
+                slot_path,
+                keep_slot: cli.save_wav.is_some(),
             });
-
-            let decode_started = SystemTime::now();
-            loop {
-                display.status = format!(
-                    "Decoding slot {} {}",
-                    format_slot_time(next_slot),
-                    decode_progress_bar(decode_started)
-                );
-                render(&display);
-
-                match rx.recv_timeout(Duration::from_millis(120)) {
-                    Ok(Ok(decodes)) => {
-                        display.last_slot_start = Some(next_slot);
-                        display.last_decodes = decodes;
-                        display.status = format!("Decoded slot {}", format_slot_time(next_slot));
-                        break;
-                    }
-                    Ok(Err(error)) => {
-                        display.status = format!("Decode error for {}: {}", format_slot_time(next_slot), error);
-                        display.last_slot_start = Some(next_slot);
-                        display.last_decodes.clear();
-                        break;
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        display.status =
-                            format!("Decode error for {}: decoder worker exited", format_slot_time(next_slot));
-                        display.last_slot_start = Some(next_slot);
-                        display.last_decodes.clear();
-                        break;
-                    }
-                }
-
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-            }
+            queued_slots.push_back(slot_start);
 
             next_slot += Duration::from_secs(SLOT_SECONDS);
         }
 
-        if display.last_slot_start.is_none() {
-            display.status = format!(
-                "Waiting for slot {}",
-                format_slot_time(next_slot_boundary(SystemTime::now()))
-            );
-        }
+        display.capture_status = format!(
+            "queued={} next={}",
+            queued_slots.len() + usize::from(active_decode_slot.is_some()),
+            format_slot_time(next_slot)
+        );
+        display.decode_status = match (active_decode_slot, active_decode_started_at) {
+            (Some(slot), Some(started_at)) => format!(
+                "{} {} pending={}",
+                format_slot_time(slot),
+                decode_progress_bar(started_at),
+                queued_slots.len()
+            ),
+            _ => match display.last_slot_start {
+                Some(slot) => format!(
+                    "idle last={} pending={}",
+                    format_slot_time(slot),
+                    queued_slots.len()
+                ),
+                None => format!("idle pending={}", queued_slots.len()),
+            },
+        };
         render(&display);
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(50));
     }
 
     print!("\x1b[?25h");
@@ -439,7 +506,16 @@ fn render(display: &DisplayState) {
         "Chan     selected={} left={:.1} dBFS right={:.1} dBFS",
         display.capture_channel, left, right
     );
-    let _ = writeln!(output, "Status   {}", display.status);
+    let _ = writeln!(output, "Capture  {}", display.capture_status);
+    let _ = writeln!(
+        output,
+        "Decode   {}{}",
+        display.decode_status,
+        display
+            .last_decode_wall_ms
+            .map(|ms| format!(" last={:.2}s", ms as f32 / 1000.0))
+            .unwrap_or_default()
+    );
     if let Some(slot_start) = display.last_slot_start {
         let _ = writeln!(output, "Slot     {}", format_slot_time(slot_start));
     } else {
