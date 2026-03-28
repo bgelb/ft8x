@@ -1,0 +1,10 @@
+[package]
+name = "audiolib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2.0.12"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9.1"

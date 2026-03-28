@@ -1,3 +1,7 @@
+pub mod audio {
+    pub use audiolib::{AudioDevice, AudioStreamConfig, CaptureStats, Error, Result, SampleStream, list_input_devices};
+}
+
 use serialport::{ClearBuffer, SerialPort};
 use std::fmt;
 use std::io::{Read, Write};
@@ -9,6 +13,7 @@ use std::time::{Duration, Instant};
 pub const K3S_BAUD_RATE: u32 = 38_400;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const DEFAULT_K3S_PORT: &str = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AK04X2PO-if00-port0";
+pub const DEFAULT_K3S_AUDIO_HINTS: &[&str] = &["CARD=CODEC", "USB Audio CODEC", "DEV=0"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -438,6 +443,34 @@ impl K3s {
             command: command.to_string(),
         })
     }
+}
+
+pub fn detect_k3s_audio_device(override_spec: Option<&str>) -> audio::Result<audio::AudioDevice> {
+    if let Some(spec) = override_spec {
+        return Ok(audio::AudioDevice {
+            name: spec.to_string(),
+            spec: spec.to_string(),
+            description: None,
+        });
+    }
+
+    let devices = audio::list_input_devices()?;
+    let mut best = None;
+    for device in devices {
+        let desc = device.description.as_deref().unwrap_or_default();
+        let looks_like_codec =
+            device.spec.contains("CARD=CODEC") || device.name.contains("USB Audio CODEC") || desc.contains("USB Audio CODEC");
+        let looks_like_device0 = device.spec.contains("DEV=0");
+        let looks_like_pcm = device.spec.starts_with("plughw:") || device.spec.starts_with("hw:");
+        if looks_like_codec && looks_like_device0 && looks_like_pcm {
+            if device.spec.starts_with("plughw:") {
+                return Ok(device);
+            }
+            best = Some(device);
+        }
+    }
+
+    best.ok_or_else(|| audio::Error::CaptureInit("K3S audio capture device not found".to_string()))
 }
 
 fn parse_prefixed_u64(prefix: &str, response: &str) -> Result<u64> {

@@ -84,6 +84,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "audiolib"
+version = "0.1.0"
+dependencies = [
+ "alsa",
+ "thiserror",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -329,7 +337,6 @@ dependencies = [
 name = "ft8rx"
 version = "0.1.0"
 dependencies = [
- "alsa",
  "chrono",
  "clap",
  "ctrlc",
@@ -762,6 +769,7 @@ dependencies = [
 name = "rigctl"
 version = "0.1.0"
 dependencies = [
+ "audiolib",
  "clap",
  "serialport",
  "thiserror",
