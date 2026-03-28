@@ -7,6 +7,7 @@ use ft8_decoder::{
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
 use rigctl::{K3s, K3sConfig, RigState, detect_k3s_audio_device};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,14 +60,18 @@ struct DisplayState {
     last_decode_wall_ms: Option<u128>,
     dropped_slots: u64,
     last_slot_start: Option<SystemTime>,
-    last_decodes: Vec<DecodedMessage>,
-    early47_deltas: Vec<DisplayDelta>,
-    full_deltas: Vec<DisplayDelta>,
+    early41_decodes: Vec<DecodedMessage>,
+    early47_decodes: Vec<DecodedMessage>,
+    full_decodes: Vec<DecodedMessage>,
 }
 
 #[derive(Debug, Clone)]
-struct DisplayDelta {
-    decode: DecodedMessage,
+struct CompositeDecodeRow {
+    display: DecodedMessage,
+    seen: &'static str,
+    early41: Option<DecodedMessage>,
+    early47: Option<DecodedMessage>,
+    full: Option<DecodedMessage>,
 }
 
 #[derive(Debug)]
@@ -205,9 +210,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         last_decode_wall_ms: None,
         dropped_slots: 0,
         last_slot_start: None,
-        last_decodes: Vec::new(),
-        early47_deltas: Vec::new(),
-        full_deltas: Vec::new(),
+        early41_decodes: Vec::new(),
+        early47_decodes: Vec::new(),
+        full_decodes: Vec::new(),
     };
 
     let mut next_slot = next_slot_boundary(SystemTime::now());
@@ -243,15 +248,15 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         Ok(update) => {
                             match stage {
                                 DecodeStage::Early41 => {
-                                    display.last_decodes = update.report.decodes.clone();
+                                    display.early41_decodes = update.report.decodes.clone();
                                 }
                                 DecodeStage::Early47 => {
-                                    display.early47_deltas = stage_deltas(&update);
+                                    display.early47_decodes = update.report.decodes.clone();
                                 }
                                 DecodeStage::Full => {
                                     display.last_slot_start = Some(slot_start);
                                     display.last_decode_wall_ms = Some(wall_ms);
-                                    display.full_deltas = stage_deltas(&update);
+                                    display.full_decodes = update.report.decodes.clone();
                                 }
                             }
                         }
@@ -261,9 +266,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             if stage == DecodeStage::Full {
                                 display.last_slot_start = Some(slot_start);
                                 display.last_decode_wall_ms = Some(wall_ms);
-                                display.last_decodes.clear();
-                                display.early47_deltas.clear();
-                                display.full_deltas.clear();
+                                display.early41_decodes.clear();
+                                display.early47_decodes.clear();
+                                display.full_decodes.clear();
                             }
                         }
                     }
@@ -289,9 +294,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     next_slot_stages.mark_handled(stage);
                     if stage == DecodeStage::Full {
                         display.last_slot_start = Some(slot_start);
-                        display.last_decodes.clear();
-                        display.early47_deltas.clear();
-                        display.full_deltas.clear();
+                        display.early41_decodes.clear();
+                        display.early47_decodes.clear();
+                        display.full_decodes.clear();
                         next_slot += Duration::from_secs(SLOT_SECONDS);
                         next_slot_stages = SlotStageState::default();
                     }
@@ -321,8 +326,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             match send_result {
                 Ok(()) => {
                     if stage == DecodeStage::Early41 {
-                        display.early47_deltas.clear();
-                        display.full_deltas.clear();
+                        display.early41_decodes.clear();
+                        display.early47_decodes.clear();
+                        display.full_decodes.clear();
                     }
                     active_decode = Some(ActiveDecodeJob { slot_start, stage });
                 }
@@ -336,8 +342,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             format_slot_time(next_slot + Duration::from_secs(SLOT_SECONDS))
                         );
                         display.last_slot_start = Some(slot_start);
-                        display.early47_deltas.clear();
-                        display.full_deltas.clear();
+                        display.early41_decodes.clear();
+                        display.early47_decodes.clear();
+                        display.full_decodes.clear();
                     }
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -600,7 +607,9 @@ fn render(display: &DisplayState) {
         .as_ref()
         .map(|state| state.band.to_string())
         .unwrap_or_else(|| "unavailable".to_string());
-    let dt_stats = summarize_dt(&display.last_decodes);
+    let display_decodes = preferred_stage_decodes(display);
+    let dt_stats = summarize_dt(display_decodes);
+    let composite_rows = composite_rows(display);
     let left = display.capture_channel_rms_dbfs.first().copied().unwrap_or(-120.0);
     let right = display.capture_channel_rms_dbfs.get(1).copied().unwrap_or(-120.0);
     let latest_sample = display
@@ -652,56 +661,37 @@ fn render(display: &DisplayState) {
         "dT stats avg={:+.2}s stddev={:.2}s count={}",
         dt_stats.0,
         dt_stats.1,
-        display.last_decodes.len()
+        display_decodes.len()
     );
     let _ = writeln!(output);
-    let _ = writeln!(output, "Early41");
-    let _ = writeln!(output, "UTC    SNR   dT(s)   Freq(Hz)  Corr     BER       Message");
-    let _ = writeln!(output, "-----  ----  ------  --------  -------  --------  -------");
-    if display.last_decodes.is_empty() {
+    let _ = writeln!(
+        output,
+        "Seen    UTC    SNR   dT(s)   Freq(Hz)  Early                 Mid                   Late                  Message"
+    );
+    let _ = writeln!(
+        output,
+        "------  -----  ----  ------  --------  --------------------  --------------------  --------------------  -------"
+    );
+    if composite_rows.is_empty() {
         let _ = writeln!(output, "no decodes yet");
     } else {
-        for decode in &display.last_decodes {
+        for row in &composite_rows {
             let _ = writeln!(
                 output,
-                "{:<5}  {:>4}  {:+6.2}  {:>8.0}  {:>7}  {:>8}  {}",
-                decode.utc,
-                decode.snr_db,
-                decode.dt_seconds,
-                decode.freq_hz,
-                format!("{}/{}", decode.corrected_bits, decode.total_bits),
-                format_ber(decode.corrected_bits, decode.total_bits),
-                decode.text
+                "{:<6}  {:<5}  {:>4}  {:+6.2}  {:>8.0}  {:<20}  {:<20}  {:<20}  {}",
+                row.seen,
+                row.display.utc,
+                row.display.snr_db,
+                row.display.dt_seconds,
+                row.display.freq_hz,
+                format_stage_metric(row.early41.as_ref()),
+                format_stage_metric(row.early47.as_ref()),
+                format_stage_metric(row.full.as_ref()),
+                row.display.text
             );
         }
     }
-    render_delta_section(&mut output, "Early47 delta", &display.early47_deltas);
-    render_delta_section(&mut output, "Full delta", &display.full_deltas);
     print!("{output}");
-}
-
-fn render_delta_section(output: &mut String, title: &str, deltas: &[DisplayDelta]) {
-    let _ = writeln!(output);
-    let _ = writeln!(output, "{title}");
-    let _ = writeln!(output, "UTC    SNR   dT(s)   Freq(Hz)  Corr     BER       Message");
-    let _ = writeln!(output, "-----  ----  ------  --------  -------  --------  -------");
-    if deltas.is_empty() {
-        let _ = writeln!(output, "none");
-        return;
-    }
-    for delta in deltas {
-        let _ = writeln!(
-            output,
-            "{:<5}  {:>4}  {:+6.2}  {:>8.0}  {:>7}  {:>8}  {}",
-            delta.decode.utc,
-            delta.decode.snr_db,
-            delta.decode.dt_seconds,
-            delta.decode.freq_hz,
-            format!("{}/{}", delta.decode.corrected_bits, delta.decode.total_bits),
-            format_ber(delta.decode.corrected_bits, delta.decode.total_bits),
-            delta.decode.text
-        );
-    }
 }
 
 fn format_ber(corrected_bits: usize, total_bits: usize) -> String {
@@ -816,25 +806,73 @@ fn relabel_stage_update(update: &mut StageDecodeReport, slot_start: SystemTime) 
     }
 }
 
-fn stage_deltas(update: &StageDecodeReport) -> Vec<DisplayDelta> {
-    let mut deltas = Vec::with_capacity(update.new_decodes.len() + update.updated_decodes.len());
-    for decode in &update.new_decodes {
-        deltas.push(DisplayDelta {
-            decode: decode.clone(),
-        });
+fn preferred_stage_decodes(display: &DisplayState) -> &[DecodedMessage] {
+    if !display.full_decodes.is_empty() {
+        &display.full_decodes
+    } else if !display.early47_decodes.is_empty() {
+        &display.early47_decodes
+    } else {
+        &display.early41_decodes
     }
-    for decode in &update.updated_decodes {
-        deltas.push(DisplayDelta {
-            decode: decode.clone(),
-        });
+}
+
+fn composite_rows(display: &DisplayState) -> Vec<CompositeDecodeRow> {
+    let mut rows = BTreeMap::<String, CompositeDecodeRow>::new();
+    for decode in &display.early41_decodes {
+        let key = decode.text.clone();
+        rows.insert(
+            key,
+            CompositeDecodeRow {
+                display: decode.clone(),
+                seen: "early",
+                early41: Some(decode.clone()),
+                early47: None,
+                full: None,
+            },
+        );
     }
-    deltas.sort_by(|left, right| {
-        left.decode
+    for decode in &display.early47_decodes {
+        let entry = rows.entry(decode.text.clone()).or_insert_with(|| CompositeDecodeRow {
+            display: decode.clone(),
+            seen: "mid",
+            early41: None,
+            early47: None,
+            full: None,
+        });
+        entry.display = decode.clone();
+        entry.early47 = Some(decode.clone());
+    }
+    for decode in &display.full_decodes {
+        let entry = rows.entry(decode.text.clone()).or_insert_with(|| CompositeDecodeRow {
+            display: decode.clone(),
+            seen: "late",
+            early41: None,
+            early47: None,
+            full: None,
+        });
+        entry.display = decode.clone();
+        entry.full = Some(decode.clone());
+    }
+    let mut rows: Vec<_> = rows.into_values().collect();
+    rows.sort_by(|left, right| {
+        left.display
             .freq_hz
-            .total_cmp(&right.decode.freq_hz)
-            .then_with(|| left.decode.text.cmp(&right.decode.text))
+            .total_cmp(&right.display.freq_hz)
+            .then_with(|| left.display.text.cmp(&right.display.text))
     });
-    deltas
+    rows
+}
+
+fn format_stage_metric(decode: Option<&DecodedMessage>) -> String {
+    match decode {
+        Some(decode) => format!(
+            "{}/{} ({})",
+            decode.corrected_bits,
+            decode.total_bits,
+            format_ber(decode.corrected_bits, decode.total_bits)
+        ),
+        None => "-".to_string(),
+    }
 }
 
 fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {
