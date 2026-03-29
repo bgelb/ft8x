@@ -584,6 +584,7 @@ async fn api_state_handler(State(snapshot): State<SharedWebSnapshot>) -> Json<We
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let audio = detect_k3s_audio_device(cli.device.as_deref())?;
     let capture = SampleStream::start(audio.clone(), AudioStreamConfig::default())?;
+    let mut rig = K3s::connect(K3sConfig::default()).ok();
     let web_snapshot = Arc::new(Mutex::new(WebSnapshot::default()));
     start_web_server(&cli.web_bind, Arc::clone(&web_snapshot))?;
     let (job_tx, job_rx) = mpsc::sync_channel::<DecodeJob>(1);
@@ -628,7 +629,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     .map_err(std::io::Error::other)?;
 
     let mut display = DisplayState {
-        rig: read_rig_state().ok(),
+        rig: read_rig_state(&mut rig),
         audio,
         capture_rms_dbfs: -120.0,
         capture_latest_sample_time: None,
@@ -668,7 +669,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
         let now = SystemTime::now();
         if now.duration_since(last_rig_poll).unwrap_or_default() >= Duration::from_secs(2) {
-            display.rig = read_rig_state().ok();
+            display.rig = read_rig_state(&mut rig);
             last_rig_poll = now;
         }
 
@@ -939,9 +940,8 @@ fn run_oneshot(cli: Cli) -> Result<(), AppError> {
     Ok(())
 }
 
-fn read_rig_state() -> Result<RigState, AppError> {
-    let mut rig = K3s::connect(K3sConfig::default())?;
-    Ok(rig.read_state()?)
+fn read_rig_state(rig: &mut Option<K3s>) -> Option<RigState> {
+    rig.as_mut().and_then(|rig| rig.read_state().ok())
 }
 
 fn extract_slot_capture(capture: &SampleStream, slot_start: SystemTime) -> Result<Vec<i16>, AppError> {
