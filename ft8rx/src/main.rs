@@ -287,8 +287,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     #waterfall {
       width: 100%;
+      max-width: 800px;
       height: 110px;
       display: block;
+      margin: 0 auto;
       image-rendering: pixelated;
       background: #02070c;
       border-radius: 10px;
@@ -349,6 +351,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .seen-late { color: #ff9e80; }
     .meta-line {
       display: flex;
+      justify-content: center;
       gap: 18px;
       flex-wrap: wrap;
       color: var(--muted);
@@ -376,7 +379,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <canvas id="waterfall" width="300" height="180"></canvas>
       <div class="meta-line">
         <span>Waterfall: 0-4000 Hz</span>
-        <span>Rows: latest at bottom</span>
+        <span>Rows: latest at top</span>
       </div>
     </section>
     <div class="maps">
@@ -653,7 +656,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let mut next_slot_stages = SlotStageState::default();
     let mut last_rig_poll = UNIX_EPOCH;
     let mut active_decode: Option<ActiveDecodeJob> = None;
-    let mut waterfall_rows = VecDeque::<Vec<u8>>::with_capacity(WATERFALL_HISTORY_ROWS);
+    let mut waterfall_rows = seeded_waterfall_rows();
     let mut last_waterfall_update = UNIX_EPOCH;
     let mut last_waterfall_sample_time = UNIX_EPOCH;
     let mut bandmaps = BandMapStore::default();
@@ -1507,9 +1510,17 @@ fn compute_waterfall_row(samples: &[i16], sample_rate_hz: u32) -> Vec<u8> {
 
 fn push_waterfall_row(rows: &mut VecDeque<Vec<u8>>, row: Vec<u8>) {
     if rows.len() == WATERFALL_HISTORY_ROWS {
-        rows.pop_front();
+        rows.pop_back();
     }
-    rows.push_back(row);
+    rows.push_front(row);
+}
+
+fn seeded_waterfall_rows() -> VecDeque<Vec<u8>> {
+    let mut rows = VecDeque::with_capacity(WATERFALL_HISTORY_ROWS);
+    for _ in 0..WATERFALL_HISTORY_ROWS {
+        rows.push_back(vec![0u8; WATERFALL_BUCKETS]);
+    }
+    rows
 }
 
 fn update_bandmaps(store: &mut BandMapStore, slot_start: SystemTime, decodes: &[DecodedMessage]) {
