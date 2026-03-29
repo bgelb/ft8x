@@ -6,7 +6,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use ft8_decoder::{
     AudioBuffer, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage, DecoderSession,
-    StageDecodeReport,
+    DecoderState, StageDecodeReport,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
@@ -595,6 +595,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     thread::spawn(move || {
         let mut session_slot: Option<SystemTime> = None;
         let mut session = DecoderSession::new();
+        let mut state = DecoderState::new();
         while let Ok(job) = job_rx.recv() {
             if session_slot != Some(job.slot_start) {
                 session.reset();
@@ -602,6 +603,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             }
             let result = decode_stage_from_samples(
                 &mut session,
+                &mut state,
                 &job.samples,
                 job.sample_rate_hz,
                 job.stage,
@@ -1002,6 +1004,7 @@ fn decode_slot_from_samples_with_raw_path(
 
 fn decode_stage_from_samples(
     session: &mut DecoderSession,
+    state: &mut DecoderState,
     samples: &[i16],
     sample_rate_hz: u32,
     stage: DecodeStage,
@@ -1028,9 +1031,10 @@ fn decode_stage_from_samples(
             DECODER_SAMPLE_RATE_HZ,
         ),
     };
-    let mut update = session
-        .decode_stage(&audio, &options, stage)
+    let (mut update, next_state) = session
+        .decode_stage_with_state(&audio, &options, stage, Some(state))
         .map_err(|error| AppError::Decoder(error.to_string()))?;
+    *state = next_state;
     relabel_stage_update(&mut update, slot_start);
     Ok(update)
 }
