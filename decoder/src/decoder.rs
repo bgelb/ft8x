@@ -1726,7 +1726,7 @@ fn downsample_candidate(
     let taper = baseband_taper();
     for index in 0..=BASEBAND_TAPER_LEN {
         baseband[index] *= taper[BASEBAND_TAPER_LEN - index];
-        baseband[copied - 1 - index] *= taper[index];
+        baseband[copied - 1 - index] *= taper[BASEBAND_TAPER_LEN - index];
     }
 
     let shift = (i0 - ib).max(0) as usize;
