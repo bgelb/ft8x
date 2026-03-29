@@ -5,7 +5,8 @@ use crate::protocol::GRAY_TONES_TO_BITS;
 
 const MAX_ITERS: usize = 30;
 const OSD_NT: usize = 40;
-const OSD_NTHETA: usize = 12;
+const OSD_NTHETA_MEDIUM: usize = 10;
+const OSD_NTHETA_DEEP: usize = 12;
 
 #[derive(Debug)]
 pub struct ParityMatrix {
@@ -255,8 +256,14 @@ impl ParityMatrix {
             }
         }
 
+        let osd_max_order = 2;
+        let osd_ntheta = if maxosd == 0 {
+            OSD_NTHETA_MEDIUM
+        } else {
+            OSD_NTHETA_DEEP
+        };
         for (index, llrs) in saved_llrs.iter().enumerate() {
-            if let Some(bits) = self.decode_osd(llrs, known_bits, 2) {
+            if let Some(bits) = self.decode_osd(llrs, known_bits, osd_max_order, osd_ntheta) {
                 return Some((bits, MAX_ITERS + index + 1));
             }
         }
@@ -268,6 +275,7 @@ impl ParityMatrix {
         llrs: &[f32],
         known_bits: Option<&[Option<u8>]>,
         max_order: usize,
+        ntheta: usize,
     ) -> Option<Vec<u8>> {
         if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
             return None;
@@ -341,7 +349,7 @@ impl ParityMatrix {
                 .map(|&bit| bit as usize)
                 .sum::<usize>()
                 + 1;
-            if nd1kpt <= OSD_NTHETA {
+            if nd1kpt <= ntheta {
                 let distance = weighted_distance(&codeword, &hard, &reliabilities);
                 if distance < best_distance {
                     best_distance = distance;
@@ -349,6 +357,9 @@ impl ParityMatrix {
                 }
             }
 
+            if max_order < 2 {
+                continue;
+            }
             for second in (0..first).rev() {
                 if apmask[second] {
                     continue;
@@ -360,7 +371,7 @@ impl ParityMatrix {
                     .map(|(&tail_bit, &basis_bit)| (tail_bit ^ basis_bit) as usize)
                     .sum::<usize>()
                     + 2;
-                if nd2kpt <= OSD_NTHETA {
+                if nd2kpt <= ntheta {
                     let mut message2 = message.clone();
                     message2[second] ^= 1;
                     let codeword2 = encode_mrb(&message2, &genmrb);
@@ -383,7 +394,7 @@ impl ParityMatrix {
                                 .map(|(&tail_bit, &basis_bit)| (tail_bit ^ basis_bit) as usize)
                                 .sum::<usize>()
                                 + 3;
-                            if nd3kpt > OSD_NTHETA {
+                            if nd3kpt > ntheta {
                                 continue;
                             }
                             let mut message3 = message2.clone();
