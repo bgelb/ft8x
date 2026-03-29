@@ -189,6 +189,25 @@ pub struct StageDecodeReport {
     pub updated_decodes: Vec<DecodedMessage>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct DecoderState {
+    resolver: HashResolver,
+}
+
+impl DecoderState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn insert_callsign(&mut self, callsign: &str) {
+        self.resolver.insert_callsign(callsign);
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidatePassDebug {
     pub pass_name: String,
@@ -327,6 +346,15 @@ pub fn decode_wav_file(
     decode_pcm(&audio, options)
 }
 
+pub fn decode_wav_file_with_state(
+    path: impl AsRef<Path>,
+    options: &DecodeOptions,
+    state: Option<&DecoderState>,
+) -> Result<(DecodeReport, DecoderState), DecoderError> {
+    let audio = load_wav(path)?;
+    decode_pcm_with_state(&audio, options, state)
+}
+
 impl DecoderSession {
     pub fn new() -> Self {
         Self::default()
@@ -345,9 +373,20 @@ impl DecoderSession {
         audio: &AudioBuffer,
         options: &DecodeOptions,
     ) -> Result<Vec<StageDecodeReport>, DecoderError> {
+        let updates = self.decode_available_with_state(audio, options, None)?;
+        Ok(updates.into_iter().map(|(report, _)| report).collect())
+    }
+
+    pub fn decode_available_with_state(
+        &mut self,
+        audio: &AudioBuffer,
+        options: &DecodeOptions,
+        state: Option<&DecoderState>,
+    ) -> Result<Vec<(StageDecodeReport, DecoderState)>, DecoderError> {
         validate_audio(audio)?;
 
         let mut updates = Vec::new();
+        let mut current_state = state.cloned();
         for stage in [DecodeStage::Early41, DecodeStage::Early47, DecodeStage::Full] {
             if self.emitted_stages.contains(&stage) {
                 continue;
@@ -355,8 +394,9 @@ impl DecoderSession {
             if !stage_is_enabled(stage, options) || audio.samples.len() < stage.required_samples() {
                 continue;
             }
-            let update = self.decode_stage(audio, options, stage)?;
-            updates.push(update);
+            let (update, next_state) = self.decode_stage_with_state(audio, options, stage, current_state.as_ref())?;
+            current_state = Some(next_state.clone());
+            updates.push((update, next_state));
         }
         Ok(updates)
     }
@@ -367,6 +407,17 @@ impl DecoderSession {
         options: &DecodeOptions,
         stage: DecodeStage,
     ) -> Result<StageDecodeReport, DecoderError> {
+        let (update, _) = self.decode_stage_with_state(audio, options, stage, None)?;
+        Ok(update)
+    }
+
+    pub fn decode_stage_with_state(
+        &mut self,
+        audio: &AudioBuffer,
+        options: &DecodeOptions,
+        stage: DecodeStage,
+        state: Option<&DecoderState>,
+    ) -> Result<(StageDecodeReport, DecoderState), DecoderError> {
         validate_audio(audio)?;
         if !stage_is_enabled(stage, options) {
             return Err(DecoderError::UnsupportedFormat(format!(
@@ -390,6 +441,7 @@ impl DecoderSession {
                     options,
                     None,
                     Vec::new(),
+                    state.map(|state| &state.resolver),
                     SYNC8_EARLY_THRESHOLD,
                     false,
                 );
@@ -397,14 +449,17 @@ impl DecoderSession {
                 search
             }
             DecodeStage::Early47 => {
-                let search = run_early47_search(audio, options, self.early41.as_ref());
+                let search = run_early47_search(audio, options, self.early41.as_ref(), state);
                 self.early47 = Some(search.clone());
                 search
             }
-            DecodeStage::Full => run_full_search(audio, options, self.early41.as_ref(), self.early47.as_ref()),
+            DecodeStage::Full => {
+                run_full_search(audio, options, self.early41.as_ref(), self.early47.as_ref(), state)
+            }
         };
 
-        let report = build_decode_report(audio, options, search);
+        let state = build_decoder_state(state, &search);
+        let report = build_decode_report_with_resolver(audio, options, search, Some(&state));
         let (new_decodes, updated_decodes) = diff_decodes(&self.last_decodes, &report.decodes);
         self.last_decodes = report
             .decodes
@@ -414,12 +469,15 @@ impl DecoderSession {
             .collect();
         self.emitted_stages.push(stage);
 
-        Ok(StageDecodeReport {
-            stage,
-            report,
-            new_decodes,
-            updated_decodes,
-        })
+        Ok((
+            StageDecodeReport {
+                stage,
+                report,
+                new_decodes,
+                updated_decodes,
+            },
+            state,
+        ))
     }
 }
 
@@ -672,8 +730,8 @@ fn append_debug_single_pass(
     });
 }
 
-fn success_resolver(successes: &[SuccessfulDecode]) -> HashResolver {
-    let mut resolver = HashResolver::default();
+fn merged_resolver(base: Option<&HashResolver>, successes: &[SuccessfulDecode]) -> HashResolver {
+    let mut resolver = base.cloned().unwrap_or_default();
     for success in successes {
         success.payload.collect_callsigns(&mut resolver);
     }
@@ -693,12 +751,13 @@ fn is_new_success(
     existing: &[SuccessfulDecode],
     current_pass: &[SuccessfulDecode],
     candidate: &SuccessfulDecode,
+    base_resolver: Option<&HashResolver>,
 ) -> bool {
     let mut combined = Vec::with_capacity(existing.len() + current_pass.len() + 1);
     combined.extend(existing.iter().cloned());
     combined.extend(current_pass.iter().cloned());
     combined.push(candidate.clone());
-    let resolver = success_resolver(&combined);
+    let resolver = merged_resolver(base_resolver, &combined);
     let candidate_key = rendered_success_key(candidate, &resolver);
     let mut seen = HashSet::<String>::new();
     for success in existing.iter().chain(current_pass.iter()) {
@@ -738,6 +797,22 @@ pub fn decode_pcm(
     }
 }
 
+pub fn decode_pcm_with_state(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    state: Option<&DecoderState>,
+) -> Result<(DecodeReport, DecoderState), DecoderError> {
+    let mut session = DecoderSession::new();
+    let mut updates = session.decode_available_with_state(audio, options, state)?;
+    if let Some((update, state)) = updates.pop() {
+        Ok((update.report, state))
+    } else {
+        Err(DecoderError::UnsupportedFormat(
+            "audio too short for selected decode profile".to_string(),
+        ))
+    }
+}
+
 fn validate_audio(audio: &AudioBuffer) -> Result<(), DecoderError> {
     if audio.sample_rate_hz != FT8_SAMPLE_RATE {
         return Err(DecoderError::UnsupportedFormat(format!(
@@ -764,6 +839,7 @@ fn run_early47_search(
     audio: &AudioBuffer,
     options: &DecodeOptions,
     early41: Option<&SearchResult>,
+    state: Option<&DecoderState>,
 ) -> SearchResult {
     let subtraction_plan = SubtractionPlan::global();
     let mut partial47 = zero_tail(audio, EARLY_47_SAMPLES);
@@ -782,6 +858,7 @@ fn run_early47_search(
         options,
         Some(partial47.clone()),
         initial_successes,
+        state.map(|state| &state.resolver),
         options.sync_threshold(),
         false,
     )
@@ -792,6 +869,7 @@ fn run_full_search(
     options: &DecodeOptions,
     early41: Option<&SearchResult>,
     early47: Option<&SearchResult>,
+    state: Option<&DecoderState>,
 ) -> SearchResult {
     let subtraction_plan = SubtractionPlan::global();
     let prepared_full = early47.map(|stage47| {
@@ -812,16 +890,19 @@ fn run_full_search(
         options,
         prepared_full,
         initial_successes,
+        state.map(|state| &state.resolver),
         options.sync_threshold(),
         true,
     )
 }
 
-fn build_decode_report(audio: &AudioBuffer, options: &DecodeOptions, search: SearchResult) -> DecodeReport {
-    let mut resolver = HashResolver::default();
-    for success in &search.successes {
-        success.payload.collect_callsigns(&mut resolver);
-    }
+fn build_decode_report_with_resolver(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    search: SearchResult,
+    base_state: Option<&DecoderState>,
+) -> DecodeReport {
+    let resolver = merged_resolver(base_state.map(|state| &state.resolver), &search.successes);
 
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
@@ -874,6 +955,12 @@ fn build_decode_report(audio: &AudioBuffer, options: &DecodeOptions, search: Sea
     }
 }
 
+fn build_decoder_state(base_state: Option<&DecoderState>, search: &SearchResult) -> DecoderState {
+    DecoderState {
+        resolver: merged_resolver(base_state.map(|state| &state.resolver), &search.successes),
+    }
+}
+
 fn diff_decodes(
     previous: &BTreeMap<String, DecodedMessage>,
     current: &[DecodedMessage],
@@ -902,6 +989,7 @@ fn run_decode_search(
     options: &DecodeOptions,
     residual_override: Option<AudioBuffer>,
     initial_successes: Vec<SuccessfulDecode>,
+    base_resolver: Option<&HashResolver>,
     sync_threshold: f32,
     allow_ap: bool,
 ) -> SearchResult {
@@ -954,7 +1042,7 @@ fn run_decode_search(
             counters.parsed_payloads += local_counters.parsed_payloads;
             if let Some(success) = success {
                 subtract_candidate(&mut residual_audio, &success, subtraction_plan);
-                if !is_new_success(&successes, &pass_successes, &success) {
+                if !is_new_success(&successes, &pass_successes, &success, base_resolver) {
                     continue;
                 }
                 pass_successes.push(success);
@@ -2089,6 +2177,11 @@ fn estimate_snr_db(full_tones: &[[Complex32; 8]]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode::{
+        WaveformOptions, encode_nonstandard_message, encode_standard_message,
+        synthesize_rectangular_waveform,
+    };
+    use crate::message::ReplyWord;
 
     #[test]
     #[ignore = "diagnostic"]
@@ -2201,5 +2294,55 @@ mod tests {
         let updates = session.decode_available(&full, &options).expect("quick decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Full);
+    }
+
+    #[test]
+    fn decode_pcm_with_state_resolves_hash22_callsign() {
+        let learned_frame = encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
+            .expect("encode learned");
+        let learned_audio = synthesize_rectangular_waveform(
+            &learned_frame,
+            &WaveformOptions {
+                base_freq_hz: 900.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("learned waveform");
+        let hashed_frame =
+            encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank).expect("encode hashed");
+        let hashed_audio = synthesize_rectangular_waveform(
+            &hashed_frame,
+            &WaveformOptions {
+                base_freq_hz: 1_234.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("hashed waveform");
+        let options = DecodeOptions {
+            max_candidates: 8,
+            max_successes: 2,
+            ..DecodeOptions::default()
+        };
+
+        let (unresolved, _) = decode_pcm_with_state(&hashed_audio, &options, None).expect("decode unresolved");
+        let unresolved_texts: Vec<_> = unresolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        assert!(
+            unresolved_texts.iter().any(|text| text.contains("<...>")),
+            "expected unresolved hash in {unresolved_texts:?}"
+        );
+
+        let (learned, state) = decode_pcm_with_state(&learned_audio, &options, None).expect("decode learned");
+        let learned_texts: Vec<_> = learned.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        assert!(
+            learned_texts.iter().any(|text| *text == "CQ HF19NY"),
+            "expected plain learned call in {learned_texts:?}"
+        );
+
+        let (resolved, _) = decode_pcm_with_state(&hashed_audio, &options, Some(&state)).expect("decode resolved");
+        let resolved_texts: Vec<_> = resolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        assert!(
+            resolved_texts.iter().any(|text| *text == "CQ HF19NY"),
+            "expected resolved call in {resolved_texts:?}"
+        );
     }
 }

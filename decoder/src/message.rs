@@ -71,7 +71,7 @@ pub enum ReplyWord {
     SeventyThree,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct HashResolver {
     h10: HashMap<u16, String>,
     h12: HashMap<u16, String>,
