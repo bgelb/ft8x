@@ -59,6 +59,7 @@ struct DisplayState {
     decode_status: String,
     early41_wall_ms: Option<u128>,
     early47_wall_ms: Option<u128>,
+    early47_tx_margin_ms: Option<i128>,
     full_wall_ms: Option<u128>,
     last_decode_wall_ms: Option<u128>,
     dropped_slots: u64,
@@ -209,6 +210,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         decode_status: "Idle".to_string(),
         early41_wall_ms: None,
         early47_wall_ms: None,
+        early47_tx_margin_ms: None,
         full_wall_ms: None,
         last_decode_wall_ms: None,
         dropped_slots: 0,
@@ -256,6 +258,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 }
                                 DecodeStage::Early47 => {
                                     display.early47_wall_ms = Some(wall_ms);
+                                    display.early47_tx_margin_ms = Some(
+                                        tx_margin_after_stage_decode_ms(slot_start, stage, wall_ms)?,
+                                    );
                                     display.early47_decodes = update.report.decodes.clone();
                                 }
                                 DecodeStage::Full => {
@@ -335,6 +340,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     if stage == DecodeStage::Early41 {
                         display.early41_wall_ms = None;
                         display.early47_wall_ms = None;
+                        display.early47_tx_margin_ms = None;
                         display.full_wall_ms = None;
                         display.last_decode_wall_ms = None;
                         display.early41_decodes.clear();
@@ -648,10 +654,11 @@ fn render(display: &DisplayState) {
     );
     let _ = writeln!(
         output,
-        "DecodeT  early={} mid={} late={}",
+        "DecodeT  early={} mid={} late={} tx_margin={}",
         format_wall_time(display.early41_wall_ms),
         format_wall_time(display.early47_wall_ms),
-        format_wall_time(display.full_wall_ms)
+        format_wall_time(display.full_wall_ms),
+        format_signed_wall_time(display.early47_tx_margin_ms)
     );
     if let Some(slot_start) = display.last_slot_start {
         let _ = writeln!(
@@ -731,6 +738,12 @@ fn format_wall_time(wall_ms: Option<u128>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn format_signed_wall_time(wall_ms: Option<i128>) -> String {
+    wall_ms
+        .map(|ms| format!("{:+.2}s", ms as f32 / 1000.0))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn next_slot_boundary(now: SystemTime) -> SystemTime {
     current_slot_boundary(now) + Duration::from_secs(SLOT_SECONDS)
 }
@@ -775,6 +788,22 @@ fn stage_capture_end(slot_start: SystemTime, stage: DecodeStage) -> Result<Syste
             stage.required_samples() as f64 / DECODER_SAMPLE_RATE_HZ as f64,
         ))
         .ok_or(AppError::Clock)
+}
+
+fn tx_margin_after_stage_decode_ms(
+    slot_start: SystemTime,
+    stage: DecodeStage,
+    wall_ms: u128,
+) -> Result<i128, AppError> {
+    let tx_start = slot_start
+        .checked_add(Duration::from_secs(SLOT_SECONDS))
+        .ok_or(AppError::Clock)?;
+    let capture_end = stage_capture_end(slot_start, stage)?;
+    let capture_to_tx_ms = tx_start
+        .duration_since(capture_end)
+        .map_err(|_| AppError::Clock)?
+        .as_millis() as i128;
+    Ok(capture_to_tx_ms - wall_ms as i128)
 }
 
 fn format_status(
