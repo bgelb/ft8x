@@ -28,7 +28,7 @@ enum Command {
         #[arg(long, default_value_t = 200.0)]
         min_freq_hz: f32,
 
-        #[arg(long, default_value_t = 3000.0)]
+        #[arg(long, default_value_t = 4000.0)]
         max_freq_hz: f32,
 
         #[arg(long, default_value_t = 600)]
