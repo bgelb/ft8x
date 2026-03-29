@@ -2177,8 +2177,11 @@ fn estimate_snr_db(full_tones: &[[Complex32; 8]]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::{WaveformOptions, encode_standard_message, synthesize_rectangular_waveform};
-    use crate::message::{NonstandardMessage, ReplyWord, unpack_message};
+    use crate::encode::{
+        WaveformOptions, encode_nonstandard_message, encode_standard_message,
+        synthesize_rectangular_waveform,
+    };
+    use crate::message::ReplyWord;
 
     #[test]
     #[ignore = "diagnostic"]
@@ -2295,113 +2298,51 @@ mod tests {
 
     #[test]
     fn decode_pcm_with_state_resolves_hash22_callsign() {
-        let frame =
-            encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank).expect("encode");
-        let audio = synthesize_rectangular_waveform(
-            &frame,
+        let learned_frame = encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
+            .expect("encode learned");
+        let learned_audio = synthesize_rectangular_waveform(
+            &learned_frame,
+            &WaveformOptions {
+                base_freq_hz: 900.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("learned waveform");
+        let hashed_frame =
+            encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank).expect("encode hashed");
+        let hashed_audio = synthesize_rectangular_waveform(
+            &hashed_frame,
             &WaveformOptions {
                 base_freq_hz: 1_234.0,
                 ..WaveformOptions::default()
             },
         )
-        .expect("waveform");
+        .expect("hashed waveform");
         let options = DecodeOptions {
             max_candidates: 8,
             max_successes: 2,
             ..DecodeOptions::default()
         };
 
-        let (unresolved, _) = decode_pcm_with_state(&audio, &options, None).expect("decode unresolved");
+        let (unresolved, _) = decode_pcm_with_state(&hashed_audio, &options, None).expect("decode unresolved");
         let unresolved_texts: Vec<_> = unresolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
         assert!(
             unresolved_texts.iter().any(|text| text.contains("<...>")),
             "expected unresolved hash in {unresolved_texts:?}"
         );
 
-        let mut state = DecoderState::new();
-        state.insert_callsign("HF19NY");
-        let (resolved, _) = decode_pcm_with_state(&audio, &options, Some(&state)).expect("decode resolved");
+        let (learned, state) = decode_pcm_with_state(&learned_audio, &options, None).expect("decode learned");
+        let learned_texts: Vec<_> = learned.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        assert!(
+            learned_texts.iter().any(|text| *text == "CQ HF19NY"),
+            "expected plain learned call in {learned_texts:?}"
+        );
+
+        let (resolved, _) = decode_pcm_with_state(&hashed_audio, &options, Some(&state)).expect("decode resolved");
         let resolved_texts: Vec<_> = resolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
         assert!(
             resolved_texts.iter().any(|text| *text == "CQ HF19NY"),
             "expected resolved call in {resolved_texts:?}"
-        );
-    }
-
-    #[test]
-    fn emitted_decoder_state_carries_callsigns_forward() {
-        let prior_search = SearchResult {
-            successes: vec![SuccessfulDecode {
-                payload: Payload::Nonstandard(NonstandardMessage {
-                    hashed: 0,
-                    plain: "HF19NY".to_string(),
-                    hashed_is_second: false,
-                    reply: ReplyWord::Blank,
-                    cq: true,
-                }),
-                codeword_bits: vec![0; 174],
-                candidate: DecodeCandidate {
-                    start_seconds: 0.5,
-                    dt_seconds: 0.0,
-                    freq_hz: 1_500.0,
-                    score: 10.0,
-                },
-                ldpc_iterations: 1,
-                snr_db: -10,
-            }],
-            residual_audio: AudioBuffer {
-                sample_rate_hz: FT8_SAMPLE_RATE,
-                samples: vec![0.0; LONG_INPUT_SAMPLES],
-            },
-            frame_count: 0,
-            usable_bins: 0,
-            top_candidates: Vec::new(),
-            counters: DecodeCounters::default(),
-        };
-        let carried_state = build_decoder_state(None, &prior_search);
-
-        let hashed_payload = unpack_message(
-            &encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank)
-                .expect("encode")
-                .codeword_bits,
-        )
-        .expect("payload");
-        let current_search = SearchResult {
-            successes: vec![SuccessfulDecode {
-                payload: hashed_payload,
-                codeword_bits: vec![0; 174],
-                candidate: DecodeCandidate {
-                    start_seconds: 0.5,
-                    dt_seconds: 0.0,
-                    freq_hz: 1_500.0,
-                    score: 12.0,
-                },
-                ldpc_iterations: 1,
-                snr_db: -8,
-            }],
-            residual_audio: AudioBuffer {
-                sample_rate_hz: FT8_SAMPLE_RATE,
-                samples: vec![0.0; LONG_INPUT_SAMPLES],
-            },
-            frame_count: 0,
-            usable_bins: 0,
-            top_candidates: Vec::new(),
-            counters: DecodeCounters::default(),
-        };
-
-        let report = build_decode_report_with_resolver(
-            &AudioBuffer {
-                sample_rate_hz: FT8_SAMPLE_RATE,
-                samples: vec![0.0; LONG_INPUT_SAMPLES],
-            },
-            &DecodeOptions::default(),
-            current_search,
-            Some(&carried_state),
-        );
-        let texts: Vec<_> = report.decodes.iter().map(|decode| decode.text.as_str()).collect();
-        assert!(
-            texts.iter().any(|text| *text == "CQ HF19NY"),
-            "expected carried state resolution in {texts:?}"
         );
     }
 }

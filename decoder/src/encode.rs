@@ -81,7 +81,37 @@ pub fn encode_standard_message(
     write_bits(&mut message_bits, 58, 1, acknowledge as u64);
     write_bits(&mut message_bits, 59, 15, u64::from(encode_g15(info)?));
     write_bits(&mut message_bits, 74, 3, 1);
+    build_frame(message_bits)
+}
 
+pub fn encode_nonstandard_message(
+    hashed_callsign: &str,
+    plain_callsign: &str,
+    hashed_is_second: bool,
+    reply: ReplyWord,
+    cq: bool,
+) -> Result<EncodedFrame, EncodeError> {
+    let mut message_bits = [0u8; MESSAGE_BITS];
+    write_bits(
+        &mut message_bits,
+        0,
+        12,
+        hash_callsign(&hashed_callsign.trim().to_uppercase(), 12),
+    );
+    write_bits(
+        &mut message_bits,
+        12,
+        58,
+        encode_c58(plain_callsign)? as u64,
+    );
+    write_bits(&mut message_bits, 70, 1, hashed_is_second as u64);
+    write_bits(&mut message_bits, 71, 2, encode_r2(reply) as u64);
+    write_bits(&mut message_bits, 73, 1, cq as u64);
+    write_bits(&mut message_bits, 74, 3, 4);
+    build_frame(message_bits)
+}
+
+fn build_frame(message_bits: [u8; MESSAGE_BITS]) -> Result<EncodedFrame, EncodeError> {
     let crc = crc14_ft8(&message_bits);
     let mut info_bits = [0u8; INFO_BITS];
     info_bits[..MESSAGE_BITS].copy_from_slice(&message_bits);
@@ -434,6 +464,35 @@ fn encode_g15(info: &GridReport) -> Result<u16, EncodeError> {
         }
         _ => Err(EncodeError::UnsupportedInfo(format!("{info:?}"))),
     }
+}
+
+fn encode_r2(reply: ReplyWord) -> u8 {
+    match reply {
+        ReplyWord::Blank => 0,
+        ReplyWord::Rrr => 1,
+        ReplyWord::Rr73 => 2,
+        ReplyWord::SeventyThree => 3,
+    }
+}
+
+fn encode_c58(text: &str) -> Result<u128, EncodeError> {
+    let alphabet: Vec<char> = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/".chars().collect();
+    let mut normalized = text.trim().to_uppercase();
+    if normalized.len() > 11 {
+        return Err(EncodeError::UnsupportedCallsign(text.to_string()));
+    }
+    while normalized.len() < 11 {
+        normalized.push(' ');
+    }
+    let mut value = 0u128;
+    for ch in normalized.chars() {
+        let digit = alphabet
+            .iter()
+            .position(|candidate| *candidate == ch)
+            .ok_or_else(|| EncodeError::UnsupportedCallsign(text.to_string()))? as u128;
+        value = value * 38 + digit;
+    }
+    Ok(value)
 }
 
 fn bits_to_tone(bits: &[u8]) -> u8 {

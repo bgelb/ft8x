@@ -15,7 +15,7 @@ pub use decoder::{
 };
 pub use encode::{
     EncodeError, EncodedFrame, WaveformOptions, channel_symbols_from_codeword_bits,
-    encode_standard_message, parse_standard_info, synthesize_channel_reference,
+    encode_nonstandard_message, encode_standard_message, parse_standard_info, synthesize_channel_reference,
     synthesize_rectangular_waveform, write_rectangular_standard_wav,
 };
 pub use message::{DecodedPayload, GridReport, MessageKind, ReplyWord};
