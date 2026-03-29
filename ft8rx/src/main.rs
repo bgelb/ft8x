@@ -1,3 +1,7 @@
+use axum::extract::State;
+use axum::response::Html;
+use axum::routing::get;
+use axum::{Json, Router};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use ft8_decoder::{
@@ -7,22 +11,37 @@ use ft8_decoder::{
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
 use rigctl::{K3s, K3sConfig, RigState, detect_k3s_audio_device};
-use std::collections::BTreeMap;
+use rustfft::FftPlanner;
+use rustfft::num_complex::Complex32;
+use serde::Serialize;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SLOT_SECONDS: u64 = 15;
 const DECODER_SAMPLE_RATE_HZ: u32 = 12_000;
+const WATERFALL_MAX_HZ: f32 = 4_000.0;
+const WATERFALL_BUCKETS: usize = 400;
+const WATERFALL_HISTORY_ROWS: usize = 180;
+const WATERFALL_SAMPLES: usize = 4096;
+const WATERFALL_UPDATE_MS: u64 = 200;
+const WEB_BIND_DEFAULT: &str = "127.0.0.1:8000";
+const BANDMAP_COLUMNS: usize = 15;
+const BANDMAP_ROWS: usize = 4;
+const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8rx")]
 struct Cli {
     #[arg(long)]
     oneshot: bool,
+    #[arg(long, default_value = WEB_BIND_DEFAULT)]
+    web_bind: String,
     #[arg(long)]
     save_wav: Option<PathBuf>,
     #[arg(long)]
@@ -73,6 +92,66 @@ struct DisplayState {
 struct CompositeDecodeRow {
     display: DecodedMessage,
     seen: &'static str,
+}
+
+type SharedWebSnapshot = Arc<Mutex<WebSnapshot>>;
+
+#[derive(Debug, Clone, Default)]
+struct BandMapStore {
+    even: BTreeMap<String, BandMapEntry>,
+    odd: BTreeMap<String, BandMapEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct BandMapEntry {
+    callsign: String,
+    freq_hz: f32,
+    last_seen_slot_index: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct WebSnapshot {
+    time_utc: String,
+    rig_frequency_hz: Option<u64>,
+    rig_mode: String,
+    rig_band: String,
+    decode_status: String,
+    decode_times: WebDecodeTimes,
+    current_slot: String,
+    last_done_slot: Option<String>,
+    decodes: Vec<WebDecodeRow>,
+    waterfall: Vec<Vec<u8>>,
+    bandmaps: WebBandMaps,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct WebDecodeTimes {
+    early_seconds: Option<f32>,
+    mid_seconds: Option<f32>,
+    late_seconds: Option<f32>,
+    tx_margin_seconds: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebDecodeRow {
+    seen: String,
+    utc: String,
+    snr_db: i32,
+    dt_seconds: f32,
+    freq_hz: f32,
+    text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct WebBandMaps {
+    even: Vec<Vec<Vec<WebBandMapCall>>>,
+    odd: Vec<Vec<Vec<WebBandMapCall>>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebBandMapCall {
+    callsign: String,
+    age_slots: u64,
 }
 
 #[derive(Debug)]
@@ -146,6 +225,315 @@ struct ActiveDecodeJob {
     stage: DecodeStage,
 }
 
+const INDEX_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ft8rx</title>
+  <style>
+    :root {
+      --bg: #06111a;
+      --panel: #0d1d29;
+      --panel-2: #132838;
+      --ink: #e7f2f7;
+      --muted: #8fb0c0;
+      --grid: #20394b;
+      --accent: #6ad3ff;
+      --good: #97f0a9;
+      --warn: #ffd26a;
+      --font: "Iosevka Term", "SF Mono", "Menlo", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(74, 144, 226, 0.16), transparent 30%),
+        linear-gradient(180deg, #071019 0%, #06111a 100%);
+      color: var(--ink);
+      font-family: var(--font);
+    }
+    .page {
+      width: 100%;
+      margin: 0;
+      padding: 18px;
+    }
+    .panel {
+      background: rgba(13, 29, 41, 0.95);
+      border: 1px solid rgba(143, 176, 192, 0.16);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.24);
+      margin-bottom: 16px;
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 18px;
+    }
+    .label {
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .value {
+      font-size: 20px;
+      line-height: 1.2;
+    }
+    .value.small {
+      font-size: 15px;
+    }
+    #waterfall {
+      width: 100%;
+      height: 110px;
+      display: block;
+      image-rendering: pixelated;
+      background: #02070c;
+      border-radius: 10px;
+      border: 1px solid rgba(143, 176, 192, 0.12);
+    }
+    .maps {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .map-grid {
+      display: grid;
+      grid-template-columns: repeat(15, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .cell {
+      min-height: 74px;
+      background: linear-gradient(180deg, rgba(19, 40, 56, 0.95), rgba(10, 23, 34, 0.95));
+      border: 1px solid rgba(143, 176, 192, 0.12);
+      border-radius: 8px;
+      padding: 6px;
+      overflow: hidden;
+    }
+    .cell-title {
+      font-size: 10px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .call {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: 12px;
+      line-height: 1.3;
+      color: var(--good);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(143, 176, 192, 0.09);
+      text-align: left;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    td.num { text-align: right; }
+    .seen-early { color: var(--good); }
+    .seen-mid { color: var(--warn); }
+    .seen-late { color: #ff9e80; }
+    .meta-line {
+      display: flex;
+      gap: 18px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 8px;
+    }
+    @media (max-width: 1100px) {
+      .status-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="panel">
+      <div class="status-grid">
+        <div><div class="label">UTC</div><div class="value" id="time"></div></div>
+        <div><div class="label">Rig</div><div class="value small" id="rig"></div></div>
+        <div><div class="label">Status</div><div class="value small" id="status"></div></div>
+        <div><div class="label">Slot</div><div class="value small" id="slot"></div></div>
+        <div><div class="label">Decode</div><div class="value small" id="times"></div></div>
+        <div><div class="label">Decodes</div><div class="value small" id="count"></div></div>
+      </div>
+    </section>
+    <section class="panel">
+      <canvas id="waterfall" width="300" height="180"></canvas>
+      <div class="meta-line">
+        <span>Waterfall: 0-4000 Hz</span>
+        <span>Rows: latest at bottom</span>
+      </div>
+    </section>
+    <div class="maps">
+      <section class="panel">
+        <div class="label">Even Slots (:00 / :30)</div>
+        <div id="even-map" class="map-grid"></div>
+      </section>
+      <section class="panel">
+        <div class="label">Odd Slots (:15 / :45)</div>
+        <div id="odd-map" class="map-grid"></div>
+      </section>
+    </div>
+    <section class="panel">
+      <div class="label">Recent Decodes</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Seen</th>
+            <th>UTC</th>
+            <th>SNR</th>
+            <th>dT</th>
+            <th>Freq</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody id="decodes"></tbody>
+      </table>
+    </section>
+  </div>
+  <script>
+    const canvas = document.getElementById('waterfall');
+    const ctx = canvas.getContext('2d');
+    function fmtSec(value) {
+      return value == null ? '-' : `${value.toFixed(2)}s`;
+    }
+    function renderWaterfall(rows) {
+      if (!rows || rows.length === 0) {
+        ctx.fillStyle = '#02070c';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        return;
+      }
+      const width = rows[0].length;
+      const height = rows.length;
+      canvas.width = width;
+      canvas.height = height;
+      const image = ctx.createImageData(width, height);
+      function gradient(v) {
+        const t = Math.max(0, Math.min(1, v / 255));
+        if (t < 0.18) {
+          const u = t / 0.18;
+          return [4 + u * 10, 8 + u * 18, 18 + u * 42];
+        }
+        if (t < 0.42) {
+          const u = (t - 0.18) / 0.24;
+          return [14 + u * 14, 26 + u * 92, 60 + u * 120];
+        }
+        if (t < 0.68) {
+          const u = (t - 0.42) / 0.26;
+          return [28 + u * 152, 118 + u * 74, 180 - u * 76];
+        }
+        if (t < 0.86) {
+          const u = (t - 0.68) / 0.18;
+          return [180 + u * 50, 192 + u * 32, 104 - u * 48];
+        }
+        const u = (t - 0.86) / 0.14;
+        return [230 + u * 25, 224 + u * 28, 56 + u * 120];
+      }
+      for (let y = 0; y < height; y++) {
+        const row = rows[y];
+        for (let x = 0; x < width; x++) {
+          const value = row[x] || 0;
+          const [r, g, b] = gradient(value);
+          const i = (y * width + x) * 4;
+          image.data[i + 0] = Math.round(r);
+          image.data[i + 1] = Math.round(g);
+          image.data[i + 2] = Math.round(b);
+          image.data[i + 3] = 255;
+        }
+      }
+      ctx.putImageData(image, 0, 0);
+    }
+    function renderBandMap(rootId, grid) {
+      const root = document.getElementById(rootId);
+      root.innerHTML = '';
+      for (let row = 0; row < grid.length; row++) {
+        for (let col = 0; col < grid[row].length; col++) {
+          const startHz = col * 200 + row * 50;
+          const cell = document.createElement('div');
+          cell.className = 'cell';
+          const title = document.createElement('div');
+          title.className = 'cell-title';
+          title.textContent = `${startHz}-${startHz + 49} Hz`;
+          cell.appendChild(title);
+          const entries = grid[row][col] || [];
+          for (const entry of entries) {
+            const line = document.createElement('div');
+            line.className = 'call';
+            const fade = Math.min(1, (entry.age_slots || 0) / 4);
+            const lightness = 72 - fade * 34;
+            const saturation = 88 - fade * 58;
+            line.style.color = `hsl(135 ${saturation}% ${lightness}%)`;
+            line.textContent = entry.callsign;
+            cell.appendChild(line);
+          }
+          root.appendChild(cell);
+        }
+      }
+    }
+    function renderDecodes(rows) {
+      const body = document.getElementById('decodes');
+      body.innerHTML = '';
+      if (!rows.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6;
+        td.textContent = 'No decodes yet';
+        tr.appendChild(td);
+        body.appendChild(tr);
+        return;
+      }
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        const seen = row.seen;
+        tr.innerHTML = `
+          <td class="seen-${seen}">${seen}</td>
+          <td>${row.utc}</td>
+          <td class="num">${row.snr_db}</td>
+          <td class="num">${row.dt_seconds.toFixed(2)}</td>
+          <td class="num">${Math.round(row.freq_hz)}</td>
+          <td>${row.text}</td>`;
+        body.appendChild(tr);
+      }
+    }
+    async function refresh() {
+      const response = await fetch('/api/state', { cache: 'no-store' });
+      const data = await response.json();
+      document.getElementById('time').textContent = data.time_utc || '-';
+      const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(3)} MHz`;
+      document.getElementById('rig').textContent = `${freq}  ${data.rig_mode}  ${data.rig_band}`;
+      document.getElementById('status').textContent = data.decode_status || '-';
+      document.getElementById('slot').textContent =
+        `${data.current_slot}${data.last_done_slot ? `  last=${data.last_done_slot}` : ''}`;
+      document.getElementById('times').textContent =
+        `early=${fmtSec(data.decode_times.early_seconds)}  mid=${fmtSec(data.decode_times.mid_seconds)}  late=${fmtSec(data.decode_times.late_seconds)}  tx_margin=${fmtSec(data.decode_times.tx_margin_seconds)}`;
+      document.getElementById('count').textContent = `${data.decodes.length} visible`;
+      renderWaterfall(data.waterfall);
+      renderBandMap('even-map', data.bandmaps.even);
+      renderBandMap('odd-map', data.bandmaps.odd);
+      renderDecodes(data.decodes);
+    }
+    refresh().catch(console.error);
+    setInterval(() => refresh().catch(console.error), 250);
+  </script>
+</body>
+</html>
+"#;
+
 fn main() -> Result<(), AppError> {
     let cli = Cli::parse();
     if cli.oneshot {
@@ -155,9 +543,49 @@ fn main() -> Result<(), AppError> {
     }
 }
 
+fn start_web_server(bind: &str, snapshot: SharedWebSnapshot) -> Result<(), AppError> {
+    let addr: SocketAddr = bind.parse().map_err(|error| {
+        AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid web bind address '{bind}': {error}"),
+        ))
+    })?;
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async move {
+            let app = Router::new()
+                .route("/", get(index_handler))
+                .route("/api/state", get(api_state_handler))
+                .with_state(snapshot);
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    if let Err(error) = axum::serve(listener, app).await {
+                        eprintln!("web server failed: {error}");
+                    }
+                }
+                Err(error) => eprintln!("web bind failed on {addr}: {error}"),
+            }
+        });
+    });
+    Ok(())
+}
+
+async fn index_handler() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+async fn api_state_handler(State(snapshot): State<SharedWebSnapshot>) -> Json<WebSnapshot> {
+    Json(snapshot.lock().expect("web snapshot poisoned").clone())
+}
+
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let audio = detect_k3s_audio_device(cli.device.as_deref())?;
     let capture = SampleStream::start(audio.clone(), AudioStreamConfig::default())?;
+    let web_snapshot = Arc::new(Mutex::new(WebSnapshot::default()));
+    start_web_server(&cli.web_bind, Arc::clone(&web_snapshot))?;
     let (job_tx, job_rx) = mpsc::sync_channel::<DecodeJob>(1);
     let (event_tx, event_rx) = mpsc::channel::<DecodeEvent>();
     thread::spawn(move || {
@@ -224,6 +652,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let mut next_slot_stages = SlotStageState::default();
     let mut last_rig_poll = UNIX_EPOCH;
     let mut active_decode: Option<ActiveDecodeJob> = None;
+    let mut waterfall_rows = VecDeque::<Vec<u8>>::with_capacity(WATERFALL_HISTORY_ROWS);
+    let mut last_waterfall_update = UNIX_EPOCH;
+    let mut last_waterfall_sample_time = UNIX_EPOCH;
+    let mut bandmaps = BandMapStore::default();
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
@@ -268,6 +700,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     display.full_wall_ms = Some(wall_ms);
                                     display.last_decode_wall_ms = Some(wall_ms);
                                     display.full_decodes = update.report.decodes.clone();
+                                    update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
                                 }
                             }
                         }
@@ -378,18 +811,88 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             }
         }
 
+        if should_refresh_waterfall(
+            now,
+            last_waterfall_update,
+            display.capture_latest_sample_time,
+            last_waterfall_sample_time,
+        ) {
+            if let Some(latest_sample_time) = display.capture_latest_sample_time {
+                if let Ok(row) = compute_latest_waterfall_row(&capture, latest_sample_time) {
+                    push_waterfall_row(&mut waterfall_rows, row);
+                    last_waterfall_update = now;
+                    last_waterfall_sample_time = latest_sample_time;
+                }
+            }
+        }
+
         display.decode_status = format_status(
             active_decode,
             next_slot,
             display.dropped_slots,
             capture.config().sample_rate_hz,
         );
+        refresh_web_snapshot(&web_snapshot, &display, &waterfall_rows, &bandmaps);
         render(&display);
         thread::sleep(Duration::from_millis(50));
     }
 
     print!("\x1b[?25h");
     Ok(())
+}
+
+fn refresh_web_snapshot(
+    snapshot: &SharedWebSnapshot,
+    display: &DisplayState,
+    waterfall_rows: &VecDeque<Vec<u8>>,
+    bandmaps: &BandMapStore,
+) {
+    let now = SystemTime::now();
+    let current_slot = current_slot_boundary(now);
+    let composite = composite_rows(display);
+    let decodes = composite
+        .into_iter()
+        .map(|row| WebDecodeRow {
+            seen: row.seen.to_string(),
+            utc: row.display.utc,
+            snr_db: row.display.snr_db,
+            dt_seconds: row.display.dt_seconds,
+            freq_hz: row.display.freq_hz,
+            text: row.display.text,
+        })
+        .collect::<Vec<_>>();
+    let current_slot_index = slot_index(current_slot);
+    let mut guard = snapshot.lock().expect("web snapshot poisoned");
+    guard.time_utc = {
+        let now_utc: DateTime<Utc> = now.into();
+        now_utc.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+    };
+    guard.rig_frequency_hz = display.rig.as_ref().map(|state| state.frequency_hz);
+    guard.rig_mode = display
+        .rig
+        .as_ref()
+        .map(|state| state.mode.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    guard.rig_band = display
+        .rig
+        .as_ref()
+        .map(|state| state.band.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    guard.decode_status = display.decode_status.clone();
+    guard.decode_times = WebDecodeTimes {
+        early_seconds: display.early41_wall_ms.map(ms_to_seconds),
+        mid_seconds: display.early47_wall_ms.map(ms_to_seconds),
+        late_seconds: display.full_wall_ms.map(ms_to_seconds),
+        tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+    };
+    guard.current_slot = format_slot_time(current_slot);
+    guard.last_done_slot = display.last_slot_start.map(format_slot_time);
+    guard.decodes = decodes;
+    guard.waterfall = waterfall_rows.iter().cloned().collect();
+    guard.bandmaps = WebBandMaps {
+        even: build_bandmap_grid(&bandmaps.even, current_slot_index),
+        odd: build_bandmap_grid(&bandmaps.odd, current_slot_index),
+    };
 }
 
 fn run_oneshot(cli: Cli) -> Result<(), AppError> {
@@ -744,6 +1247,14 @@ fn format_signed_wall_time(wall_ms: Option<i128>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn ms_to_seconds(ms: u128) -> f32 {
+    ms as f32 / 1000.0
+}
+
+fn ms_to_signed_seconds(ms: i128) -> f32 {
+    ms as f32 / 1000.0
+}
+
 fn next_slot_boundary(now: SystemTime) -> SystemTime {
     current_slot_boundary(now) + Duration::from_secs(SLOT_SECONDS)
 }
@@ -752,6 +1263,15 @@ fn current_slot_boundary(now: SystemTime) -> SystemTime {
     let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     let current = (since_epoch.as_secs() / SLOT_SECONDS) * SLOT_SECONDS;
     UNIX_EPOCH + Duration::from_secs(current)
+}
+
+fn slot_index(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / SLOT_SECONDS
+}
+
+fn is_even_slot_family(time: SystemTime) -> bool {
+    let second = time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() % 60;
+    matches!(second, 0 | 30)
 }
 
 fn format_slot_time(time: SystemTime) -> String {
@@ -765,6 +1285,10 @@ fn temp_path(name: &str) -> PathBuf {
 
 fn full_slot_sample_count(sample_rate_hz: u32) -> usize {
     SLOT_SECONDS as usize * sample_rate_hz as usize
+}
+
+fn samples_to_duration(sample_rate_hz: u32, sample_count: usize) -> Duration {
+    Duration::from_secs_f64(sample_count as f64 / sample_rate_hz as f64)
 }
 
 fn stage_sample_count(sample_rate_hz: u32, stage: DecodeStage) -> usize {
@@ -912,4 +1436,162 @@ fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> V
         output.push(samples[left] * (1.0 - frac) + samples[right] * frac);
     }
     output
+}
+
+fn should_refresh_waterfall(
+    now: SystemTime,
+    last_update: SystemTime,
+    latest_sample_time: Option<SystemTime>,
+    last_sample_time: SystemTime,
+) -> bool {
+    if now.duration_since(last_update).unwrap_or_default() < Duration::from_millis(WATERFALL_UPDATE_MS) {
+        return false;
+    }
+    latest_sample_time.is_some_and(|latest| latest > last_sample_time)
+}
+
+fn compute_latest_waterfall_row(capture: &SampleStream, latest_sample_time: SystemTime) -> Result<Vec<u8>, AppError> {
+    let sample_rate_hz = capture.config().sample_rate_hz;
+    let start = latest_sample_time
+        .checked_sub(samples_to_duration(sample_rate_hz, WATERFALL_SAMPLES))
+        .ok_or(AppError::Clock)?;
+    let samples = capture.extract_window(start, WATERFALL_SAMPLES)?;
+    Ok(compute_waterfall_row(&samples, sample_rate_hz))
+}
+
+fn compute_waterfall_row(samples: &[i16], sample_rate_hz: u32) -> Vec<u8> {
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(WATERFALL_SAMPLES);
+    let mut buffer = vec![Complex32::new(0.0, 0.0); WATERFALL_SAMPLES];
+    for (index, slot) in buffer.iter_mut().enumerate() {
+        let window = 0.5 - 0.5 * ((2.0 * std::f32::consts::PI * index as f32) / WATERFALL_SAMPLES as f32).cos();
+        let sample = samples.get(index).copied().unwrap_or_default() as f32 / i16::MAX as f32;
+        *slot = Complex32::new(sample * window, 0.0);
+    }
+    fft.process(&mut buffer);
+
+    let bin_hz = sample_rate_hz as f32 / WATERFALL_SAMPLES as f32;
+    let bucket_hz = WATERFALL_MAX_HZ / WATERFALL_BUCKETS as f32;
+    let mut bucket_db = vec![0.0f32; WATERFALL_BUCKETS];
+    let mut min_db = f32::INFINITY;
+    let mut max_db = f32::NEG_INFINITY;
+    let mut sum_db = 0.0f32;
+    let mut row = vec![0u8; WATERFALL_BUCKETS];
+    for (bucket_index, db_slot) in bucket_db.iter_mut().enumerate() {
+        let start_hz = bucket_index as f32 * bucket_hz;
+        let end_hz = start_hz + bucket_hz;
+        let start_bin = (start_hz / bin_hz).floor() as usize;
+        let end_bin = ((end_hz / bin_hz).ceil() as usize).min(buffer.len() / 2);
+        let mut peak = 1.0e-12f32;
+        for bin in start_bin..end_bin.max(start_bin + 1) {
+            peak = peak.max(buffer[bin].norm_sqr());
+        }
+        let db = 10.0 * peak.log10();
+        *db_slot = db;
+        min_db = min_db.min(db);
+        max_db = max_db.max(db);
+        sum_db += db;
+    }
+
+    let mean_db = sum_db / WATERFALL_BUCKETS as f32;
+    let floor_db = min_db.max(mean_db - 10.0);
+    let ceiling_db = max_db.min(mean_db + 26.0);
+    let span_db = (ceiling_db - floor_db).max(8.0);
+    for (bucket_index, cell) in row.iter_mut().enumerate() {
+        let normalized = ((bucket_db[bucket_index] - floor_db) / span_db).clamp(0.0, 1.0);
+        let curved = normalized.powf(0.72);
+        *cell = (curved * 255.0).round() as u8;
+    }
+    row
+}
+
+fn push_waterfall_row(rows: &mut VecDeque<Vec<u8>>, row: Vec<u8>) {
+    if rows.len() == WATERFALL_HISTORY_ROWS {
+        rows.pop_front();
+    }
+    rows.push_back(row);
+}
+
+fn update_bandmaps(store: &mut BandMapStore, slot_start: SystemTime, decodes: &[DecodedMessage]) {
+    let slot_idx = slot_index(slot_start);
+    prune_bandmap(&mut store.even, slot_idx);
+    prune_bandmap(&mut store.odd, slot_idx);
+    let map = if is_even_slot_family(slot_start) {
+        &mut store.even
+    } else {
+        &mut store.odd
+    };
+    for decode in decodes {
+        for callsign in callsigns_from_decode(decode) {
+            map.insert(
+                callsign.clone(),
+                BandMapEntry {
+                    callsign,
+                    freq_hz: decode.freq_hz,
+                    last_seen_slot_index: slot_idx,
+                },
+            );
+        }
+    }
+}
+
+fn prune_bandmap(map: &mut BTreeMap<String, BandMapEntry>, current_slot_index: u64) {
+    map.retain(|_, entry| current_slot_index.saturating_sub(entry.last_seen_slot_index) < BANDMAP_MAX_AGE_SLOTS);
+}
+
+fn callsigns_from_decode(decode: &DecodedMessage) -> Vec<String> {
+    let mut calls = Vec::<String>::new();
+    if let Some(call) = &decode.payload.primary_call {
+        calls.push(call.clone());
+    }
+    if let Some(call) = &decode.payload.secondary_call {
+        if !calls.iter().any(|existing| existing == call) {
+            calls.push(call.clone());
+        }
+    }
+    calls
+}
+
+fn build_bandmap_grid(
+    map: &BTreeMap<String, BandMapEntry>,
+    current_slot_index: u64,
+) -> Vec<Vec<Vec<WebBandMapCall>>> {
+    let mut cells =
+        vec![vec![Vec::<(f32, WebBandMapCall)>::new(); BANDMAP_COLUMNS]; BANDMAP_ROWS];
+    for entry in map.values() {
+        let age_slots = current_slot_index.saturating_sub(entry.last_seen_slot_index);
+        if age_slots >= BANDMAP_MAX_AGE_SLOTS {
+            continue;
+        }
+        if !(0.0..WATERFALL_MAX_HZ).contains(&entry.freq_hz) {
+            continue;
+        }
+        let column = (entry.freq_hz / 200.0).floor() as usize;
+        let row = ((entry.freq_hz % 200.0) / 50.0).floor() as usize;
+        if row < BANDMAP_ROWS && column < BANDMAP_COLUMNS {
+            cells[row][column].push((
+                entry.freq_hz,
+                WebBandMapCall {
+                    callsign: entry.callsign.clone(),
+                    age_slots,
+                },
+            ));
+        }
+    }
+
+    cells
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|mut cell| {
+                    cell.sort_by(|left, right| {
+                        left.0
+                            .total_cmp(&right.0)
+                            .then_with(|| left.1.callsign.cmp(&right.1.callsign))
+                    });
+                    cell.into_iter().map(|(_, call)| call).collect()
+                })
+                .collect()
+        })
+        .collect()
 }

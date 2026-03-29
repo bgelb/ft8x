@@ -4,13 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = "0.8.4"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 ctrlc = "3.5.0"
 clap = { version = "4.5.40", features = ["derive"] }
 ft8_decoder = { path = "../decoder" }
 hound = "3.5.1"
 rigctl = { path = "../rigctl" }
+rustfft = "6.4.1"
+serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "net"] }
 
 [profile.dev.package."*"]
 opt-level = 2
