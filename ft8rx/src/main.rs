@@ -5,8 +5,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use ft8_decoder::{
-    AudioBuffer, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage, DecoderSession,
-    DecoderState, StageDecodeReport,
+    AudioBuffer, CallModifier, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage,
+    DecoderSession, DecoderState, StageDecodeReport, StructuredCallField, StructuredCallValue,
+    StructuredInfoField, StructuredInfoValue, StructuredMessage,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
@@ -105,6 +106,7 @@ struct BandMapStore {
 #[derive(Debug, Clone)]
 struct BandMapEntry {
     callsign: String,
+    detail: Option<String>,
     freq_hz: f32,
     last_seen_slot_index: u64,
 }
@@ -139,6 +141,10 @@ struct WebDecodeRow {
     snr_db: i32,
     dt_seconds: f32,
     freq_hz: f32,
+    kind: String,
+    field1: String,
+    field2: String,
+    info: String,
     text: String,
 }
 
@@ -151,6 +157,7 @@ struct WebBandMaps {
 #[derive(Debug, Clone, Serialize)]
 struct WebBandMapCall {
     callsign: String,
+    detail: Option<String>,
     age_slots: u64,
 }
 
@@ -402,6 +409,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <th>SNR</th>
             <th>dT</th>
             <th>Freq</th>
+            <th>Kind</th>
+            <th>Field 1</th>
+            <th>Field 2</th>
+            <th>Info</th>
             <th>Message</th>
           </tr>
         </thead>
@@ -481,7 +492,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             const lightness = 72 - fade * 34;
             const saturation = 88 - fade * 58;
             line.style.color = `hsl(135 ${saturation}% ${lightness}%)`;
-            line.textContent = entry.callsign;
+            line.textContent = entry.detail ? `${entry.callsign} ${entry.detail}` : entry.callsign;
             cell.appendChild(line);
           }
           root.appendChild(cell);
@@ -494,7 +505,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (!rows.length) {
         const tr = document.createElement('tr');
         const td = document.createElement('td');
-        td.colSpan = 6;
+        td.colSpan = 10;
         td.textContent = 'No decodes yet';
         tr.appendChild(td);
         body.appendChild(tr);
@@ -509,6 +520,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <td class="num">${row.snr_db}</td>
           <td class="num">${row.dt_seconds.toFixed(2)}</td>
           <td class="num">${Math.round(row.freq_hz)}</td>
+          <td>${row.kind}</td>
+          <td>${row.field1}</td>
+          <td>${row.field2}</td>
+          <td>${row.info}</td>
           <td>${row.text}</td>`;
         body.appendChild(tr);
       }
@@ -858,13 +873,20 @@ fn refresh_web_snapshot(
     let composite = composite_rows(display);
     let decodes = composite
         .into_iter()
-        .map(|row| WebDecodeRow {
-            seen: row.seen.to_string(),
-            utc: row.display.utc,
-            snr_db: row.display.snr_db,
-            dt_seconds: row.display.dt_seconds,
-            freq_hz: row.display.freq_hz,
-            text: row.display.text,
+        .map(|row| {
+            let (kind, field1, field2, info) = decode_columns(&row.display);
+            WebDecodeRow {
+                seen: row.seen.to_string(),
+                utc: row.display.utc,
+                snr_db: row.display.snr_db,
+                dt_seconds: row.display.dt_seconds,
+                freq_hz: row.display.freq_hz,
+                kind,
+                field1,
+                field2,
+                info,
+                text: row.display.text,
+            }
         })
         .collect::<Vec<_>>();
     let current_slot_index = slot_index(current_slot);
@@ -1426,6 +1448,137 @@ fn composite_rows(display: &DisplayState) -> Vec<CompositeDecodeRow> {
     rows
 }
 
+fn decode_columns(decode: &DecodedMessage) -> (String, String, String, String) {
+    match &decode.message {
+        StructuredMessage::Standard {
+            first,
+            second,
+            acknowledge,
+            info,
+            ..
+        } => (
+            "std".to_string(),
+            structured_call_text(first),
+            structured_call_text(second),
+            structured_info_text(*acknowledge, info),
+        ),
+        StructuredMessage::Nonstandard {
+            hashed_call,
+            plain_call,
+            hashed_is_second,
+            reply,
+            cq,
+            ..
+        } => {
+            let hashed = hashed_call_text(hashed_call);
+            let (field1, field2) = if *cq {
+                ("CQ".to_string(), plain_call.callsign.clone())
+            } else if *hashed_is_second {
+                (plain_call.callsign.clone(), hashed)
+            } else {
+                (hashed, plain_call.callsign.clone())
+            };
+            let info = if *cq {
+                "CQ".to_string()
+            } else {
+                reply_word_text(*reply).to_string()
+            };
+            ("nonstd".to_string(), field1, field2, info)
+        }
+        StructuredMessage::FreeText { .. } => (
+            "free".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
+        StructuredMessage::Unsupported { .. } => (
+            "unsup".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
+    }
+}
+
+fn bandmap_detail(message: &StructuredMessage) -> Option<String> {
+    match message {
+        StructuredMessage::Standard {
+            acknowledge, info, ..
+        } => {
+            let text = structured_info_text(*acknowledge, info);
+            (!text.is_empty()).then_some(text)
+        }
+        StructuredMessage::FreeText { .. }
+        | StructuredMessage::Nonstandard { .. }
+        | StructuredMessage::Unsupported { .. } => None,
+    }
+}
+
+fn structured_call_text(field: &StructuredCallField) -> String {
+    let base = match &field.value {
+        StructuredCallValue::Token { token } => token.clone(),
+        StructuredCallValue::StandardCall { callsign } => callsign.clone(),
+        StructuredCallValue::Hash22 {
+            resolved_callsign: Some(callsign),
+            ..
+        } => callsign.clone(),
+        StructuredCallValue::Hash22 {
+            resolved_callsign: None,
+            ..
+        } => "<...>".to_string(),
+    };
+    match field.modifier {
+        Some(CallModifier::R) => format!("{base}/R"),
+        Some(CallModifier::P) => format!("{base}/P"),
+        None => base,
+    }
+}
+
+fn hashed_call_text(field: &ft8_decoder::HashedCallField12) -> String {
+    field
+        .resolved_callsign
+        .as_ref()
+        .map(|callsign| format!("<{callsign}>"))
+        .unwrap_or_else(|| "<...>".to_string())
+}
+
+fn structured_info_text(acknowledge: bool, info: &StructuredInfoField) -> String {
+    match &info.value {
+        StructuredInfoValue::Blank => {
+            if acknowledge {
+                "R".to_string()
+            } else {
+                String::new()
+            }
+        }
+        StructuredInfoValue::Grid { locator } => {
+            if acknowledge {
+                format!("R {locator}")
+            } else {
+                locator.clone()
+            }
+        }
+        StructuredInfoValue::SignalReport { db } => {
+            let value = format!("{db:+03}");
+            if acknowledge {
+                format!("R{value}")
+            } else {
+                value
+            }
+        }
+        StructuredInfoValue::Reply { word } => reply_word_text(*word).to_string(),
+    }
+}
+
+fn reply_word_text(word: ft8_decoder::ReplyWord) -> &'static str {
+    match word {
+        ft8_decoder::ReplyWord::Blank => "",
+        ft8_decoder::ReplyWord::Rrr => "RRR",
+        ft8_decoder::ReplyWord::Rr73 => "RR73",
+        ft8_decoder::ReplyWord::SeventyThree => "73",
+    }
+}
+
 fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {
     if samples.is_empty() || src_rate_hz == dst_rate_hz {
         return samples.to_vec();
@@ -1537,11 +1690,12 @@ fn update_bandmaps(store: &mut BandMapStore, slot_start: SystemTime, decodes: &[
         &mut store.odd
     };
     for decode in decodes {
-        for callsign in callsigns_from_decode(decode) {
+        for (callsign, detail) in bandmap_calls_from_decode(decode) {
             map.insert(
                 callsign.clone(),
                 BandMapEntry {
                     callsign,
+                    detail,
                     freq_hz: decode.freq_hz,
                     last_seen_slot_index: slot_idx,
                 },
@@ -1554,17 +1708,18 @@ fn prune_bandmap(map: &mut BTreeMap<String, BandMapEntry>, current_slot_index: u
     map.retain(|_, entry| current_slot_index.saturating_sub(entry.last_seen_slot_index) < BANDMAP_MAX_AGE_SLOTS);
 }
 
-fn callsigns_from_decode(decode: &DecodedMessage) -> Vec<String> {
+fn bandmap_calls_from_decode(decode: &DecodedMessage) -> Vec<(String, Option<String>)> {
     let mut calls = Vec::<String>::new();
-    if let Some(call) = &decode.payload.primary_call {
-        calls.push(call.clone());
+    if let Some(call) = decode.message.primary_call() {
+        calls.push(call.to_string());
     }
-    if let Some(call) = &decode.payload.secondary_call {
+    if let Some(call) = decode.message.secondary_call() {
         if !calls.iter().any(|existing| existing == call) {
-            calls.push(call.clone());
+            calls.push(call.to_string());
         }
     }
-    calls
+    let detail = bandmap_detail(&decode.message);
+    calls.into_iter().map(|call| (call, detail.clone())).collect()
 }
 
 fn build_bandmap_grid(
@@ -1588,6 +1743,7 @@ fn build_bandmap_grid(
                 entry.freq_hz,
                 WebBandMapCall {
                     callsign: entry.callsign.clone(),
+                    detail: entry.detail.clone(),
                     age_slots,
                 },
             ));
