@@ -66,6 +66,13 @@ pub struct PlainCallField58 {
     pub callsign: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum MessageCallField<'a> {
+    Standard(&'a StructuredCallField),
+    Hashed12(&'a HashedCallField12),
+    Plain58(&'a PlainCallField58),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub enum StructuredMessage {
     FreeText {
@@ -162,19 +169,39 @@ impl StructuredMessage {
         }
     }
 
-    pub fn primary_call(&self) -> Option<&str> {
+    pub fn first_call_field(&self) -> Option<MessageCallField<'_>> {
         match self {
-            StructuredMessage::Standard { first, .. } => structured_call_primary(first),
-            StructuredMessage::Nonstandard { plain_call, .. } => Some(&plain_call.callsign),
+            StructuredMessage::Standard { first, .. } => Some(MessageCallField::Standard(first)),
+            StructuredMessage::Nonstandard {
+                hashed_call,
+                plain_call,
+                hashed_is_second,
+                ..
+            } => {
+                if *hashed_is_second {
+                    Some(MessageCallField::Plain58(plain_call))
+                } else {
+                    Some(MessageCallField::Hashed12(hashed_call))
+                }
+            }
             StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
         }
     }
 
-    pub fn secondary_call(&self) -> Option<&str> {
+    pub fn second_call_field(&self) -> Option<MessageCallField<'_>> {
         match self {
-            StructuredMessage::Standard { second, .. } => structured_call_primary(second),
-            StructuredMessage::Nonstandard { hashed_call, .. } => {
-                hashed_call.resolved_callsign.as_deref()
+            StructuredMessage::Standard { second, .. } => Some(MessageCallField::Standard(second)),
+            StructuredMessage::Nonstandard {
+                hashed_call,
+                plain_call,
+                hashed_is_second,
+                ..
+            } => {
+                if *hashed_is_second {
+                    Some(MessageCallField::Hashed12(hashed_call))
+                } else {
+                    Some(MessageCallField::Plain58(plain_call))
+                }
             }
             StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
         }
@@ -461,17 +488,6 @@ fn structured_info_field(raw: u16, info: &GridReport) -> StructuredInfoField {
         GridReport::Reply(word) => StructuredInfoValue::Reply { word: *word },
     };
     StructuredInfoField { raw, value }
-}
-
-fn structured_call_primary(field: &StructuredCallField) -> Option<&str> {
-    match &field.value {
-        StructuredCallValue::StandardCall { callsign } => Some(callsign),
-        StructuredCallValue::Hash22 {
-            resolved_callsign: Some(callsign),
-            ..
-        } => Some(callsign),
-        StructuredCallValue::Token { .. } | StructuredCallValue::Hash22 { .. } => None,
-    }
 }
 
 fn apply_modifier(text: String, modifier: &Option<CallModifier>) -> String {
@@ -815,6 +831,55 @@ mod tests {
             cq: true,
         };
         assert_eq!(cq.to_text(), "CQ K1ABC");
+    }
+
+    #[test]
+    fn ordered_call_fields_preserve_nonstandard_position() {
+        let first_hashed = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 12,
+                resolved_callsign: Some("K1ABC".to_string()),
+            },
+            plain_call: PlainCallField58 {
+                raw: 34,
+                callsign: "HF19NY".to_string(),
+            },
+            hashed_is_second: false,
+            reply: ReplyWord::Blank,
+            cq: false,
+        };
+        assert!(matches!(
+            first_hashed.first_call_field(),
+            Some(MessageCallField::Hashed12(_))
+        ));
+        assert!(matches!(
+            first_hashed.second_call_field(),
+            Some(MessageCallField::Plain58(_))
+        ));
+
+        let second_hashed = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 12,
+                resolved_callsign: Some("K1ABC".to_string()),
+            },
+            plain_call: PlainCallField58 {
+                raw: 34,
+                callsign: "HF19NY".to_string(),
+            },
+            hashed_is_second: true,
+            reply: ReplyWord::Blank,
+            cq: false,
+        };
+        assert!(matches!(
+            second_hashed.first_call_field(),
+            Some(MessageCallField::Plain58(_))
+        ));
+        assert!(matches!(
+            second_hashed.second_call_field(),
+            Some(MessageCallField::Hashed12(_))
+        ));
     }
 
     #[test]

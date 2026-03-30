@@ -19,8 +19,8 @@ pub use encode::{
     synthesize_channel_reference, synthesize_rectangular_waveform, write_rectangular_standard_wav,
 };
 pub use message::{
-    CallModifier, GridReport, HashedCallField12, MessageKind, PlainCallField58, ReplyWord,
-    StructuredCallField, StructuredCallValue, StructuredInfoField, StructuredInfoValue,
+    CallModifier, GridReport, HashedCallField12, MessageCallField, MessageKind, PlainCallField58,
+    ReplyWord, StructuredCallField, StructuredCallValue, StructuredInfoField, StructuredInfoValue,
     StructuredMessage,
 };
 pub use wave::{AudioBuffer, DecoderError, write_wav};
