@@ -6,8 +6,8 @@ use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use ft8_decoder::{
     AudioBuffer, CallModifier, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage,
-    DecoderSession, DecoderState, StageDecodeReport, StructuredCallField, StructuredCallValue,
-    StructuredInfoField, StructuredInfoValue, StructuredMessage,
+    DecoderSession, DecoderState, MessageCallField, StageDecodeReport, StructuredCallField,
+    StructuredCallValue, StructuredInfoField, StructuredInfoValue, StructuredMessage,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
@@ -1732,16 +1732,31 @@ fn prune_bandmap(map: &mut BTreeMap<String, BandMapEntry>, current_slot_index: u
 
 fn bandmap_calls_from_decode(decode: &DecodedMessage) -> Vec<(String, Option<String>)> {
     let mut calls = Vec::<String>::new();
-    if let Some(call) = decode.message.primary_call() {
-        calls.push(call.to_string());
+    if let Some(call) = visible_call_text(decode.message.first_call_field()) {
+        calls.push(call);
     }
-    if let Some(call) = decode.message.secondary_call() {
-        if !calls.iter().any(|existing| existing == call) {
-            calls.push(call.to_string());
+    if let Some(call) = visible_call_text(decode.message.second_call_field()) {
+        if !calls.iter().any(|existing| existing == &call) {
+            calls.push(call);
         }
     }
     let detail = bandmap_detail(&decode.message);
     calls.into_iter().map(|call| (call, detail.clone())).collect()
+}
+
+fn visible_call_text(field: Option<MessageCallField<'_>>) -> Option<String> {
+    match field? {
+        MessageCallField::Standard(field) => match &field.value {
+            StructuredCallValue::StandardCall { callsign } => Some(callsign.clone()),
+            StructuredCallValue::Hash22 {
+                resolved_callsign: Some(callsign),
+                ..
+            } => Some(callsign.clone()),
+            StructuredCallValue::Token { .. } | StructuredCallValue::Hash22 { .. } => None,
+        },
+        MessageCallField::Hashed12(field) => field.resolved_callsign.clone(),
+        MessageCallField::Plain58(field) => Some(field.callsign.clone()),
+    }
 }
 
 fn build_bandmap_grid(
