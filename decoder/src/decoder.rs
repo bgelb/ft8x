@@ -332,6 +332,7 @@ const BASEBAND_SYMBOL_SAMPLES: usize = FT8_SYMBOL_SAMPLES / DOWNSAMPLE_FACTOR;
 const FFT_BIN_HZ: f32 = FT8_SAMPLE_RATE as f32 / LONG_FFT_SAMPLES as f32;
 const SYNC8_BIN_HZ: f32 = FT8_SAMPLE_RATE as f32 / SYNC8_FFT_SAMPLES as f32;
 const BASEBAND_TAPER_LEN: usize = 100;
+const BASEBAND_VALID_SAMPLES: usize = 2_812;
 const SUBTRACT_FILTER_SAMPLES: usize = 4_000;
 const SUBTRACT_FILTER_HALF: usize = SUBTRACT_FILTER_SAMPLES / 2;
 const EARLY_BLOCK_SAMPLES: usize = 3_456;
@@ -1906,12 +1907,14 @@ fn normalize_sync_scores(scores: &mut [(usize, isize, f32)]) {
 
 fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
     let mut sync = 0.0f32;
+    let valid_samples = baseband.len().min(BASEBAND_VALID_SAMPLES);
     let waveforms = sync8d_waveforms();
     let tweak = (residual_hz != 0.0).then(|| sync8d_tweak(residual_hz));
     for (offset, tone) in crate::protocol::FT8_COSTAS.iter().copied().enumerate() {
         for block in [0usize, 36, 72] {
             let symbol_start = start_index + ((block + offset) * BASEBAND_SYMBOL_SAMPLES) as isize;
-            if symbol_start < 0 || symbol_start as usize + BASEBAND_SYMBOL_SAMPLES > baseband.len()
+            if symbol_start < 0
+                || symbol_start as usize + BASEBAND_SYMBOL_SAMPLES > valid_samples
             {
                 continue;
             }
@@ -1933,9 +1936,10 @@ fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
 
 fn extract_symbol_tones(baseband: &[Complex32], start_index: isize) -> Vec<[Complex32; 8]> {
     let mut tones = vec![[Complex32::new(0.0, 0.0); 8]; FT8_MESSAGE_SYMBOLS];
+    let valid_samples = baseband.len().min(BASEBAND_VALID_SAMPLES);
     for (symbol_index, symbol_tones) in tones.iter_mut().enumerate() {
         let sample_index = start_index + (symbol_index * BASEBAND_SYMBOL_SAMPLES) as isize;
-        if sample_index < 0 || sample_index as usize + BASEBAND_SYMBOL_SAMPLES > baseband.len() {
+        if sample_index < 0 || sample_index as usize + BASEBAND_SYMBOL_SAMPLES > valid_samples {
             continue;
         }
         let segment =
