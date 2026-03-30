@@ -703,3 +703,189 @@ pub fn hash_callsign(callsign: &str, nbits: u8) -> u64 {
         .wrapping_mul(HASH_MULTIPLIER)
         .wrapping_shr((64 - nbits) as u32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crc::crc14_ft8;
+    use crate::encode::{encode_nonstandard_message, encode_standard_message};
+
+    #[test]
+    fn structured_standard_to_text_preserves_acknowledge_rules() {
+        let first = StructuredCallField {
+            raw: 0,
+            value: StructuredCallValue::Token {
+                token: "K1ABC".to_string(),
+            },
+            modifier: None,
+        };
+        let second = StructuredCallField {
+            raw: 0,
+            value: StructuredCallValue::StandardCall {
+                callsign: "W1XYZ".to_string(),
+            },
+            modifier: None,
+        };
+
+        let blank = StructuredMessage::Standard {
+            i3: 1,
+            first: first.clone(),
+            second: second.clone(),
+            acknowledge: true,
+            info: StructuredInfoField {
+                raw: 0,
+                value: StructuredInfoValue::Blank,
+            },
+        };
+        assert_eq!(blank.to_text(), "K1ABC W1XYZ R");
+
+        let grid = StructuredMessage::Standard {
+            i3: 1,
+            first: first.clone(),
+            second: second.clone(),
+            acknowledge: true,
+            info: StructuredInfoField {
+                raw: 0,
+                value: StructuredInfoValue::Grid {
+                    locator: "FN31".to_string(),
+                },
+            },
+        };
+        assert_eq!(grid.to_text(), "K1ABC W1XYZ R FN31");
+
+        let signal = StructuredMessage::Standard {
+            i3: 1,
+            first,
+            second,
+            acknowledge: true,
+            info: StructuredInfoField {
+                raw: 0,
+                value: StructuredInfoValue::SignalReport { db: -7 },
+            },
+        };
+        assert_eq!(signal.to_text(), "K1ABC W1XYZ R-07");
+    }
+
+    #[test]
+    fn structured_nonstandard_to_text_preserves_variants() {
+        let unresolved = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 0,
+                resolved_callsign: None,
+            },
+            plain_call: PlainCallField58 {
+                raw: 0,
+                callsign: "K1ABC".to_string(),
+            },
+            hashed_is_second: false,
+            reply: ReplyWord::Rrr,
+            cq: false,
+        };
+        assert_eq!(unresolved.to_text(), "<...> K1ABC RRR");
+
+        let resolved_second = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 0,
+                resolved_callsign: Some("HF19NY".to_string()),
+            },
+            plain_call: PlainCallField58 {
+                raw: 0,
+                callsign: "K1ABC".to_string(),
+            },
+            hashed_is_second: true,
+            reply: ReplyWord::Blank,
+            cq: false,
+        };
+        assert_eq!(resolved_second.to_text(), "K1ABC <HF19NY>");
+
+        let cq = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 0,
+                resolved_callsign: Some("HF19NY".to_string()),
+            },
+            plain_call: PlainCallField58 {
+                raw: 0,
+                callsign: "K1ABC".to_string(),
+            },
+            hashed_is_second: false,
+            reply: ReplyWord::Blank,
+            cq: true,
+        };
+        assert_eq!(cq.to_text(), "CQ K1ABC");
+    }
+
+    #[test]
+    fn payload_to_message_preserves_standard_modifiers() {
+        let frame =
+            encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank).expect("encode");
+
+        let mut message_bits = frame.message_bits.to_vec();
+        write_bits(&mut message_bits, 28, 1, 1);
+        write_bits(&mut message_bits, 57, 1, 1);
+        write_bits(&mut message_bits, 74, 3, 1);
+        let payload = payload_from_message_bits(&message_bits);
+        assert_eq!(
+            payload.to_message(&HashResolver::default()).to_text(),
+            "CQ/R K1ABC/R"
+        );
+
+        let mut portable_bits = frame.message_bits.to_vec();
+        write_bits(&mut portable_bits, 28, 1, 1);
+        write_bits(&mut portable_bits, 57, 1, 0);
+        write_bits(&mut portable_bits, 74, 3, 2);
+        let portable = payload_from_message_bits(&portable_bits);
+        assert_eq!(
+            portable.to_message(&HashResolver::default()).to_text(),
+            "CQ/P K1ABC"
+        );
+    }
+
+    #[test]
+    fn payload_to_message_preserves_nonstandard_hash_positions() {
+        let frame = encode_nonstandard_message("K1ABC", "HF19NY", true, ReplyWord::Rr73, false)
+            .expect("encode");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let unresolved = payload.to_message(&HashResolver::default());
+        assert_eq!(unresolved.to_text(), "HF19NY <...> RR73");
+
+        let mut resolver = HashResolver::default();
+        resolver.insert_callsign("K1ABC");
+        let resolved = payload.to_message(&resolver);
+        assert_eq!(resolved.to_text(), "HF19NY <K1ABC> RR73");
+    }
+
+    #[test]
+    fn structured_misc_rendering_matches_legacy_contract() {
+        let free = StructuredMessage::FreeText {
+            i3: 0,
+            n3: 0,
+            raw: 0,
+            text: " HELLO WORLD ".to_string(),
+        };
+        assert_eq!(free.to_text(), "HELLO WORLD");
+
+        let unsupported = StructuredMessage::Unsupported {
+            i3: 5,
+            n3: Some(3),
+            message_bits: vec![0; 77],
+        };
+        assert_eq!(unsupported.to_text(), "<unsupported:5.3>");
+    }
+
+    fn payload_from_message_bits(message_bits: &[u8]) -> Payload {
+        let mut codeword = Vec::with_capacity(91);
+        codeword.extend_from_slice(message_bits);
+        codeword.extend_from_slice(&crc14_ft8(message_bits));
+        unpack_message(&codeword).expect("payload")
+    }
+
+    fn write_bits(bits: &mut [u8], start: usize, len: usize, value: u64) {
+        for offset in 0..len {
+            let shift = len - offset - 1;
+            bits[start + offset] = ((value >> shift) & 1) as u8;
+        }
+    }
+}
