@@ -377,7 +377,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       --accent: #6ad3ff;
       --good: #97f0a9;
       --warn: #ffd26a;
+      --focus-station: #8fe9ff;
+      --partner-station: #ffd26a;
       --font: "Iosevka Term", "SF Mono", "Menlo", monospace;
+      --waterfall-width: 800px;
+      --waterfall-shell-width: 840px;
     }
     * { box-sizing: border-box; }
     body {
@@ -402,6 +406,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .top-main {
       display: grid;
       gap: 18px;
+      width: min(100%, var(--waterfall-shell-width));
     }
     .panel {
       background: rgba(13, 29, 41, 0.95);
@@ -432,7 +437,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     #waterfall {
       width: 100%;
-      max-width: 800px;
+      max-width: var(--waterfall-width);
       height: 110px;
       display: block;
       margin: 0 auto;
@@ -440,6 +445,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       background: #02070c;
       border-radius: 10px;
       border: 1px solid rgba(143, 176, 192, 0.12);
+    }
+    .status-panel,
+    .waterfall-panel {
+      width: 100%;
+      max-width: var(--waterfall-shell-width);
     }
     .maps {
       display: grid;
@@ -504,11 +514,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       margin-top: 8px;
     }
     .pickable {
-      color: var(--accent);
+      color: inherit;
       cursor: pointer;
-      text-decoration: underline;
-      text-decoration-color: rgba(106, 211, 255, 0.35);
-      text-underline-offset: 2px;
+      text-decoration: none;
     }
     .detail-panel {
       min-height: 100%;
@@ -529,23 +537,41 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .activity-list {
       margin-top: 8px;
       display: grid;
-      gap: 8px;
-      max-height: 520px;
+      gap: 4px;
+      max-height: 220px;
       overflow: auto;
       padding-right: 4px;
     }
     .activity-item {
-      border: 1px solid rgba(143, 176, 192, 0.12);
-      border-radius: 10px;
-      padding: 8px 10px;
+      border: 1px solid rgba(143, 176, 192, 0.1);
+      border-radius: 8px;
+      padding: 4px 6px;
       background: rgba(19, 40, 56, 0.45);
-      font-size: 13px;
-      line-height: 1.4;
-    }
-    .activity-head {
-      color: var(--muted);
       font-size: 12px;
-      margin-bottom: 4px;
+      line-height: 1.15;
+      display: grid;
+      grid-template-columns: 64px 78px 110px 34px 46px 50px minmax(0, 1fr);
+      gap: 6px;
+      align-items: baseline;
+    }
+    .activity-col {
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .activity-station {
+      font-weight: 600;
+      color: var(--focus-station);
+    }
+    .activity-partner {
+      color: var(--partner-station);
+    }
+    .activity-msg {
+      color: var(--ink);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     @media (max-width: 1100px) {
       .status-grid { grid-template-columns: 1fr; }
@@ -557,7 +583,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <div class="page">
     <div class="top-layout">
       <div class="top-main">
-        <section class="panel">
+        <section class="panel status-panel">
           <div class="status-grid">
             <div><div class="label">UTC</div><div class="value" id="time"></div></div>
             <div><div class="label">Rig</div><div class="value small" id="rig"></div></div>
@@ -569,7 +595,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <div><div class="label">Decodes</div><div class="value small" id="count"></div></div>
           </div>
         </section>
-        <section class="panel">
+        <section class="panel waterfall-panel">
           <canvas id="waterfall" width="300" height="180"></canvas>
           <div class="meta-line">
             <span>Waterfall: 0-4000 Hz</span>
@@ -630,6 +656,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     const ctx = canvas.getContext('2d');
     let selectedCall = null;
     let lastSnapshot = null;
+    let autoFollowLogs = true;
     function fmtSec(value) {
       return value == null ? '-' : `${value.toFixed(2)}s`;
     }
@@ -641,6 +668,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function renderCallValue(value, call) {
       if (!call) return value;
       return `<span class="pickable" data-call="${call}">${value}</span>`;
+    }
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+    function renderParty(value, selected) {
+      const text = value || '-';
+      if (!selected) {
+        return escapeHtml(text);
+      }
+      const cls = text === selected ? 'activity-station' : 'activity-partner';
+      return `<span class="${cls}">${escapeHtml(text)}</span>`;
     }
     function renderWaterfall(rows) {
       if (!rows || rows.length === 0) {
@@ -780,9 +823,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
         div.className = 'activity-item';
         const peer = item.peer_after ?? item.peer_before ?? '-';
         div.innerHTML = `
-          <div class="activity-head">${item.timestamp}  ${item.sender_call}  peer=${peer}  snr=${item.snr_db}  dT=${item.dt_seconds.toFixed(2)}  f=${Math.round(item.freq_hz)}</div>
-          <div>${item.text}</div>`;
+          <div class="activity-col">${item.timestamp}</div>
+          <div class="activity-col">${renderParty(item.sender_call, selectedCall)}</div>
+          <div class="activity-col">${renderParty(peer, selectedCall)}</div>
+          <div class="activity-col">${item.snr_db}</div>
+          <div class="activity-col">${item.dt_seconds.toFixed(2)}</div>
+          <div class="activity-col">${Math.round(item.freq_hz)}</div>
+          <div class="activity-msg">${escapeHtml(item.text)}</div>`;
         logs.appendChild(div);
+      }
+      if (autoFollowLogs) {
+        logs.scrollTop = logs.scrollHeight;
       }
     }
     async function refresh() {
@@ -816,6 +867,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     refresh().catch(console.error);
     setInterval(() => refresh().catch(console.error), 250);
+    document.getElementById('detail-logs').addEventListener('scroll', (event) => {
+      const node = event.currentTarget;
+      const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
+      autoFollowLogs = remaining < 12;
+    });
   </script>
 </body>
 </html>
