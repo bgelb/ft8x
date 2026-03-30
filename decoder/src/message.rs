@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::crc;
-use crate::protocol::{CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, HASH_MULTIPLIER};
+use crate::protocol::{
+    CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FTX_INFO_BITS, FTX_MESSAGE_BITS, HASH_MULTIPLIER,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub enum MessageKind {
@@ -316,11 +318,11 @@ impl HashResolver {
 }
 
 pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
-    if codeword.len() < 91 {
+    if codeword.len() < FTX_INFO_BITS {
         return None;
     }
-    let message_bits = &codeword[..77];
-    let crc_bits = &codeword[77..91];
+    let message_bits = &codeword[..FTX_MESSAGE_BITS];
+    let crc_bits = &codeword[FTX_MESSAGE_BITS..FTX_INFO_BITS];
     if !crc::crc_matches(message_bits, crc_bits) {
         return None;
     }

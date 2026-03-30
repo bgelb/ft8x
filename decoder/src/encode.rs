@@ -6,16 +6,20 @@ use thiserror::Error;
 
 use crate::crc::crc14_ft8;
 use crate::message::{GridReport, ReplyWord, hash_callsign};
+use crate::modes::ft8::{
+    FT8_GEOMETRY, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES,
+};
+use crate::modes::populate_channel_symbols;
 use crate::protocol::{
-    CALL_NTOKENS, CALL_STANDARD_BASE, FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE,
-    FT8_SYMBOL_SAMPLES, GRAY_TONES_TO_BITS,
+    CALL_NTOKENS, CALL_STANDARD_BASE, FTX_CODEWORD_BITS, FTX_DATA_SYMBOLS, FTX_INFO_BITS,
+    FTX_MESSAGE_BITS, GRAY_TONES_TO_BITS,
 };
 use crate::wave::{AudioBuffer, DecoderError, write_wav};
 
-const MESSAGE_BITS: usize = 77;
-const INFO_BITS: usize = 91;
-const CODEWORD_BITS: usize = 174;
-const DATA_SYMBOLS: usize = 58;
+const MESSAGE_BITS: usize = FTX_MESSAGE_BITS;
+const INFO_BITS: usize = FTX_INFO_BITS;
+const CODEWORD_BITS: usize = FTX_CODEWORD_BITS;
+const DATA_SYMBOLS: usize = FTX_DATA_SYMBOLS;
 const GFSK_BT: f32 = 2.0;
 
 #[derive(Debug, Clone)]
@@ -124,11 +128,8 @@ fn build_frame(message_bits: [u8; MESSAGE_BITS]) -> Result<EncodedFrame, EncodeE
     }
 
     let mut channel_symbols = [0u8; FT8_MESSAGE_SYMBOLS];
-    channel_symbols[..7].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[36..43].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[72..79].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[7..36].copy_from_slice(&data_symbols[..29]);
-    channel_symbols[43..72].copy_from_slice(&data_symbols[29..]);
+    populate_channel_symbols(&mut channel_symbols, &FT8_GEOMETRY, &data_symbols)
+        .expect("ft8 channel layout");
 
     Ok(EncodedFrame {
         message_bits,
@@ -236,11 +237,8 @@ pub fn channel_symbols_from_codeword_bits(
     }
 
     let mut channel_symbols = [0u8; FT8_MESSAGE_SYMBOLS];
-    channel_symbols[..7].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[36..43].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[72..79].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[7..36].copy_from_slice(&data_symbols[..29]);
-    channel_symbols[43..72].copy_from_slice(&data_symbols[29..]);
+    populate_channel_symbols(&mut channel_symbols, &FT8_GEOMETRY, &data_symbols)
+        .expect("ft8 channel layout");
     Some(channel_symbols)
 }
 

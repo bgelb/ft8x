@@ -2,7 +2,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::protocol::FT8_SAMPLE_RATE;
+use crate::modes::ft8::FT8_SAMPLE_RATE;
 
 #[derive(Debug, Clone)]
 pub struct AudioBuffer {
