@@ -64,19 +64,9 @@ pub fn encode_standard_message(
     info: &GridReport,
 ) -> Result<EncodedFrame, EncodeError> {
     let mut message_bits = [0u8; MESSAGE_BITS];
-    write_bits(
-        &mut message_bits,
-        0,
-        28,
-        u64::from(encode_c28(first)?),
-    );
+    write_bits(&mut message_bits, 0, 28, u64::from(encode_c28(first)?));
     write_bits(&mut message_bits, 28, 1, 0);
-    write_bits(
-        &mut message_bits,
-        29,
-        28,
-        u64::from(encode_c28(second)?),
-    );
+    write_bits(&mut message_bits, 29, 28, u64::from(encode_c28(second)?));
     write_bits(&mut message_bits, 57, 1, 0);
     write_bits(&mut message_bits, 58, 1, acknowledge as u64);
     write_bits(&mut message_bits, 59, 15, u64::from(encode_g15(info)?));
@@ -307,7 +297,8 @@ fn generator_rows() -> &'static Vec<[u8; INFO_BITS]> {
             .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
-                if trimmed.len() != INFO_BITS || !trimmed.bytes().all(|byte| matches!(byte, b'0' | b'1'))
+                if trimmed.len() != INFO_BITS
+                    || !trimmed.bytes().all(|byte| matches!(byte, b'0' | b'1'))
                 {
                     return None;
                 }
@@ -330,9 +321,9 @@ fn encode_c28(text: &str) -> Result<u32, EncodeError> {
         _ => {
             if let Some(rest) = upper.strip_prefix("CQ ") {
                 if rest.len() == 3 && rest.chars().all(|ch| ch.is_ascii_digit()) {
-                    let suffix = rest.parse::<u32>().map_err(|_| {
-                        EncodeError::UnsupportedToken(text.to_string())
-                    })?;
+                    let suffix = rest
+                        .parse::<u32>()
+                        .map_err(|_| EncodeError::UnsupportedToken(text.to_string()))?;
                     return Ok(3 + suffix);
                 }
                 if (1..=4).contains(&rest.len()) && rest.chars().all(|ch| ch.is_ascii_uppercase()) {
@@ -371,11 +362,7 @@ fn wsjtx_pack28_workaround(callsign: &str) -> String {
         return format!("3D0{}", &upper[4..7]);
     }
     let bytes = upper.as_bytes();
-    if bytes.len() >= 4
-        && bytes[0] == b'3'
-        && bytes[1] == b'X'
-        && bytes[2].is_ascii_uppercase()
-    {
+    if bytes.len() >= 4 && bytes[0] == b'3' && bytes[1] == b'X' && bytes[2].is_ascii_uppercase() {
         let tail_end = upper.len().min(6);
         return format!("Q{}", &upper[2..tail_end]);
     }
@@ -446,8 +433,7 @@ fn encode_g15(info: &GridReport) -> Result<u16, EncodeError> {
     match info {
         GridReport::Grid(grid) if is_grid4(grid) => {
             let chars: Vec<char> = grid.chars().collect();
-            let value = (((chars[0] as u16 - b'A' as u16) * 18
-                + (chars[1] as u16 - b'A' as u16))
+            let value = (((chars[0] as u16 - b'A' as u16) * 18 + (chars[1] as u16 - b'A' as u16))
                 * 10
                 + (chars[2] as u16 - b'0' as u16))
                 * 10
@@ -489,7 +475,8 @@ fn encode_c58(text: &str) -> Result<u128, EncodeError> {
         let digit = alphabet
             .iter()
             .position(|candidate| *candidate == ch)
-            .ok_or_else(|| EncodeError::UnsupportedCallsign(text.to_string()))? as u128;
+            .ok_or_else(|| EncodeError::UnsupportedCallsign(text.to_string()))?
+            as u128;
         value = value * 38 + digit;
     }
     Ok(value)
@@ -549,10 +536,12 @@ fn alphabet27_index(ch: char) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode_pcm;
-    use crate::message::{GridReport, HashResolver, unpack_message};
-    use crate::ldpc::ParityMatrix;
     use crate::DecodeOptions;
+    use crate::decode_pcm;
+    use crate::ldpc::ParityMatrix;
+    use crate::message::{
+        GridReport, HashResolver, StructuredInfoValue, StructuredMessage, unpack_message,
+    };
 
     #[test]
     fn standard_message_codeword_satisfies_parity() {
@@ -576,19 +565,19 @@ mod tests {
         )
         .expect("encode");
         let payload = unpack_message(&frame.codeword_bits).expect("payload");
-        let rendered = payload.render(&HashResolver::default());
-        assert_eq!(rendered.text, "CQ DX R6WA LN32");
+        let rendered = payload.to_message(&HashResolver::default());
+        assert_eq!(rendered.to_text(), "CQ DX R6WA LN32");
     }
 
     #[test]
     fn encodes_nonstandard_call_as_hash22() {
-        let frame = encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank)
-            .expect("encode");
+        let frame =
+            encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank).expect("encode");
         let payload = unpack_message(&frame.codeword_bits).expect("payload");
         let mut resolver = HashResolver::default();
         resolver.insert_callsign("HF19NY");
-        let rendered = payload.render(&resolver);
-        assert_eq!(rendered.text, "CQ HF19NY");
+        let rendered = payload.to_message(&resolver);
+        assert_eq!(rendered.to_text(), "CQ HF19NY");
     }
 
     #[test]
@@ -599,8 +588,38 @@ mod tests {
         let mut resolver = HashResolver::default();
         resolver.insert_callsign("YO7CGS");
         resolver.insert_callsign("A41ZZ");
-        let rendered = payload.render(&resolver);
-        assert_eq!(rendered.text, "YO7CGS A41ZZ -11");
+        let rendered = payload.to_message(&resolver);
+        assert_eq!(rendered.to_text(), "YO7CGS A41ZZ -11");
+    }
+
+    #[test]
+    fn structured_standard_message_preserves_raw_fields() {
+        let frame = encode_standard_message(
+            "GJ0KYZ",
+            "RK9AX",
+            false,
+            &GridReport::Grid("MO05".to_string()),
+        )
+        .expect("encode");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let message = payload.to_message(&HashResolver::default());
+        let StructuredMessage::Standard {
+            first,
+            second,
+            info,
+            ..
+        } = message
+        else {
+            panic!("expected standard message");
+        };
+
+        assert_eq!(first.raw, read_bits(&frame.message_bits, 0, 28) as u32);
+        assert_eq!(second.raw, read_bits(&frame.message_bits, 29, 28) as u32);
+        assert_eq!(info.raw, read_bits(&frame.message_bits, 59, 15) as u16);
+        assert!(matches!(
+            info.value,
+            StructuredInfoValue::Grid { ref locator } if locator == "MO05"
+        ));
     }
 
     #[test]
@@ -630,10 +649,22 @@ mod tests {
             },
         )
         .expect("decode");
-        let decoded: Vec<_> = report.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let decoded: Vec<_> = report
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
             decoded.contains(&"GJ0KYZ RK9AX MO05"),
             "decoded messages: {decoded:?}"
         );
+    }
+
+    fn read_bits(bits: &[u8], start: usize, len: usize) -> u64 {
+        let mut value = 0u64;
+        for bit in &bits[start..start + len] {
+            value = (value << 1) | (*bit as u64);
+        }
+        value
     }
 }
