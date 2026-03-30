@@ -128,14 +128,17 @@ impl ModeSpec {
         self.tuning.baseband_valid_samples
     }
 
+    /// Number of LDPC code bits carried by one data half of the frame.
     pub const fn codeword_half_bits(&self) -> usize {
         self.geometry.data_symbol_positions.len() * 3 / 2
     }
 
+    /// Number of 3-bit data symbols carried by one data half of the frame.
     pub const fn groups_per_half(&self) -> usize {
         self.geometry.data_symbol_positions.len() / 2
     }
 
+    /// Legacy FT8 bitmetric loops index from the symbol just before each 29-symbol data half.
     pub fn bitmetric_half_start_symbols(&self) -> [usize; 2] {
         let groups_per_half = self.groups_per_half();
         [
@@ -160,14 +163,17 @@ impl ModeSpec {
         self.start_seconds_from_dt(self.candidate_dt_seconds_from_lag(lag))
     }
 
+    /// Convert a sync-search lag back into dt while keeping the nominal start offset centralized.
     pub fn candidate_dt_seconds_from_lag(&self, lag: isize) -> f32 {
         (lag as f32 - self.nominal_start_sync_fraction()) * self.sync_step_seconds()
     }
 
+    /// Shared helper for the half-Hz residual probes used during candidate refinement.
     pub fn residual_hz_from_half_step(&self, step: isize) -> f32 {
         step as f32 * self.tuning.refine_residual_step_hz
     }
 
+    /// Preserve the legacy sample rounding used by subtraction and debug candidate paths.
     pub fn start_sample_from_dt(&self, dt_seconds: f32) -> isize {
         ((self.start_seconds_from_dt(dt_seconds) * self.geometry.sample_rate_hz as f32 + 1.0)
             .trunc()) as isize

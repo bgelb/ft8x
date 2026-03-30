@@ -258,6 +258,7 @@ pub(super) fn baseband_taper() -> &'static [f32] {
     static TAPER: OnceLock<Vec<f32>> = OnceLock::new();
     TAPER.get_or_init(|| {
         let taper_len = ACTIVE_MODE.baseband_taper_len();
+        // Legacy raised-cosine taper applied symmetrically after copying the candidate band.
         (0..=taper_len)
             .map(|index| {
                 0.5 * (1.0
@@ -267,6 +268,7 @@ pub(super) fn baseband_taper() -> &'static [f32] {
     })
 }
 
+// Copy the requested FFT bins into the downsample buffer and return the copied prefix length.
 pub(super) fn copy_band_into_baseband(
     baseband: &mut [Complex32],
     bins: &[Complex32],
@@ -278,6 +280,7 @@ pub(super) fn copy_band_into_baseband(
     copied
 }
 
+// Apply the same edge taper at the front and back of the copied baseband band.
 pub(super) fn apply_symmetric_taper(baseband: &mut [Complex32], taper: &[f32]) {
     for (offset, &gain) in taper.iter().rev().enumerate() {
         baseband[offset] *= gain;

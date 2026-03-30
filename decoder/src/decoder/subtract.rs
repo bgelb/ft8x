@@ -52,6 +52,8 @@ pub(super) fn refined_subtraction_offset(
     let sq0 = subtraction_residual_band_power(audio, reference, freq_hz, start_sample, plan);
     let sqp =
         subtraction_residual_band_power(audio, reference, freq_hz, start_sample + probe_step, plan);
+    // Fit a parabola through the residual power at -step / 0 / +step and keep the sub-sample
+    // offset only when the quadratic minimum falls inside that probe window.
     let b = (sqp - sqm) * 0.5;
     let c = (sqp + sqm - 2.0 * sq0) * 0.5;
     if c == 0.0 {
@@ -69,6 +71,8 @@ fn overlapping_window(
     reference_len: usize,
     signal_len: usize,
 ) -> Option<OverlapWindow> {
+    // Convert an arbitrary signed start sample into aligned slices over the reference
+    // waveform and the available audio window without duplicating offset arithmetic.
     let reference_start = if start_sample < 0 {
         (-start_sample) as usize
     } else {
@@ -86,6 +90,7 @@ fn overlapping_window(
 }
 
 fn edge_correction(plan: &SubtractionPlan, frame_len: usize, offset: usize) -> f32 {
+    // Compensate for the truncated subtraction filter near the beginning and end of the overlap.
     let edge = offset.min(frame_len - 1 - offset);
     if edge < plan.edge_correction.len() {
         plan.edge_correction[edge]

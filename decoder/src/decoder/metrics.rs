@@ -4,6 +4,10 @@ use crate::protocol::{
     gray_encode_3bit_value,
 };
 
+// FT8's legacy bitmetric walk evaluates 1-, 2-, and 3-symbol hypotheses.
+const BITMETRIC_MAX_COMBINED_SYMBOLS: usize = 3;
+const BITMETRIC_SYMBOL_VALUE_MASK: usize = (1usize << FTX_BITS_PER_SYMBOL) - 1;
+
 pub(super) fn truth_metrics(
     llrs: &[f32],
     truth_codeword_bits: &[u8],
@@ -32,45 +36,36 @@ pub(super) fn compute_bitmetric_passes(full_tones: &[[Complex32; 8]]) -> [Vec<f3
     let groups_per_half = ACTIVE_MODE.groups_per_half();
     let half_symbol_starts = ACTIVE_MODE.bitmetric_half_start_symbols();
 
-    for nsym in 1..=3 {
+    for nsym in 1..=BITMETRIC_MAX_COMBINED_SYMBOLS {
         let nt = 1usize << (FTX_BITS_PER_SYMBOL * nsym);
-        let ibmax = match nsym {
-            1 => 2,
-            2 => 5,
-            3 => 8,
-            _ => unreachable!(),
-        };
-        for half in 0..2 {
+        let decision_max_bit = bitmetric_decision_max_bit(nsym);
+        for (half, &half_symbol_start) in half_symbol_starts.iter().enumerate() {
             for k in (1..=groups_per_half).step_by(nsym) {
-                let ks = half_symbol_starts[half] + k;
+                let ks = half_symbol_start + k;
                 let start_bit = (k - 1) * FTX_BITS_PER_SYMBOL + half * half_bits;
                 let mut metrics = vec![0.0f32; nt];
                 for (i, metric) in metrics.iter_mut().enumerate() {
-                    let tone0 =
-                        gray_encode_3bit_value(((i >> (FTX_BITS_PER_SYMBOL * (nsym - 1))) & 0b111) as u8)
-                            as usize;
-                    let tone1 = gray_encode_3bit_value(
-                        ((i >> (FTX_BITS_PER_SYMBOL * nsym.saturating_sub(2))) & 0b111) as u8,
-                    ) as usize;
+                    let tone0 = bitmetric_metric_tone(i, nsym, 0);
                     *metric = full_tones[ks][tone0].norm();
                     if nsym >= 2 {
+                        let tone1 = bitmetric_metric_tone(i, nsym, 1);
                         *metric = (full_tones[ks][tone0] + full_tones[ks + 1][tone1]).norm();
-                    }
-                    if nsym >= 3 {
-                        let tone2 = gray_encode_3bit_value((i & 0b111) as u8) as usize;
-                        *metric = (full_tones[ks][tone0]
-                            + full_tones[ks + 1][tone1]
-                            + full_tones[ks + 2][tone2])
-                            .norm();
+                        if nsym >= 3 {
+                            let tone2 = bitmetric_metric_tone(i, nsym, 2);
+                            *metric = (full_tones[ks][tone0]
+                                + full_tones[ks + 1][tone1]
+                                + full_tones[ks + 2][tone2])
+                                .norm();
+                        }
                     }
                 }
 
-                for ib in 0..=ibmax {
+                for ib in 0..=decision_max_bit {
                     let target_bit = start_bit + ib;
                     if target_bit >= FTX_CODEWORD_BITS {
                         continue;
                     }
-                    let decision_bit = ibmax - ib;
+                    let decision_bit = decision_max_bit - ib;
                     let mut best_one = f32::NEG_INFINITY;
                     let mut best_zero = f32::NEG_INFINITY;
                     for (value, metric) in metrics.iter().enumerate() {
@@ -112,6 +107,21 @@ pub(super) fn compute_bitmetric_passes(full_tones: &[[Complex32; 8]]) -> [Vec<f3
     }
 
     [bmeta, bmetb, bmetc, bmetd]
+}
+
+// A combined nsym-symbol hypothesis carries nsym * 3 code bits, numbered from the most
+// significant bit down to zero in the legacy FT8 bitmetric walk.
+fn bitmetric_decision_max_bit(nsym: usize) -> usize {
+    debug_assert!((1..=BITMETRIC_MAX_COMBINED_SYMBOLS).contains(&nsym));
+    FTX_BITS_PER_SYMBOL * nsym - 1
+}
+
+// Interpret `metric_index` as `nsym` concatenated 3-bit Gray-coded tones. The earliest symbol
+// lives in the most-significant triplet so the extraction order matches the legacy decoder.
+fn bitmetric_metric_tone(metric_index: usize, nsym: usize, symbol_offset: usize) -> usize {
+    debug_assert!(symbol_offset < nsym);
+    let shift = FTX_BITS_PER_SYMBOL * (nsym - symbol_offset - 1);
+    gray_encode_3bit_value(((metric_index >> shift) & BITMETRIC_SYMBOL_VALUE_MASK) as u8) as usize
 }
 
 pub(super) fn compute_symbol_bit_llrs(full_tones: &[[Complex32; 8]]) -> Vec<f32> {

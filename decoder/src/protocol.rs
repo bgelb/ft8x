@@ -1,7 +1,12 @@
+/// FT8/FT4-style packed messages carry 77 payload bits before the CRC.
 pub const FTX_MESSAGE_BITS: usize = 77;
+/// The 77 payload bits plus the 14-bit CRC fed into the LDPC encoder.
 pub const FTX_INFO_BITS: usize = 91;
+/// LDPC(174, 91) codeword width used by FT8.
 pub const FTX_CODEWORD_BITS: usize = 174;
+/// 8-FSK carries three coded bits per payload symbol.
 pub const FTX_BITS_PER_SYMBOL: usize = 3;
+/// One FT8 frame carries two 87-bit LDPC halves, one per 29-symbol data block.
 pub const FTX_CODEWORD_HALF_BITS: usize = FTX_CODEWORD_BITS / 2;
 pub const FTX_DATA_SYMBOLS_PER_HALF: usize = FTX_CODEWORD_HALF_BITS / FTX_BITS_PER_SYMBOL;
 pub const FTX_DATA_SYMBOLS: usize = FTX_DATA_SYMBOLS_PER_HALF * 2;
@@ -39,6 +44,7 @@ pub struct NonstandardMessageLayout {
     pub kind: BitField,
 }
 
+/// Packed bit layout for standard FT8 messages inside the 77-bit payload.
 pub const FTX_STANDARD_LAYOUT: StandardMessageLayout = StandardMessageLayout {
     first_call: BitField { start: 0, len: 28 },
     first_suffix: BitField { start: 28, len: 1 },
@@ -49,6 +55,7 @@ pub const FTX_STANDARD_LAYOUT: StandardMessageLayout = StandardMessageLayout {
     kind: BitField { start: 74, len: 3 },
 };
 
+/// Packed bit layout for nonstandard FT8 messages inside the 77-bit payload.
 pub const FTX_NONSTANDARD_LAYOUT: NonstandardMessageLayout = NonstandardMessageLayout {
     hashed_call: BitField { start: 0, len: 12 },
     plain_call: BitField { start: 12, len: 58 },
@@ -63,11 +70,13 @@ pub const FTX_MESSAGE_KIND_STANDARD_SLASH_P: u8 = 2;
 pub const FTX_MESSAGE_KIND_NONSTANDARD: u8 = 4;
 pub const FTX_FREE_TEXT_FIELD: BitField = BitField { start: 0, len: 71 };
 pub const FTX_FREE_TEXT_SUBTYPE_FIELD: BitField = BitField { start: 71, len: 3 };
+/// AP templates constrain the first 29 packed bits plus the 3-bit message-kind field.
 pub const FTX_AP_KNOWN_FIELDS: [BitField; 2] = [
     BitField { start: 0, len: 29 },
     BitField { start: 74, len: 3 },
 ];
 
+/// Read a packed FT8 field as a big-endian integer.
 pub fn read_bit_field(bits: &[u8], field: BitField) -> u64 {
     let mut value = 0u64;
     for bit in &bits[field.start..field.end()] {
@@ -76,6 +85,7 @@ pub fn read_bit_field(bits: &[u8], field: BitField) -> u64 {
     value
 }
 
+/// Read a packed FT8 field wider than 64 bits, such as the 58-bit nonstandard callsign.
 pub fn read_bit_field_u128(bits: &[u8], field: BitField) -> u128 {
     let mut value = 0u128;
     for bit in &bits[field.start..field.end()] {
@@ -84,6 +94,7 @@ pub fn read_bit_field_u128(bits: &[u8], field: BitField) -> u128 {
     value
 }
 
+/// Write a packed FT8 field using the same big-endian bit order as the on-air payload.
 pub fn write_bit_field(bits: &mut [u8], field: BitField, value: u64) {
     for (offset, slot) in bits[field.start..field.end()].iter_mut().enumerate() {
         let shift = field.len - 1 - offset;
@@ -91,6 +102,7 @@ pub fn write_bit_field(bits: &mut [u8], field: BitField, value: u64) {
     }
 }
 
+/// Copy selected packed-message fields into a 174-slot AP known-bit vector.
 pub fn copy_known_message_bits(
     known: &mut [Option<u8>],
     message_bits: &[u8],
@@ -113,6 +125,7 @@ pub fn copy_known_message_bits(
     Some(())
 }
 
+/// Gray-coded FT8 tone values indexed by tone number.
 pub const GRAY_TONES_TO_BITS: [[u8; 3]; 8] = [
     [0, 0, 0],
     [0, 0, 1],
@@ -135,6 +148,7 @@ const ALPHABET_36: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const ALPHABET_37: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const ALPHABET_38: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
 const ALPHABET_42: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?";
+const GRAY_3BIT_MASK: u8 = (1u8 << FTX_BITS_PER_SYMBOL) - 1;
 
 fn alphabet_char(alphabet: &[u8], index: usize) -> char {
     alphabet[index] as char
@@ -147,6 +161,8 @@ fn alphabet_index(alphabet: &[u8], ch: char) -> Option<u32> {
         .map(|index| index as u32)
 }
 
+// The pack/unpack code names the concrete FT8 alphabets at the callsite so field bases stay
+// obvious without re-embedding the byte tables throughout encode/message code.
 pub fn digit10_char(index: usize) -> char {
     alphabet_char(ALPHABET_10, index)
 }
@@ -191,8 +207,9 @@ pub fn alphabet42_char(index: usize) -> char {
     alphabet_char(ALPHABET_42, index)
 }
 
+/// Convert one 3-bit binary symbol value into the FT8 Gray-coded tone number.
 pub fn gray_encode_3bit_value(bits: u8) -> u8 {
-    match bits & 0b111 {
+    match bits & GRAY_3BIT_MASK {
         0b000 => 0,
         0b001 => 1,
         0b011 => 2,
@@ -205,10 +222,12 @@ pub fn gray_encode_3bit_value(bits: u8) -> u8 {
     }
 }
 
+/// Convenience wrapper for callers that already hold the triplet as separate bits.
 pub fn gray_encode_3bits(bits: [u8; 3]) -> u8 {
     gray_encode_3bit_value((bits[0] << 2) | (bits[1] << 1) | bits[2])
 }
 
+/// Inverse of `gray_encode_3bit_value`, used when unpacking FT8 tones back into bits.
 pub fn gray_decode_tone3(tone: u8) -> [u8; 3] {
     GRAY_TONES_TO_BITS[tone as usize]
 }

@@ -27,6 +27,7 @@ pub(super) fn build_spectrogram(audio: &AudioBuffer, options: &DecodeOptions) ->
     let mut input = fft.make_input_vec();
     let mut spectrum = fft.make_output_vec();
 
+    // Standard Hann window over one symbol before the per-hop FFT.
     let window: Vec<f32> = (0..geometry.symbol_samples)
         .map(|index| {
             let phase = 2.0 * std::f32::consts::PI * index as f32
