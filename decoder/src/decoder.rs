@@ -877,19 +877,17 @@ fn run_full_search(
     state: Option<&DecoderState>,
 ) -> SearchResult {
     let subtraction_plan = SubtractionPlan::global();
-    let prepared_full = early47.map(|stage47| {
-        let mut prepared = audio.clone();
-        for success in &stage47.successes {
-            subtract_candidate_with_dt_refinement(&mut prepared, success, subtraction_plan, true);
-        }
-        prepared.samples[..EARLY_47_SAMPLES]
-            .copy_from_slice(&stage47.residual_audio.samples[..EARLY_47_SAMPLES]);
-        prepared
-    });
     let initial_successes = early47
         .map(|stage| stage.successes.clone())
         .or_else(|| early41.map(|stage| stage.successes.clone()))
         .unwrap_or_default();
+    let prepared_full = (!initial_successes.is_empty()).then(|| {
+        let mut prepared = audio.clone();
+        for success in &initial_successes {
+            subtract_candidate_with_dt_refinement(&mut prepared, success, subtraction_plan, true);
+        }
+        prepared
+    });
     run_decode_search(
         audio,
         options,
