@@ -346,3 +346,33 @@ pub(super) fn normalize_sync_scores(scores: &mut [(usize, isize, f32)]) {
         *score /= baseline;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync8_score_uses_quarter_symbol_row_mapping() {
+        let geometry = &ACTIVE_MODE.geometry;
+        let row_len = ACTIVE_MODE.sync_fft_samples() / 2 + 1;
+        let nhsym = 400usize;
+        let bin = 10usize;
+        let nominal_start = 2isize;
+        let lag = 0isize;
+        let mut symbol_power = vec![0.0f32; nhsym * row_len];
+
+        for (offset, costas) in geometry.costas_pattern.iter().copied().enumerate() {
+            for &block_start in geometry.sync_block_starts {
+                let row_start = nominal_start
+                    + ((block_start + offset) * ACTIVE_MODE.tuning.sync_step_divisor) as isize;
+                let row = (row_start as usize - 1) * row_len;
+                for tone in 0..7 {
+                    symbol_power[row + bin + 2 * tone] = 1.0;
+                }
+                symbol_power[row + bin + 2 * costas] = 8.0;
+            }
+        }
+
+        assert!(sync8_score(&symbol_power, nhsym, bin, lag, nominal_start) > 5.0);
+    }
+}

@@ -369,3 +369,36 @@ pub(super) fn estimate_snr_db(full_tones: &[[Complex32; 8]]) -> i32 {
     let signal = maxima.iter().copied().sum::<f32>() / maxima.len() as f32;
     (10.0 * ((signal / noise).max(1e-6)).log10() - 24.0).round() as i32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_samples_past_valid_window_do_not_change_extracted_tones() {
+        let valid = ACTIVE_MODE.tuning.baseband_valid_samples;
+        let len = valid + BASEBAND_SYMBOL_SAMPLES * 4;
+        let clean = vec![Complex32::new(0.0, 0.0); len];
+        let mut dirty = clean.clone();
+        for sample in &mut dirty[valid..] {
+            *sample = Complex32::new(123.0, -45.0);
+        }
+
+        assert_eq!(extract_symbol_tones(&clean, 0), extract_symbol_tones(&dirty, 0));
+    }
+
+    #[test]
+    fn baseband_taper_application_is_symmetric() {
+        let taper = baseband_taper();
+        let copied = BASEBAND_TAPER_LEN * 2 + 8;
+        let mut gains = vec![1.0f32; copied];
+        for index in 0..=BASEBAND_TAPER_LEN {
+            gains[index] *= taper[BASEBAND_TAPER_LEN - index];
+            gains[copied - 1 - index] *= taper[BASEBAND_TAPER_LEN - index];
+        }
+
+        for index in 0..=BASEBAND_TAPER_LEN {
+            assert_eq!(gains[index], gains[copied - 1 - index]);
+        }
+    }
+}

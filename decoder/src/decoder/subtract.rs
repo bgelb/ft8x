@@ -185,3 +185,37 @@ impl SubtractionPlan {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refined_subtraction_offset_is_zero_for_aligned_reference() {
+        let frame =
+            crate::encode::encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank)
+                .expect("encode frame");
+        let audio = crate::encode::synthesize_rectangular_waveform(
+            &frame,
+            &crate::encode::WaveformOptions {
+                base_freq_hz: 1_234.0,
+                amplitude: 1.0,
+                ..crate::encode::WaveformOptions::default()
+            },
+        )
+        .expect("audio");
+        let reference = synthesize_channel_reference(&frame.channel_symbols, 1_234.0);
+        let start_sample = ACTIVE_MODE.start_sample_from_dt(0.0);
+
+        assert_eq!(
+            refined_subtraction_offset(
+                &audio,
+                &reference,
+                1_234.0,
+                start_sample,
+                SubtractionPlan::global(),
+            ),
+            Some(0)
+        );
+    }
+}

@@ -1,10 +1,12 @@
 use super::*;
+use crate::protocol::{FTX_AP_KNOWN_FIELDS, copy_known_message_bits};
+use crate::protocol::FTX_CODEWORD_BITS;
 
 pub(super) fn truth_metrics(
     llrs: &[f32],
     truth_codeword_bits: &[u8],
 ) -> Option<(Option<usize>, Option<f32>)> {
-    if llrs.len() != 174 || truth_codeword_bits.len() < 174 {
+    if llrs.len() != FTX_CODEWORD_BITS || truth_codeword_bits.len() < FTX_CODEWORD_BITS {
         return None;
     }
     let mut hard_errors = 0usize;
@@ -20,10 +22,16 @@ pub(super) fn truth_metrics(
 }
 
 pub(super) fn compute_bitmetric_passes(full_tones: &[[Complex32; 8]]) -> [Vec<f32>; 4] {
-    let mut bmeta = vec![0.0f32; 174];
-    let mut bmetb = vec![0.0f32; 174];
-    let mut bmetc = vec![0.0f32; 174];
-    let mut bmetd = vec![0.0f32; 174];
+    let mut bmeta = vec![0.0f32; FTX_CODEWORD_BITS];
+    let mut bmetb = vec![0.0f32; FTX_CODEWORD_BITS];
+    let mut bmetc = vec![0.0f32; FTX_CODEWORD_BITS];
+    let mut bmetd = vec![0.0f32; FTX_CODEWORD_BITS];
+    let half_bits = FTX_CODEWORD_BITS / 2;
+    let groups_per_half = half_bits / 3;
+    let half_symbol_starts = [
+        ACTIVE_MODE.geometry.data_symbol_positions[0] - 1,
+        ACTIVE_MODE.geometry.data_symbol_positions[groups_per_half] - 1,
+    ];
     let graymap = [0usize, 1, 3, 2, 5, 6, 4, 7];
 
     for nsym in 1..=3 {
@@ -31,13 +39,13 @@ pub(super) fn compute_bitmetric_passes(full_tones: &[[Complex32; 8]]) -> [Vec<f3
         let ibmax = match nsym {
             1 => 2,
             2 => 5,
-            3 => 8,
-            _ => unreachable!(),
-        };
+                3 => 8,
+                _ => unreachable!(),
+            };
         for half in 0..2 {
-            for k in (1..=29).step_by(nsym) {
-                let ks = if half == 0 { k + 6 } else { k + 42 };
-                let start_bit = (k - 1) * 3 + half * 87;
+            for k in (1..=groups_per_half).step_by(nsym) {
+                let ks = half_symbol_starts[half] + k;
+                let start_bit = (k - 1) * 3 + half * half_bits;
                 let mut metrics = vec![0.0f32; nt];
                 for (i, metric) in metrics.iter_mut().enumerate() {
                     let tone0 = graymap[(i >> (3 * (nsym - 1))) & 0b111];
@@ -57,7 +65,7 @@ pub(super) fn compute_bitmetric_passes(full_tones: &[[Complex32; 8]]) -> [Vec<f3
 
                 for ib in 0..=ibmax {
                     let target_bit = start_bit + ib;
-                    if target_bit >= 174 {
+                    if target_bit >= FTX_CODEWORD_BITS {
                         continue;
                     }
                     let decision_bit = ibmax - ib;
@@ -136,7 +144,7 @@ pub(super) fn decode_llr_set(
     let Some(payload) = unpack_message(&bits) else {
         return None;
     };
-    if matches!(payload, Payload::Unsupported(_, _)) {
+    if matches!(payload, Payload::Unsupported(_)) {
         return None;
     }
     counters.parsed_payloads += 1;
@@ -162,7 +170,7 @@ pub(super) fn decode_llr_set_with_known_bits(
     let Some(payload) = unpack_message(&bits) else {
         return None;
     };
-    if matches!(payload, Payload::Unsupported(_, _)) {
+    if matches!(payload, Payload::Unsupported(_)) {
         return None;
     }
     counters.parsed_payloads += 1;
@@ -175,13 +183,9 @@ pub(super) fn cq_ap_known_bits() -> &'static [Option<u8>] {
         let frame =
             crate::encode::encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank)
                 .expect("encode CQ AP template");
-        let mut known = vec![None; 174];
-        for index in 0..29 {
-            known[index] = Some(frame.message_bits[index]);
-        }
-        for index in 74..77 {
-            known[index] = Some(frame.message_bits[index]);
-        }
+        let mut known = vec![None; FTX_CODEWORD_BITS];
+        copy_known_message_bits(&mut known, &frame.message_bits, &FTX_AP_KNOWN_FIELDS)
+            .expect("copy AP template bits");
         known
     })
 }
@@ -196,13 +200,9 @@ pub(super) fn mycall_ap_known_bits() -> &'static [Option<u8>] {
             &GridReport::Reply(crate::message::ReplyWord::Rrr),
         )
         .expect("encode MyCall AP template");
-        let mut known = vec![None; 174];
-        for index in 0..29 {
-            known[index] = Some(frame.message_bits[index]);
-        }
-        for index in 74..77 {
-            known[index] = Some(frame.message_bits[index]);
-        }
+        let mut known = vec![None; FTX_CODEWORD_BITS];
+        copy_known_message_bits(&mut known, &frame.message_bits, &FTX_AP_KNOWN_FIELDS)
+            .expect("copy AP template bits");
         known
     })
 }
@@ -235,5 +235,31 @@ pub(super) fn normalize_metric_vector(values: &mut [f32]) {
         for value in values {
             *value /= sigma;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitmetric_passes_preserve_codeword_bit_order_on_ideal_tones() {
+        let frame =
+            crate::encode::encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank)
+                .expect("encode frame");
+        let channel_symbols =
+            crate::encode::channel_symbols_from_codeword_bits(&frame.codeword_bits)
+                .expect("channel symbols");
+        let mut full_tones = vec![[Complex32::new(1.0, 0.0); 8]; ACTIVE_MODE.geometry.message_symbols];
+        for (symbol_index, tone) in channel_symbols.iter().copied().enumerate() {
+            full_tones[symbol_index][tone as usize] = Complex32::new(9.0, 0.0);
+        }
+
+        let hard_bits: Vec<u8> = compute_bitmetric_passes(&full_tones)[0]
+            .iter()
+            .map(|value| u8::from(*value >= 0.0))
+            .collect();
+
+        assert_eq!(hard_bits, frame.codeword_bits);
     }
 }

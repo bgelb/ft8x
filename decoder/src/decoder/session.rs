@@ -151,11 +151,11 @@ pub(super) fn merged_resolver(
 }
 
 pub(super) fn rendered_success_key(success: &SuccessfulDecode, resolver: &HashResolver) -> String {
-    let rendered = success.payload.render(resolver);
-    if rendered.text.trim().is_empty() {
+    let rendered = success.payload.to_message(resolver).to_text();
+    if rendered.trim().is_empty() {
         format!("{:?}", success.payload)
     } else {
-        rendered.text
+        rendered
     }
 }
 
@@ -277,15 +277,15 @@ pub(super) fn build_decode_report_with_resolver(
 
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
-        let payload = success.payload.render(&resolver);
-        if matches!(payload.kind, MessageKind::Unsupported) {
+        let message = success.payload.to_message(&resolver);
+        if matches!(message, StructuredMessage::Unsupported { .. }) {
             continue;
         }
-        let text = payload.text.clone();
+        let text = message.to_text();
         if text.trim().is_empty() {
             continue;
         }
-        let message = DecodedMessage {
+        let decode = DecodedMessage {
             utc: "000000".to_string(),
             snr_db: success.snr_db,
             dt_seconds: success.candidate.dt_seconds,
@@ -293,12 +293,12 @@ pub(super) fn build_decode_report_with_resolver(
             text: text.clone(),
             candidate_score: success.candidate.score,
             ldpc_iterations: success.ldpc_iterations,
-            payload,
+            message,
         };
         match dedup.get(&text) {
-            Some(existing) if existing.candidate_score >= message.candidate_score => {}
+            Some(existing) if existing.candidate_score >= decode.candidate_score => {}
             _ => {
-                dedup.insert(text, message);
+                dedup.insert(text, decode);
             }
         }
     }
@@ -564,4 +564,38 @@ pub(super) fn try_refined_candidate(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::hash_callsign;
+    use crate::message::ReplyWord;
+
+    #[test]
+    fn merged_resolver_collects_callsigns_from_successes() {
+        let frame =
+            crate::encode::encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
+                .expect("encode frame");
+        let payload = unpack_message(&frame.codeword_bits)
+            .expect("payload")
+            .clone();
+        let resolver = merged_resolver(
+            None,
+            &[SuccessfulDecode {
+                payload,
+                codeword_bits: frame.codeword_bits.to_vec(),
+                candidate: DecodeCandidate {
+                    start_seconds: 0.5,
+                    dt_seconds: 0.0,
+                    freq_hz: 1_200.0,
+                    score: 1.0,
+                },
+                ldpc_iterations: 0,
+                snr_db: 0,
+            }],
+        );
+
+        assert_eq!(resolver.resolve12(hash_callsign("HF19NY", 12) as u16), Some("HF19NY"));
+    }
 }
