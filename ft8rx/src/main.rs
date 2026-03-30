@@ -1731,17 +1731,11 @@ fn prune_bandmap(map: &mut BTreeMap<String, BandMapEntry>, current_slot_index: u
 }
 
 fn bandmap_calls_from_decode(decode: &DecodedMessage) -> Vec<(String, Option<String>)> {
-    let mut calls = Vec::<String>::new();
-    if let Some(call) = visible_call_text(decode.message.first_call_field()) {
-        calls.push(call);
-    }
-    if let Some(call) = visible_call_text(decode.message.second_call_field()) {
-        if !calls.iter().any(|existing| existing == &call) {
-            calls.push(call);
-        }
-    }
     let detail = bandmap_detail(&decode.message);
-    calls.into_iter().map(|call| (call, detail.clone())).collect()
+    visible_call_text(decode.message.second_call_field())
+        .into_iter()
+        .map(|call| (call, detail.clone()))
+        .collect()
 }
 
 fn visible_call_text(field: Option<MessageCallField<'_>>) -> Option<String> {
