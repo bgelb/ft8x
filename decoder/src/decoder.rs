@@ -1028,6 +1028,7 @@ fn run_decode_search(
         }
 
         let mut pass_successes = Vec::<SuccessfulDecode>::new();
+        let mut pass_changed = false;
         for candidate in &candidates {
             let mut local_counters = DecodeCounters::default();
             let success = try_candidate(
@@ -1044,6 +1045,7 @@ fn run_decode_search(
             counters.ldpc_codewords += local_counters.ldpc_codewords;
             counters.parsed_payloads += local_counters.parsed_payloads;
             if let Some(success) = success {
+                pass_changed = true;
                 subtract_candidate(&mut residual_audio, &success, subtraction_plan);
                 if !is_new_success(&successes, &pass_successes, &success, base_resolver) {
                     continue;
@@ -1051,7 +1053,7 @@ fn run_decode_search(
                 pass_successes.push(success);
             }
         }
-        if pass_successes.is_empty() {
+        if !pass_changed {
             break;
         }
 
