@@ -1503,14 +1503,36 @@ fn decode_columns(decode: &DecodedMessage) -> (String, String, String, String) {
 fn bandmap_detail(message: &StructuredMessage) -> Option<String> {
     match message {
         StructuredMessage::Standard {
-            acknowledge, info, ..
+            first,
+            second,
+            acknowledge,
+            info,
+            ..
         } => {
-            let text = structured_info_text(*acknowledge, info);
-            (!text.is_empty()).then_some(text)
+            let mut parts = Vec::new();
+            if let Some(token) = bandmap_token(first).or_else(|| bandmap_token(second)) {
+                parts.push(token);
+            }
+            let info_text = structured_info_text(*acknowledge, info);
+            if !info_text.is_empty() {
+                parts.push(info_text);
+            }
+            (!parts.is_empty()).then(|| parts.join(" "))
         }
         StructuredMessage::FreeText { .. }
         | StructuredMessage::Nonstandard { .. }
         | StructuredMessage::Unsupported { .. } => None,
+    }
+}
+
+fn bandmap_token(field: &StructuredCallField) -> Option<String> {
+    match &field.value {
+        StructuredCallValue::Token { token } => token
+            .split_whitespace()
+            .next()
+            .map(ToOwned::to_owned)
+            .or_else(|| (!token.is_empty()).then(|| token.clone())),
+        StructuredCallValue::StandardCall { .. } | StructuredCallValue::Hash22 { .. } => None,
     }
 }
 
