@@ -846,7 +846,12 @@ fn run_early47_search(
     if let Some(stage41) = early41 {
         for success in &stage41.successes {
             if success.candidate.dt_seconds < 0.396 {
-                subtract_candidate(&mut partial47, success, subtraction_plan);
+                subtract_candidate_with_dt_refinement(
+                    &mut partial47,
+                    success,
+                    subtraction_plan,
+                    true,
+                );
             }
         }
     }
@@ -875,7 +880,7 @@ fn run_full_search(
     let prepared_full = early47.map(|stage47| {
         let mut prepared = audio.clone();
         for success in &stage47.successes {
-            subtract_candidate(&mut prepared, success, subtraction_plan);
+            subtract_candidate_with_dt_refinement(&mut prepared, success, subtraction_plan, true);
         }
         prepared.samples[..EARLY_47_SAMPLES]
             .copy_from_slice(&stage47.residual_audio.samples[..EARLY_47_SAMPLES]);
@@ -1315,13 +1320,91 @@ fn collect_candidates_legacy(audio: &AudioBuffer, options: &DecodeOptions) -> Ve
 }
 
 fn subtract_candidate(audio: &mut AudioBuffer, success: &SuccessfulDecode, plan: &SubtractionPlan) {
+    subtract_candidate_with_dt_refinement(audio, success, plan, false);
+}
+
+fn subtract_candidate_with_dt_refinement(
+    audio: &mut AudioBuffer,
+    success: &SuccessfulDecode,
+    plan: &SubtractionPlan,
+    refine_dt: bool,
+) {
     let Some(channel_symbols) = channel_symbols_from_codeword_bits(&success.codeword_bits) else {
         return;
     };
     let start_sample =
         ((success.candidate.dt_seconds + 0.5) * FT8_SAMPLE_RATE as f32 + 1.0).trunc() as isize - 1;
     let reference = synthesize_channel_reference(&channel_symbols, success.candidate.freq_hz);
-    let frame_len = reference.len();
+    let offset_samples = if refine_dt {
+        let Some(offset_samples) =
+            refined_subtraction_offset(audio, &reference, success.candidate.freq_hz, start_sample, plan)
+        else {
+            return;
+        };
+        offset_samples
+    } else {
+        0
+    };
+    apply_subtraction(audio, &reference, start_sample + offset_samples, plan);
+}
+
+fn refined_subtraction_offset(
+    audio: &AudioBuffer,
+    reference: &[Complex32],
+    freq_hz: f32,
+    start_sample: isize,
+    plan: &SubtractionPlan,
+) -> Option<isize> {
+    let sqm = subtraction_residual_band_power(audio, reference, freq_hz, start_sample - 90, plan);
+    let sq0 = subtraction_residual_band_power(audio, reference, freq_hz, start_sample, plan);
+    let sqp = subtraction_residual_band_power(audio, reference, freq_hz, start_sample + 90, plan);
+    let b = (sqp - sqm) * 0.5;
+    let c = (sqp + sqm - 2.0 * sq0) * 0.5;
+    if c == 0.0 {
+        return None;
+    }
+    let dx = -b / (2.0 * c);
+    if dx.abs() > 1.0 {
+        return None;
+    }
+    Some((90.0 * dx).round() as isize)
+}
+
+fn subtraction_residual_band_power(
+    audio: &AudioBuffer,
+    reference: &[Complex32],
+    freq_hz: f32,
+    start_sample: isize,
+    plan: &SubtractionPlan,
+) -> f32 {
+    let mut residual = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
+    let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
+    for offset in 0..reference.len() {
+        let index = start_sample + offset as isize;
+        if index < 0 || index as usize >= audio.samples.len() {
+            continue;
+        }
+        let corrected = envelope[offset] * reference[offset];
+        residual[offset] = Complex32::new(audio.samples[index as usize] - 2.0 * corrected.re, 0.0);
+    }
+    plan.forward.process(&mut residual);
+    let df = FT8_SAMPLE_RATE as f32 / LONG_INPUT_SAMPLES as f32;
+    let start_bin = ((freq_hz - 1.5 * FT8_TONE_SPACING_HZ) / df).trunc().max(0.0) as usize;
+    let end_bin = ((freq_hz + 8.5 * FT8_TONE_SPACING_HZ) / df)
+        .trunc()
+        .min((LONG_INPUT_SAMPLES / 2) as f32) as usize;
+    residual[start_bin..=end_bin]
+        .iter()
+        .map(|value| value.re * value.re + value.im * value.im)
+        .sum()
+}
+
+fn filtered_subtraction_envelope(
+    audio: &AudioBuffer,
+    reference: &[Complex32],
+    start_sample: isize,
+    plan: &SubtractionPlan,
+) -> Vec<Complex32> {
     let mut envelope = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
     for (offset, sample) in reference.iter().enumerate() {
         let index = start_sample + offset as isize;
@@ -1341,6 +1424,17 @@ fn subtract_candidate(audio: &mut AudioBuffer, success: &SuccessfulDecode, plan:
         *value *= scale;
     }
 
+    envelope
+}
+
+fn apply_subtraction(
+    audio: &mut AudioBuffer,
+    reference: &[Complex32],
+    start_sample: isize,
+    plan: &SubtractionPlan,
+) {
+    let frame_len = reference.len();
+    let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
     for offset in 0..frame_len {
         let index = start_sample + offset as isize;
         if index < 0 || index as usize >= audio.samples.len() {
