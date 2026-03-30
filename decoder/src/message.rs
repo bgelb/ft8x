@@ -4,10 +4,12 @@ use serde::Serialize;
 
 use crate::crc;
 use crate::protocol::{
-    CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FTX_INFO_BITS,
-    FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_STANDARD_SLASH_P,
+    CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FTX_FREE_TEXT_FIELD,
+    FTX_FREE_TEXT_SUBTYPE_FIELD, FTX_INFO_BITS, FTX_MESSAGE_BITS,
+    FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_STANDARD_SLASH_P,
     FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT, FTX_STANDARD_LAYOUT,
-    HASH_MULTIPLIER,
+    HASH_MULTIPLIER, alphabet27_char, alphabet36_char, alphabet37_char, alphabet38_char,
+    alphabet38_index, alphabet42_char, digit10_char, read_bit_field, read_bit_field_u128,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -330,17 +332,13 @@ pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
         return None;
     }
 
-    let i3 = read_bits(
-        message_bits,
-        FTX_STANDARD_LAYOUT.kind.start,
-        FTX_STANDARD_LAYOUT.kind.len,
-    ) as u8;
+    let i3 = read_bit_field(message_bits, FTX_STANDARD_LAYOUT.kind) as u8;
     match i3 {
         0 => {
-            let n3 = read_bits(message_bits, FTX_NONSTANDARD_LAYOUT.reply.start, 3) as u8;
+            let n3 = read_bit_field(message_bits, FTX_FREE_TEXT_SUBTYPE_FIELD) as u8;
             match n3 {
                 0 => {
-                    let raw = read_bits_u128(message_bits, 0, 71);
+                    let raw = read_bit_field_u128(message_bits, FTX_FREE_TEXT_FIELD);
                     Some(Payload::FreeText(FreeTextMessage {
                         i3,
                         n3,
@@ -356,87 +354,42 @@ pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
             }
         }
         FTX_MESSAGE_KIND_STANDARD_SLASH_R | FTX_MESSAGE_KIND_STANDARD_SLASH_P => {
-            let first_raw = read_bits(
-                message_bits,
-                FTX_STANDARD_LAYOUT.first_call.start,
-                FTX_STANDARD_LAYOUT.first_call.len,
-            ) as u32;
-            let second_raw = read_bits(
-                message_bits,
-                FTX_STANDARD_LAYOUT.second_call.start,
-                FTX_STANDARD_LAYOUT.second_call.len,
-            ) as u32;
+            let first_raw = read_bit_field(message_bits, FTX_STANDARD_LAYOUT.first_call) as u32;
+            let second_raw = read_bit_field(message_bits, FTX_STANDARD_LAYOUT.second_call) as u32;
             let modifier = if i3 == FTX_MESSAGE_KIND_STANDARD_SLASH_R {
                 CallModifier::R
             } else {
                 CallModifier::P
             };
-            let info_raw = read_bits(
-                message_bits,
-                FTX_STANDARD_LAYOUT.info.start,
-                FTX_STANDARD_LAYOUT.info.len,
-            ) as u16;
+            let info_raw = read_bit_field(message_bits, FTX_STANDARD_LAYOUT.info) as u16;
             Some(Payload::Standard(StandardMessage {
                 i3,
                 first_raw,
                 first: decode_c28(first_raw as u64),
-                first_modifier: (read_bits(
-                    message_bits,
-                    FTX_STANDARD_LAYOUT.first_suffix.start,
-                    FTX_STANDARD_LAYOUT.first_suffix.len,
-                ) == 1)
+                first_modifier: (read_bit_field(message_bits, FTX_STANDARD_LAYOUT.first_suffix) == 1)
                     .then_some(modifier.clone()),
                 second_raw,
                 second: decode_c28(second_raw as u64),
-                second_modifier: (read_bits(
-                    message_bits,
-                    FTX_STANDARD_LAYOUT.second_suffix.start,
-                    FTX_STANDARD_LAYOUT.second_suffix.len,
-                ) == 1)
+                second_modifier: (read_bit_field(message_bits, FTX_STANDARD_LAYOUT.second_suffix)
+                    == 1)
                     .then_some(modifier),
-                acknowledge: read_bits(
-                    message_bits,
-                    FTX_STANDARD_LAYOUT.acknowledge.start,
-                    FTX_STANDARD_LAYOUT.acknowledge.len,
-                ) == 1,
+                acknowledge: read_bit_field(message_bits, FTX_STANDARD_LAYOUT.acknowledge) == 1,
                 info_raw,
                 info: decode_g15(info_raw as u64),
             }))
         }
         FTX_MESSAGE_KIND_NONSTANDARD => Some(Payload::Nonstandard(NonstandardMessage {
             i3,
-            hashed: read_bits(
+            hashed: read_bit_field(message_bits, FTX_NONSTANDARD_LAYOUT.hashed_call) as u16,
+            plain_raw: read_bit_field_u128(message_bits, FTX_NONSTANDARD_LAYOUT.plain_call),
+            plain: decode_c58(read_bit_field_u128(
                 message_bits,
-                FTX_NONSTANDARD_LAYOUT.hashed_call.start,
-                FTX_NONSTANDARD_LAYOUT.hashed_call.len,
-            ) as u16,
-            plain_raw: read_bits_u128(
-                message_bits,
-                FTX_NONSTANDARD_LAYOUT.plain_call.start,
-                FTX_NONSTANDARD_LAYOUT.plain_call.len,
-            ),
-            plain: decode_c58(read_bits_u128(
-                message_bits,
-                FTX_NONSTANDARD_LAYOUT.plain_call.start,
-                FTX_NONSTANDARD_LAYOUT.plain_call.len,
+                FTX_NONSTANDARD_LAYOUT.plain_call,
             )),
-            hashed_is_second: read_bits(
-                message_bits,
-                FTX_NONSTANDARD_LAYOUT.hashed_is_second.start,
-                FTX_NONSTANDARD_LAYOUT.hashed_is_second.len,
-            ) == 1,
-            reply: decode_r2(
-                read_bits(
-                    message_bits,
-                    FTX_NONSTANDARD_LAYOUT.reply.start,
-                    FTX_NONSTANDARD_LAYOUT.reply.len,
-                ) as u8,
-            ),
-            cq: read_bits(
-                message_bits,
-                FTX_NONSTANDARD_LAYOUT.cq.start,
-                FTX_NONSTANDARD_LAYOUT.cq.len,
-            ) == 1,
+            hashed_is_second: read_bit_field(message_bits, FTX_NONSTANDARD_LAYOUT.hashed_is_second)
+                == 1,
+            reply: decode_r2(read_bit_field(message_bits, FTX_NONSTANDARD_LAYOUT.reply) as u8),
+            cq: read_bit_field(message_bits, FTX_NONSTANDARD_LAYOUT.cq) == 1,
         })),
         other => Some(Payload::Unsupported(UnsupportedMessage {
             i3: other,
@@ -658,10 +611,10 @@ fn decode_c28(value: u64) -> CallField {
             let i4 = remaining % 27;
             let suffix = format!(
                 "{}{}{}{}",
-                alphabet27(i1 as usize),
-                alphabet27(i2 as usize),
-                alphabet27(i3 as usize),
-                alphabet27(i4 as usize)
+                alphabet27_char(i1 as usize),
+                alphabet27_char(i2 as usize),
+                alphabet27_char(i3 as usize),
+                alphabet27_char(i4 as usize)
             )
             .trim()
             .to_string();
@@ -679,12 +632,12 @@ fn decode_c28(value: u64) -> CallField {
             remaining %= (27 * 27) as u64;
             let i5 = remaining / 27;
             let i6 = remaining % 27;
-            let a1 = alphabet37(i1 as usize);
-            let a2 = alphabet36(i2 as usize);
-            let a3 = digit10(i3 as usize);
-            let a4 = alphabet27(i4 as usize);
-            let a5 = alphabet27(i5 as usize);
-            let a6 = alphabet27(i6 as usize);
+            let a1 = alphabet37_char(i1 as usize);
+            let a2 = alphabet36_char(i2 as usize);
+            let a3 = digit10_char(i3 as usize);
+            let a4 = alphabet27_char(i4 as usize);
+            let a5 = alphabet27_char(i5 as usize);
+            let a6 = alphabet27_char(i6 as usize);
             CallField::Standard(format!("{a1}{a2}{a3}{a4}{a5}{a6}").trim().to_string())
         }
         raw if raw >= CALL_NTOKENS as u64 && raw < (CALL_NTOKENS + CALL_MAX22) as u64 => {
@@ -695,71 +648,28 @@ fn decode_c28(value: u64) -> CallField {
 }
 
 fn decode_c58(value: u128) -> String {
-    let alphabet: Vec<char> = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/".chars().collect();
     let mut remaining = value;
     let mut chars = [' '; 11];
-    for slot in (0..11).rev() {
+    for slot in chars.iter_mut().rev() {
         let digit = (remaining % 38) as usize;
         remaining /= 38;
-        chars[slot] = alphabet[digit];
+        *slot = alphabet38_char(digit);
     }
     chars.iter().collect::<String>().trim().to_string()
 }
 
 fn decode_free_text(value: u128) -> String {
-    let alphabet: Vec<char> = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"
-        .chars()
-        .collect();
     let mut remaining = value;
     let mut chars = [' '; 13];
-    for slot in (0..13).rev() {
+    for slot in chars.iter_mut().rev() {
         let digit = (remaining % 42) as usize;
         remaining /= 42;
-        chars[slot] = alphabet[digit];
+        *slot = alphabet42_char(digit);
     }
     chars.iter().collect::<String>().trim().to_string()
 }
 
-fn alphabet37(index: usize) -> char {
-    " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        .chars()
-        .nth(index)
-        .unwrap()
-}
-
-fn alphabet36(index: usize) -> char {
-    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        .chars()
-        .nth(index)
-        .unwrap()
-}
-
-fn digit10(index: usize) -> char {
-    "0123456789".chars().nth(index).unwrap()
-}
-
-fn alphabet27(index: usize) -> char {
-    " ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().nth(index).unwrap()
-}
-
-fn read_bits(bits: &[u8], start: usize, len: usize) -> u64 {
-    let mut value = 0u64;
-    for bit in &bits[start..start + len] {
-        value = (value << 1) | (*bit as u64);
-    }
-    value
-}
-
-fn read_bits_u128(bits: &[u8], start: usize, len: usize) -> u128 {
-    let mut value = 0u128;
-    for bit in &bits[start..start + len] {
-        value = (value << 1) | (*bit as u128);
-    }
-    value
-}
-
 pub fn hash_callsign(callsign: &str, nbits: u8) -> u64 {
-    let alphabet: Vec<char> = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/".chars().collect();
     let mut padded = callsign.trim().to_uppercase();
     padded.truncate(11);
     while padded.len() < 11 {
@@ -768,10 +678,7 @@ pub fn hash_callsign(callsign: &str, nbits: u8) -> u64 {
 
     let mut value = 0u64;
     for ch in padded.chars() {
-        let digit = alphabet
-            .iter()
-            .position(|candidate| *candidate == ch)
-            .unwrap_or(0) as u64;
+        let digit = alphabet38_index(ch).unwrap_or(0) as u64;
         value = value.wrapping_mul(38).wrapping_add(digit);
     }
     value

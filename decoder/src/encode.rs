@@ -13,7 +13,9 @@ use crate::modes::populate_channel_symbols;
 use crate::protocol::{
     CALL_NTOKENS, CALL_STANDARD_BASE, FTX_CODEWORD_BITS, FTX_DATA_SYMBOLS, FTX_INFO_BITS,
     FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_STANDARD_SLASH_R,
-    FTX_NONSTANDARD_LAYOUT, FTX_STANDARD_LAYOUT, GRAY_TONES_TO_BITS,
+    FTX_NONSTANDARD_LAYOUT, FTX_STANDARD_LAYOUT, alphabet27_index, alphabet36_index,
+    alphabet37_index, alphabet38_index, digit10_index, gray_decode_tone3, gray_encode_3bits,
+    write_bit_field,
 };
 use crate::wave::{AudioBuffer, DecoderError, write_wav};
 
@@ -69,46 +71,31 @@ pub fn encode_standard_message(
     info: &GridReport,
 ) -> Result<EncodedFrame, EncodeError> {
     let mut message_bits = [0u8; MESSAGE_BITS];
-    write_bits(
+    write_bit_field(
         &mut message_bits,
-        FTX_STANDARD_LAYOUT.first_call.start,
-        FTX_STANDARD_LAYOUT.first_call.len,
+        FTX_STANDARD_LAYOUT.first_call,
         u64::from(encode_c28(first)?),
     );
-    write_bits(
+    write_bit_field(&mut message_bits, FTX_STANDARD_LAYOUT.first_suffix, 0);
+    write_bit_field(
         &mut message_bits,
-        FTX_STANDARD_LAYOUT.first_suffix.start,
-        FTX_STANDARD_LAYOUT.first_suffix.len,
-        0,
-    );
-    write_bits(
-        &mut message_bits,
-        FTX_STANDARD_LAYOUT.second_call.start,
-        FTX_STANDARD_LAYOUT.second_call.len,
+        FTX_STANDARD_LAYOUT.second_call,
         u64::from(encode_c28(second)?),
     );
-    write_bits(
+    write_bit_field(&mut message_bits, FTX_STANDARD_LAYOUT.second_suffix, 0);
+    write_bit_field(
         &mut message_bits,
-        FTX_STANDARD_LAYOUT.second_suffix.start,
-        FTX_STANDARD_LAYOUT.second_suffix.len,
-        0,
-    );
-    write_bits(
-        &mut message_bits,
-        FTX_STANDARD_LAYOUT.acknowledge.start,
-        FTX_STANDARD_LAYOUT.acknowledge.len,
+        FTX_STANDARD_LAYOUT.acknowledge,
         acknowledge as u64,
     );
-    write_bits(
+    write_bit_field(
         &mut message_bits,
-        FTX_STANDARD_LAYOUT.info.start,
-        FTX_STANDARD_LAYOUT.info.len,
+        FTX_STANDARD_LAYOUT.info,
         u64::from(encode_g15(info)?),
     );
-    write_bits(
+    write_bit_field(
         &mut message_bits,
-        FTX_STANDARD_LAYOUT.kind.start,
-        FTX_STANDARD_LAYOUT.kind.len,
+        FTX_STANDARD_LAYOUT.kind,
         u64::from(FTX_MESSAGE_KIND_STANDARD_SLASH_R),
     );
     build_frame(message_bits)
@@ -122,40 +109,30 @@ pub fn encode_nonstandard_message(
     cq: bool,
 ) -> Result<EncodedFrame, EncodeError> {
     let mut message_bits = [0u8; MESSAGE_BITS];
-    write_bits(
+    write_bit_field(
         &mut message_bits,
-        FTX_NONSTANDARD_LAYOUT.hashed_call.start,
-        FTX_NONSTANDARD_LAYOUT.hashed_call.len,
+        FTX_NONSTANDARD_LAYOUT.hashed_call,
         hash_callsign(&hashed_callsign.trim().to_uppercase(), 12),
     );
-    write_bits(
+    write_bit_field(
         &mut message_bits,
-        FTX_NONSTANDARD_LAYOUT.plain_call.start,
-        FTX_NONSTANDARD_LAYOUT.plain_call.len,
+        FTX_NONSTANDARD_LAYOUT.plain_call,
         encode_c58(plain_callsign)? as u64,
     );
-    write_bits(
+    write_bit_field(
         &mut message_bits,
-        FTX_NONSTANDARD_LAYOUT.hashed_is_second.start,
-        FTX_NONSTANDARD_LAYOUT.hashed_is_second.len,
+        FTX_NONSTANDARD_LAYOUT.hashed_is_second,
         hashed_is_second as u64,
     );
-    write_bits(
+    write_bit_field(
         &mut message_bits,
-        FTX_NONSTANDARD_LAYOUT.reply.start,
-        FTX_NONSTANDARD_LAYOUT.reply.len,
+        FTX_NONSTANDARD_LAYOUT.reply,
         encode_r2(reply) as u64,
     );
-    write_bits(
+    write_bit_field(&mut message_bits, FTX_NONSTANDARD_LAYOUT.cq, cq as u64);
+    write_bit_field(
         &mut message_bits,
-        FTX_NONSTANDARD_LAYOUT.cq.start,
-        FTX_NONSTANDARD_LAYOUT.cq.len,
-        cq as u64,
-    );
-    write_bits(
-        &mut message_bits,
-        FTX_NONSTANDARD_LAYOUT.kind.start,
-        FTX_NONSTANDARD_LAYOUT.kind.len,
+        FTX_NONSTANDARD_LAYOUT.kind,
         u64::from(FTX_MESSAGE_KIND_NONSTANDARD),
     );
     build_frame(message_bits)
@@ -201,7 +178,7 @@ pub fn synthesize_rectangular_waveform(
 ) -> Result<AudioBuffer, EncodeError> {
     let total_samples = (options.total_seconds * FT8_SAMPLE_RATE as f32).round() as usize;
     let start_sample = (options.start_seconds * FT8_SAMPLE_RATE as f32).round() as usize;
-    let frame_samples = FT8_MESSAGE_SYMBOLS * FT8_SYMBOL_SAMPLES;
+    let frame_samples = FT8_GEOMETRY.frame_samples();
     if start_sample + frame_samples > total_samples {
         return Err(EncodeError::WaveformTooShort);
     }
@@ -475,7 +452,7 @@ fn encode_packed_standard_callsign(callsign: &str) -> Option<u32> {
 
     let i1 = alphabet37_index(padded[0])?;
     let i2 = alphabet36_index(padded[1])?;
-    let i3 = digit_index_10(padded[2])?;
+    let i3 = digit10_index(padded[2])?;
     let i4 = alphabet27_index(padded[3])?;
     let i5 = alphabet27_index(padded[4])?;
     let i6 = alphabet27_index(padded[5])?;
@@ -516,7 +493,6 @@ fn encode_r2(reply: ReplyWord) -> u8 {
 }
 
 fn encode_c58(text: &str) -> Result<u128, EncodeError> {
-    let alphabet: Vec<char> = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/".chars().collect();
     let mut normalized = text.trim().to_uppercase();
     if normalized.len() > 11 {
         return Err(EncodeError::UnsupportedCallsign(text.to_string()));
@@ -526,9 +502,7 @@ fn encode_c58(text: &str) -> Result<u128, EncodeError> {
     }
     let mut value = 0u128;
     for ch in normalized.chars() {
-        let digit = alphabet
-            .iter()
-            .position(|candidate| *candidate == ch)
+        let digit = alphabet38_index(ch)
             .ok_or_else(|| EncodeError::UnsupportedCallsign(text.to_string()))?
             as u128;
         value = value * 38 + digit;
@@ -537,17 +511,10 @@ fn encode_c58(text: &str) -> Result<u128, EncodeError> {
 }
 
 fn bits_to_tone(bits: &[u8]) -> u8 {
-    GRAY_TONES_TO_BITS
-        .iter()
-        .position(|candidate| candidate.as_slice() == bits)
-        .expect("valid Gray triad") as u8
-}
-
-fn write_bits(bits: &mut [u8], start: usize, len: usize, value: u64) {
-    for bit_index in 0..len {
-        let shift = len - 1 - bit_index;
-        bits[start + bit_index] = ((value >> shift) & 1) as u8;
-    }
+    let triad = [bits[0], bits[1], bits[2]];
+    let tone = gray_encode_3bits(triad);
+    debug_assert_eq!(gray_decode_tone3(tone), triad);
+    tone
 }
 
 fn is_grid4(grid: &str) -> bool {
@@ -557,34 +524,6 @@ fn is_grid4(grid: &str) -> bool {
         && matches!(bytes[1], b'A'..=b'R')
         && bytes[2].is_ascii_digit()
         && bytes[3].is_ascii_digit()
-}
-
-fn alphabet37_index(ch: char) -> Option<u32> {
-    " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        .chars()
-        .position(|candidate| candidate == ch)
-        .map(|index| index as u32)
-}
-
-fn alphabet36_index(ch: char) -> Option<u32> {
-    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        .chars()
-        .position(|candidate| candidate == ch)
-        .map(|index| index as u32)
-}
-
-fn digit_index_10(ch: char) -> Option<u32> {
-    "0123456789"
-        .chars()
-        .position(|candidate| candidate == ch)
-        .map(|index| index as u32)
-}
-
-fn alphabet27_index(ch: char) -> Option<u32> {
-    " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        .chars()
-        .position(|candidate| candidate == ch)
-        .map(|index| index as u32)
 }
 
 #[cfg(test)]

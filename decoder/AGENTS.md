@@ -28,6 +28,31 @@
   - `deepest` against WSJT-X deepest semantics
   - `unlimited` against the best available reference, without compatibility constraints
 
+## Decoder Code Contract
+
+### Do
+
+- Route geometry, layout, and timing semantics through `ModeSpec`, `FrameGeometry`, and shared layout helpers instead of scattering literals through decoder code.
+- Keep internal indexing zero-based. If an external paper or reference algorithm is 1-based, translate it once at the boundary and keep the rest of the code zero-based.
+- Confine raw slice/index math to small named helpers or hot numeric kernels. Orchestration code should work in terms of named fields, windows, and typed geometry.
+- Add derived constants or helpers when a protocol shape matters. Examples: symbol-group starts, bit-field ranges, valid baseband windows, taper reach, and sync spans.
+- Prefer named conversion helpers over arrays or maps as the public face of an algorithm. Tables are fine internally, but callers should use `gray_*`, `alphabet_*`, `read_bit_field`, or similar helpers.
+- Preserve computation order in numeric kernels unless parity and performance are both revalidated.
+- Run `cargo test`, `cargo build --release`, and the full `medium` regression after each material decoder cleanup.
+
+### Don't
+
+- Don’t add direct `FT8_` references to shared decoder submodules. FT8-specific constants belong in the FT8 mode definition or FT8 wrapper layer.
+- Don’t add raw FT8 timing arithmetic like `dt + 0.5`, `start - 0.5`, or coarse-lag half-step math outside mode/helper code.
+- Don’t duplicate message, codeword, or channel-symbol layout logic across encode, decode, and message-render paths.
+- Don’t rewrite hot DSP, LDPC, subtraction, or FFT loops into iterator-heavy forms just for style. Keep hot loops explicit when that is the clearest and safest representation of the computation.
+
+## Future Modes
+
+- Future FT4 or FT2 support should start by adding a new mode spec, mode tuning, and wrapper entrypoints.
+- Shared decoder kernels should remain mode-parameterized and must not assume FT8 symbol counts, stage counts, Costas block locations, or hardcoded bit offsets.
+- If a future mode needs new machinery, add it behind the mode boundary rather than re-entangling shared decoder modules with FT8-specific assumptions.
+
 ## Investigation Notes
 
 - Prefer corpus-level A/B runs over intuition. Several plausible-looking changes were neutral or harmful, and the harness results made that obvious quickly.

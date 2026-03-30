@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+struct OverlapWindow {
+    reference_start: usize,
+    signal_start: usize,
+    len: usize,
+}
+
 pub(super) fn subtract_candidate(
     audio: &mut AudioBuffer,
     success: &SuccessfulDecode,
@@ -45,6 +52,8 @@ pub(super) fn refined_subtraction_offset(
     let sq0 = subtraction_residual_band_power(audio, reference, freq_hz, start_sample, plan);
     let sqp =
         subtraction_residual_band_power(audio, reference, freq_hz, start_sample + probe_step, plan);
+    // Fit a parabola through the residual power at -step / 0 / +step and keep the sub-sample
+    // offset only when the quadratic minimum falls inside that probe window.
     let b = (sqp - sqm) * 0.5;
     let c = (sqp + sqm - 2.0 * sq0) * 0.5;
     if c == 0.0 {
@@ -57,6 +66,39 @@ pub(super) fn refined_subtraction_offset(
     Some((probe_step as f32 * dx).round() as isize)
 }
 
+fn overlapping_window(
+    start_sample: isize,
+    reference_len: usize,
+    signal_len: usize,
+) -> Option<OverlapWindow> {
+    // Convert an arbitrary signed start sample into aligned slices over the reference
+    // waveform and the available audio window without duplicating offset arithmetic.
+    let reference_start = if start_sample < 0 {
+        (-start_sample) as usize
+    } else {
+        0
+    };
+    let signal_start = start_sample.max(0) as usize;
+    let len = reference_len
+        .saturating_sub(reference_start)
+        .min(signal_len.saturating_sub(signal_start));
+    (len > 0).then_some(OverlapWindow {
+        reference_start,
+        signal_start,
+        len,
+    })
+}
+
+fn edge_correction(plan: &SubtractionPlan, frame_len: usize, offset: usize) -> f32 {
+    // Compensate for the truncated subtraction filter near the beginning and end of the overlap.
+    let edge = offset.min(frame_len - 1 - offset);
+    if edge < plan.edge_correction.len() {
+        plan.edge_correction[edge]
+    } else {
+        1.0
+    }
+}
+
 pub(super) fn subtraction_residual_band_power(
     audio: &AudioBuffer,
     reference: &[Complex32],
@@ -66,13 +108,18 @@ pub(super) fn subtraction_residual_band_power(
 ) -> f32 {
     let mut residual = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
     let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
-    for offset in 0..reference.len() {
-        let index = start_sample + offset as isize;
-        if index < 0 || index as usize >= audio.samples.len() {
-            continue;
+    if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
+        let residual_window = &mut residual[window.reference_start..window.reference_start + window.len];
+        let envelope_window = &envelope[window.reference_start..window.reference_start + window.len];
+        let reference_window = &reference[window.reference_start..window.reference_start + window.len];
+        let audio_window = &audio.samples[window.signal_start..window.signal_start + window.len];
+        for (residual_slot, ((&sample, &envelope_value), &reference_value)) in residual_window
+            .iter_mut()
+            .zip(audio_window.iter().zip(envelope_window.iter()).zip(reference_window.iter()))
+        {
+            let corrected = envelope_value * reference_value;
+            *residual_slot = Complex32::new(sample - 2.0 * corrected.re, 0.0);
         }
-        let corrected = envelope[offset] * reference[offset];
-        residual[offset] = Complex32::new(audio.samples[index as usize] - 2.0 * corrected.re, 0.0);
     }
     plan.forward.process(&mut residual);
     let df = ACTIVE_MODE.geometry.sample_rate_hz as f32 / LONG_INPUT_SAMPLES as f32;
@@ -93,12 +140,16 @@ pub(super) fn filtered_subtraction_envelope(
     plan: &SubtractionPlan,
 ) -> Vec<Complex32> {
     let mut envelope = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
-    for (offset, sample) in reference.iter().enumerate() {
-        let index = start_sample + offset as isize;
-        if index < 0 || index as usize >= audio.samples.len() {
-            continue;
+    if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
+        let envelope_window = &mut envelope[window.reference_start..window.reference_start + window.len];
+        let reference_window = &reference[window.reference_start..window.reference_start + window.len];
+        let audio_window = &audio.samples[window.signal_start..window.signal_start + window.len];
+        for (slot, (&reference_value, &audio_sample)) in envelope_window
+            .iter_mut()
+            .zip(reference_window.iter().zip(audio_window.iter()))
+        {
+            *slot = reference_value.conj() * audio_sample;
         }
-        envelope[offset] = sample.conj() * audio.samples[index as usize];
     }
 
     plan.forward.process(&mut envelope);
@@ -122,19 +173,19 @@ pub(super) fn apply_subtraction(
 ) {
     let frame_len = reference.len();
     let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
-    for offset in 0..frame_len {
-        let index = start_sample + offset as isize;
-        if index < 0 || index as usize >= audio.samples.len() {
-            continue;
+    if let Some(window) = overlapping_window(start_sample, frame_len, audio.samples.len()) {
+        let audio_window = &mut audio.samples[window.signal_start..window.signal_start + window.len];
+        let envelope_window = &envelope[window.reference_start..window.reference_start + window.len];
+        let reference_window = &reference[window.reference_start..window.reference_start + window.len];
+        for (local_offset, (audio_sample, (&envelope_value, &reference_value))) in audio_window
+            .iter_mut()
+            .zip(envelope_window.iter().zip(reference_window.iter()))
+            .enumerate()
+        {
+            let global_offset = window.reference_start + local_offset;
+            let coeff = envelope_value * edge_correction(plan, frame_len, global_offset);
+            *audio_sample -= 2.0 * (coeff * reference_value).re;
         }
-        let edge = offset.min(frame_len - 1 - offset);
-        let correction = if edge < plan.edge_correction.len() {
-            plan.edge_correction[edge]
-        } else {
-            1.0
-        };
-        let coeff = envelope[offset] * correction;
-        audio.samples[index as usize] -= 2.0 * (coeff * reference[offset]).re;
     }
 }
 

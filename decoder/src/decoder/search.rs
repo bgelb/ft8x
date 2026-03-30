@@ -1,10 +1,11 @@
 use super::*;
 
 pub(super) fn search_grid(audio: &AudioBuffer, options: &DecodeOptions) -> SearchGrid {
-    let geometry = &ACTIVE_MODE.geometry;
+    let spec = &ACTIVE_MODE;
+    let geometry = &spec.geometry;
     let min_bin = (options.min_freq_hz / geometry.tone_spacing_hz).floor().max(0.0) as usize;
     let max_bin =
-        (options.max_freq_hz / geometry.tone_spacing_hz).ceil() as usize + geometry.costas_pattern.len();
+        (options.max_freq_hz / geometry.tone_spacing_hz).ceil() as usize + spec.sync_tone_span_bins();
     SearchGrid {
         frame_count: (audio.samples.len().saturating_sub(geometry.symbol_samples) / geometry.hop_samples)
             + 1,
@@ -26,6 +27,7 @@ pub(super) fn build_spectrogram(audio: &AudioBuffer, options: &DecodeOptions) ->
     let mut input = fft.make_input_vec();
     let mut spectrum = fft.make_output_vec();
 
+    // Standard Hann window over one symbol before the per-hop FFT.
     let window: Vec<f32> = (0..geometry.symbol_samples)
         .map(|index| {
             let phase = 2.0 * std::f32::consts::PI * index as f32
@@ -107,7 +109,7 @@ pub(super) fn collect_candidates(
 
     let mut primary = Vec::with_capacity(max_bin - min_bin + 1);
     let mut secondary = Vec::with_capacity(max_bin - min_bin + 1);
-    let nominal_start = (tuning.nominal_start_seconds / sync_step_seconds) as isize;
+    let nominal_start = spec.nominal_start_sync_lag();
 
     for bin in min_bin..=max_bin {
         let mut best_local = (f32::NEG_INFINITY, 0isize);
@@ -133,9 +135,9 @@ pub(super) fn collect_candidates(
     let mut raw = Vec::<DecodeCandidate>::new();
     for &(bin, lag, score) in &primary {
         if score >= sync_threshold && score.is_finite() {
-            let dt_seconds = (lag as f32 - 0.5) * sync_step_seconds;
+            let dt_seconds = spec.candidate_dt_seconds_from_lag(lag);
             raw.push(DecodeCandidate {
-                start_seconds: dt_seconds + 0.5,
+                start_seconds: spec.candidate_start_seconds_from_lag(lag),
                 dt_seconds,
                 freq_hz: bin as f32 * sync_bin_hz,
                 score,
@@ -149,9 +151,9 @@ pub(super) fn collect_candidates(
                 .iter()
                 .any(|&(b, local_lag, _)| b == bin && local_lag == lag)
         {
-            let dt_seconds = (lag as f32 - 0.5) * sync_step_seconds;
+            let dt_seconds = spec.candidate_dt_seconds_from_lag(lag);
             raw.push(DecodeCandidate {
-                start_seconds: dt_seconds + 0.5,
+                start_seconds: spec.candidate_start_seconds_from_lag(lag),
                 dt_seconds,
                 freq_hz: bin as f32 * sync_bin_hz,
                 score,
@@ -210,8 +212,9 @@ pub(super) fn collect_candidates_legacy(
     audio: &AudioBuffer,
     options: &DecodeOptions,
 ) -> Vec<DecodeCandidate> {
-    let geometry = &ACTIVE_MODE.geometry;
-    let tuning = &ACTIVE_MODE.tuning;
+    let spec = &ACTIVE_MODE;
+    let geometry = &spec.geometry;
+    let tuning = &spec.tuning;
     let hops_per_symbol = geometry.hops_per_symbol();
     let spectrogram = build_spectrogram(audio, options);
     let costas = all_costas_positions(geometry);
@@ -238,9 +241,10 @@ pub(super) fn collect_candidates_legacy(
                 raw.push(DecodeCandidate {
                     start_seconds: start_frame as f32 * geometry.hop_samples as f32
                         / geometry.sample_rate_hz as f32,
-                    dt_seconds: start_frame as f32 * geometry.hop_samples as f32
-                        / geometry.sample_rate_hz as f32
-                        - 0.5,
+                    dt_seconds: spec.dt_seconds_from_start(
+                        start_frame as f32 * geometry.hop_samples as f32
+                            / geometry.sample_rate_hz as f32,
+                    ),
                     freq_hz: (spectrogram.min_bin + base) as f32 * geometry.tone_spacing_hz,
                     score,
                 });
@@ -326,7 +330,7 @@ pub(super) fn sync8_score(
 }
 
 pub(super) fn ratio_sync_score(signal: f32, band_total: f32) -> f32 {
-    let noise = (band_total - signal) / 6.0;
+    let noise = (band_total - signal) / (ACTIVE_MODE.sync_tone_span_bins() - 1) as f32;
     if noise > 0.0 { signal / noise } else { 0.0 }
 }
 
@@ -340,8 +344,11 @@ pub(super) fn normalize_sync_scores(scores: &mut [(usize, isize, f32)]) {
         return;
     }
     values.sort_by(|left, right| left.total_cmp(right));
-    let percentile = ((values.len() as f32 * 0.40).round() as usize).clamp(1, values.len()) - 1;
-    let baseline = values[percentile].max(1e-6);
+    let percentile = ((values.len() as f32 * ACTIVE_MODE.tuning.sync_baseline_percentile).round()
+        as usize)
+        .clamp(1, values.len())
+        - 1;
+    let baseline = values[percentile].max(ACTIVE_MODE.tuning.sync_baseline_floor);
     for (_, _, score) in scores.iter_mut() {
         *score /= baseline;
     }

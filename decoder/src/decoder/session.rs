@@ -21,7 +21,7 @@ impl DecoderSession {
         validate_audio(audio)?;
 
         let mut updates = Vec::new();
-        for stage in [DecodeStage::Early41, DecodeStage::Early47, DecodeStage::Full] {
+        for stage in DecodeStage::ordered() {
             if self.emitted_stages.contains(&stage) {
                 continue;
             }
@@ -44,7 +44,7 @@ impl DecoderSession {
 
         let mut updates = Vec::new();
         let mut current_state = state.cloned();
-        for stage in [DecodeStage::Early41, DecodeStage::Early47, DecodeStage::Full] {
+        for stage in DecodeStage::ordered() {
             if self.emitted_stages.contains(&stage) {
                 continue;
             }
@@ -440,7 +440,6 @@ pub(super) fn run_decode_search(
 
     SearchResult {
         successes,
-        residual_audio,
         frame_count,
         usable_bins,
         top_candidates,
@@ -525,7 +524,7 @@ pub(super) fn try_refined_candidate(
             codeword_bits: bits,
             candidate: DecodeCandidate {
                 start_seconds: refined.start_seconds,
-                dt_seconds: refined.start_seconds - 0.5,
+                dt_seconds: ACTIVE_MODE.dt_seconds_from_start(refined.start_seconds),
                 freq_hz: refined.freq_hz,
                 score: refined.sync_score.max(candidate_score),
             },
@@ -551,7 +550,7 @@ pub(super) fn try_refined_candidate(
                         codeword_bits: bits,
                         candidate: DecodeCandidate {
                             start_seconds: refined.start_seconds,
-                            dt_seconds: refined.start_seconds - 0.5,
+                            dt_seconds: ACTIVE_MODE.dt_seconds_from_start(refined.start_seconds),
                             freq_hz: refined.freq_hz,
                             score: refined.sync_score.max(candidate_score),
                         },
@@ -586,7 +585,7 @@ mod tests {
                 payload,
                 codeword_bits: frame.codeword_bits.to_vec(),
                 candidate: DecodeCandidate {
-                    start_seconds: 0.5,
+                    start_seconds: ACTIVE_MODE.nominal_start_seconds(),
                     dt_seconds: 0.0,
                     freq_hz: 1_200.0,
                     score: 1.0,
