@@ -35,6 +35,7 @@ const WEB_BIND_DEFAULT: &str = "127.0.0.1:8000";
 const BANDMAP_COLUMNS: usize = 15;
 const BANDMAP_ROWS: usize = 4;
 const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
+const DT_HISTORY_FRAMES: usize = 40;
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8rx")]
@@ -118,7 +119,9 @@ struct WebSnapshot {
     rig_mode: String,
     rig_band: String,
     decode_status: String,
+    audio_stats: WebAudioStats,
     decode_times: WebDecodeTimes,
+    dt_stats: WebDtStats,
     current_slot: String,
     last_done_slot: Option<String>,
     decodes: Vec<WebDecodeRow>,
@@ -127,11 +130,32 @@ struct WebSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+struct WebAudioStats {
+    latest_sample: Option<String>,
+    selected_channel: usize,
+    overall_dbfs: f32,
+    left_dbfs: f32,
+    right_dbfs: f32,
+    recoveries: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 struct WebDecodeTimes {
     early_seconds: Option<f32>,
     mid_seconds: Option<f32>,
     late_seconds: Option<f32>,
     tx_margin_seconds: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct WebDtStats {
+    current_mean_seconds: Option<f32>,
+    current_median_seconds: Option<f32>,
+    current_stddev_seconds: Option<f32>,
+    current_count: usize,
+    ten_minute_mean_seconds: Option<f32>,
+    ten_minute_median_seconds: Option<f32>,
+    ten_minute_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -376,9 +400,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="status-grid">
         <div><div class="label">UTC</div><div class="value" id="time"></div></div>
         <div><div class="label">Rig</div><div class="value small" id="rig"></div></div>
+        <div><div class="label">Audio</div><div class="value small" id="audio"></div></div>
         <div><div class="label">Status</div><div class="value small" id="status"></div></div>
         <div><div class="label">Slot</div><div class="value small" id="slot"></div></div>
         <div><div class="label">Decode</div><div class="value small" id="times"></div></div>
+        <div><div class="label">dT</div><div class="value small" id="dtstats"></div></div>
         <div><div class="label">Decodes</div><div class="value small" id="count"></div></div>
       </div>
     </section>
@@ -534,11 +560,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById('time').textContent = data.time_utc || '-';
       const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(3)} MHz`;
       document.getElementById('rig').textContent = `${freq}  ${data.rig_mode}  ${data.rig_band}`;
+      document.getElementById('audio').textContent =
+        `latest=${data.audio_stats.latest_sample ?? '-'}  ch=${data.audio_stats.selected_channel}  L=${data.audio_stats.left_dbfs.toFixed(1)}  R=${data.audio_stats.right_dbfs.toFixed(1)}  all=${data.audio_stats.overall_dbfs.toFixed(1)} dBFS  rec=${data.audio_stats.recoveries}`;
       document.getElementById('status').textContent = data.decode_status || '-';
       document.getElementById('slot').textContent =
         `${data.current_slot}${data.last_done_slot ? `  last=${data.last_done_slot}` : ''}`;
       document.getElementById('times').textContent =
         `early=${fmtSec(data.decode_times.early_seconds)}  mid=${fmtSec(data.decode_times.mid_seconds)}  late=${fmtSec(data.decode_times.late_seconds)}  tx_margin=${fmtSec(data.decode_times.tx_margin_seconds)}`;
+      document.getElementById('dtstats').textContent =
+        `cur avg=${fmtSec(data.dt_stats.current_mean_seconds)}  med=${fmtSec(data.dt_stats.current_median_seconds)}  std=${fmtSec(data.dt_stats.current_stddev_seconds)}  n=${data.dt_stats.current_count}  10m avg=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}  med=${fmtSec(data.dt_stats.ten_minute_median_seconds)}  n=${data.dt_stats.ten_minute_count}`;
       document.getElementById('count').textContent = `${data.decodes.length} visible`;
       renderWaterfall(data.waterfall);
       renderBandMap('even-map', data.bandmaps.even);
@@ -677,6 +707,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let mut last_waterfall_update = UNIX_EPOCH;
     let mut last_waterfall_sample_time = UNIX_EPOCH;
     let mut bandmaps = BandMapStore::default();
+    let mut dt_frame_history = VecDeque::<Vec<DecodedMessage>>::with_capacity(DT_HISTORY_FRAMES);
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
@@ -721,6 +752,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     display.full_wall_ms = Some(wall_ms);
                                     display.last_decode_wall_ms = Some(wall_ms);
                                     display.full_decodes = update.report.decodes.clone();
+                                    if dt_frame_history.len() == DT_HISTORY_FRAMES {
+                                        dt_frame_history.pop_front();
+                                    }
+                                    dt_frame_history.push_back(display.full_decodes.clone());
                                     update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
                                 }
                             }
@@ -853,7 +888,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             display.dropped_slots,
             capture.config().sample_rate_hz,
         );
-        refresh_web_snapshot(&web_snapshot, &display, &waterfall_rows, &bandmaps);
+        refresh_web_snapshot(
+            &web_snapshot,
+            &display,
+            &waterfall_rows,
+            &bandmaps,
+            &dt_frame_history,
+        );
         render(&display);
         thread::sleep(Duration::from_millis(50));
     }
@@ -867,10 +908,14 @@ fn refresh_web_snapshot(
     display: &DisplayState,
     waterfall_rows: &VecDeque<Vec<u8>>,
     bandmaps: &BandMapStore,
+    dt_frame_history: &VecDeque<Vec<DecodedMessage>>,
 ) {
     let now = SystemTime::now();
     let current_slot = current_slot_boundary(now);
     let composite = composite_rows(display);
+    let preferred_decodes = preferred_stage_decodes(display);
+    let current_dt_stats = summarize_dt(preferred_decodes);
+    let ten_minute_dt_stats = summarize_dt_history(dt_frame_history);
     let decodes = composite
         .into_iter()
         .map(|row| {
@@ -907,11 +952,28 @@ fn refresh_web_snapshot(
         .map(|state| state.band.to_string())
         .unwrap_or_else(|| "unavailable".to_string());
     guard.decode_status = display.decode_status.clone();
+    guard.audio_stats = WebAudioStats {
+        latest_sample: display.capture_latest_sample_time.map(format_slot_time),
+        selected_channel: display.capture_channel,
+        overall_dbfs: display.capture_rms_dbfs,
+        left_dbfs: display.capture_channel_rms_dbfs.first().copied().unwrap_or(-120.0),
+        right_dbfs: display.capture_channel_rms_dbfs.get(1).copied().unwrap_or(-120.0),
+        recoveries: display.capture_recoveries,
+    };
     guard.decode_times = WebDecodeTimes {
         early_seconds: display.early41_wall_ms.map(ms_to_seconds),
         mid_seconds: display.early47_wall_ms.map(ms_to_seconds),
         late_seconds: display.full_wall_ms.map(ms_to_seconds),
         tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+    };
+    guard.dt_stats = WebDtStats {
+        current_mean_seconds: current_dt_stats.mean,
+        current_median_seconds: current_dt_stats.median,
+        current_stddev_seconds: current_dt_stats.stddev,
+        current_count: current_dt_stats.count,
+        ten_minute_mean_seconds: ten_minute_dt_stats.mean,
+        ten_minute_median_seconds: ten_minute_dt_stats.median,
+        ten_minute_count: ten_minute_dt_stats.count,
     };
     guard.current_slot = format_slot_time(current_slot);
     guard.last_done_slot = display.last_slot_start.map(format_slot_time);
@@ -1215,10 +1277,11 @@ fn render(display: &DisplayState) {
     );
     let _ = writeln!(
         output,
-        "dT stats avg={:+.2}s stddev={:.2}s count={}",
-        dt_stats.0,
-        dt_stats.1,
-        display_decodes.len()
+        "dT stats avg={:+.2}s med={:+.2}s stddev={:.2}s count={}",
+        dt_stats.mean.unwrap_or(0.0),
+        dt_stats.median.unwrap_or(0.0),
+        dt_stats.stddev.unwrap_or(0.0),
+        dt_stats.count
     );
     let _ = writeln!(output);
     let _ = writeln!(
@@ -1248,20 +1311,57 @@ fn render(display: &DisplayState) {
     print!("{output}");
 }
 
-fn summarize_dt(decodes: &[DecodedMessage]) -> (f32, f32) {
+#[derive(Debug, Clone, Copy, Default)]
+struct DtSummary {
+    mean: Option<f32>,
+    median: Option<f32>,
+    stddev: Option<f32>,
+    count: usize,
+}
+
+fn summarize_dt(decodes: &[DecodedMessage]) -> DtSummary {
     if decodes.is_empty() {
-        return (0.0, 0.0);
+        return DtSummary::default();
     }
-    let mean = decodes.iter().map(|decode| decode.dt_seconds).sum::<f32>() / decodes.len() as f32;
-    let variance = decodes
+    let values: Vec<f32> = decodes.iter().map(|decode| decode.dt_seconds).collect();
+    summarize_dt_values(&values)
+}
+
+fn summarize_dt_history(frame_history: &VecDeque<Vec<DecodedMessage>>) -> DtSummary {
+    let values = frame_history
         .iter()
-        .map(|decode| {
-            let delta = decode.dt_seconds - mean;
+        .flat_map(|frame| frame.iter().map(|decode| decode.dt_seconds))
+        .collect::<Vec<_>>();
+    summarize_dt_values(&values)
+}
+
+fn summarize_dt_values(values: &[f32]) -> DtSummary {
+    if values.is_empty() {
+        return DtSummary::default();
+    }
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = *value - mean;
             delta * delta
         })
         .sum::<f32>()
-        / decodes.len() as f32;
-    (mean, variance.sqrt())
+        / values.len() as f32;
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let median = if sorted.len() % 2 == 1 {
+        sorted[sorted.len() / 2]
+    } else {
+        let upper = sorted.len() / 2;
+        (sorted[upper - 1] + sorted[upper]) * 0.5
+    };
+    DtSummary {
+        mean: Some(mean),
+        median: Some(median),
+        stddev: Some(variance.sqrt()),
+        count: values.len(),
+    }
 }
 
 fn format_wall_time(wall_ms: Option<u128>) -> String {
