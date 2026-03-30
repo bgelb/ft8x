@@ -6,8 +6,8 @@ use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use ft8_decoder::{
     AudioBuffer, CallModifier, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage,
-    DecoderSession, DecoderState, MessageCallField, StageDecodeReport, StructuredCallField,
-    StructuredCallValue, StructuredInfoField, StructuredInfoValue, StructuredMessage,
+    DecoderSession, DecoderState, StageDecodeReport, StructuredCallField, StructuredCallValue,
+    StructuredInfoField, StructuredInfoValue, StructuredMessage,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
@@ -15,7 +15,7 @@ use rigctl::{K3s, K3sConfig, RigState, detect_k3s_audio_device};
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ const BANDMAP_COLUMNS: usize = 15;
 const BANDMAP_ROWS: usize = 4;
 const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
 const DT_HISTORY_FRAMES: usize = 40;
+const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8rx")]
@@ -127,6 +128,8 @@ struct WebSnapshot {
     decodes: Vec<WebDecodeRow>,
     waterfall: Vec<Vec<u8>>,
     bandmaps: WebBandMaps,
+    stations: Vec<WebStationSummary>,
+    station_logs: Vec<WebStationLog>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -167,7 +170,9 @@ struct WebDecodeRow {
     freq_hz: f32,
     kind: String,
     field1: String,
+    field1_select_call: Option<String>,
     field2: String,
+    field2_select_call: Option<String>,
     info: String,
     text: String,
 }
@@ -183,6 +188,105 @@ struct WebBandMapCall {
     callsign: String,
     detail: Option<String>,
     age_slots: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebStationSummary {
+    callsign: String,
+    last_heard_at: String,
+    is_in_qso: bool,
+    in_qso_since: Option<String>,
+    qso_with: Option<String>,
+    last_qso_ended_at: Option<String>,
+    qso_history: Vec<WebCompletedQso>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebCompletedQso {
+    started_at: String,
+    ended_at: String,
+    peer: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebStationLog {
+    timestamp: String,
+    sender_call: String,
+    peer_before: Option<String>,
+    peer_after: Option<String>,
+    related_calls: Vec<String>,
+    snr_db: i32,
+    dt_seconds: f32,
+    freq_hz: f32,
+    kind: String,
+    field1: String,
+    field2: String,
+    info: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct StationTracker {
+    stations: BTreeMap<String, StationState>,
+    logs: VecDeque<LoggedDecode>,
+    hash12_resolutions: BTreeMap<u16, String>,
+    hash22_resolutions: BTreeMap<u32, String>,
+}
+
+#[derive(Debug, Clone)]
+struct StationState {
+    last_heard_at: SystemTime,
+    active_qso: Option<ActiveQso>,
+    last_qso_ended_at: Option<SystemTime>,
+    qso_history: Vec<CompletedQso>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveQso {
+    since: SystemTime,
+    peer: PeerRef,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedQso {
+    started_at: SystemTime,
+    ended_at: SystemTime,
+    peer: PeerRef,
+}
+
+#[derive(Debug, Clone)]
+enum PeerRef {
+    Callsign(String),
+    Hash12(u16),
+    Hash22(u32),
+}
+
+#[derive(Debug, Clone)]
+struct LoggedDecode {
+    received_at: SystemTime,
+    sender_call: String,
+    peer_before: Option<PeerRef>,
+    peer_after: Option<PeerRef>,
+    related_calls: Vec<String>,
+    snr_db: i32,
+    dt_seconds: f32,
+    freq_hz: f32,
+    kind: String,
+    field1: String,
+    field2: String,
+    info: String,
+    text: String,
+}
+
+impl Default for StationTracker {
+    fn default() -> Self {
+        Self {
+            stations: BTreeMap::new(),
+            logs: VecDeque::new(),
+            hash12_resolutions: BTreeMap::new(),
+            hash22_resolutions: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -289,6 +393,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       margin: 0;
       padding: 18px;
     }
+    .top-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(320px, 0.9fr);
+      gap: 18px;
+      align-items: start;
+    }
+    .top-main {
+      display: grid;
+      gap: 18px;
+    }
     .panel {
       background: rgba(13, 29, 41, 0.95);
       border: 1px solid rgba(143, 176, 192, 0.16);
@@ -389,32 +503,97 @@ const INDEX_HTML: &str = r#"<!doctype html>
       font-size: 13px;
       margin-top: 8px;
     }
+    .pickable {
+      color: var(--accent);
+      cursor: pointer;
+      text-decoration: underline;
+      text-decoration-color: rgba(106, 211, 255, 0.35);
+      text-underline-offset: 2px;
+    }
+    .detail-panel {
+      min-height: 100%;
+    }
+    .detail-block {
+      margin-top: 14px;
+    }
+    .detail-lines {
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .detail-empty {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .activity-list {
+      margin-top: 8px;
+      display: grid;
+      gap: 8px;
+      max-height: 520px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .activity-item {
+      border: 1px solid rgba(143, 176, 192, 0.12);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(19, 40, 56, 0.45);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .activity-head {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
     @media (max-width: 1100px) {
       .status-grid { grid-template-columns: 1fr; }
+      .top-layout { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <div class="page">
-    <section class="panel">
-      <div class="status-grid">
-        <div><div class="label">UTC</div><div class="value" id="time"></div></div>
-        <div><div class="label">Rig</div><div class="value small" id="rig"></div></div>
-        <div><div class="label">Audio</div><div class="value small" id="audio"></div></div>
-        <div><div class="label">Status</div><div class="value small" id="status"></div></div>
-        <div><div class="label">Slot</div><div class="value small" id="slot"></div></div>
-        <div><div class="label">Decode</div><div class="value small" id="times"></div></div>
-        <div><div class="label">dT</div><div class="value small" id="dtstats"></div></div>
-        <div><div class="label">Decodes</div><div class="value small" id="count"></div></div>
+    <div class="top-layout">
+      <div class="top-main">
+        <section class="panel">
+          <div class="status-grid">
+            <div><div class="label">UTC</div><div class="value" id="time"></div></div>
+            <div><div class="label">Rig</div><div class="value small" id="rig"></div></div>
+            <div><div class="label">Audio</div><div class="value small" id="audio"></div></div>
+            <div><div class="label">Status</div><div class="value small" id="status"></div></div>
+            <div><div class="label">Slot</div><div class="value small" id="slot"></div></div>
+            <div><div class="label">Decode</div><div class="value small" id="times"></div></div>
+            <div><div class="label">dT</div><div class="value small" id="dtstats"></div></div>
+            <div><div class="label">Decodes</div><div class="value small" id="count"></div></div>
+          </div>
+        </section>
+        <section class="panel">
+          <canvas id="waterfall" width="300" height="180"></canvas>
+          <div class="meta-line">
+            <span>Waterfall: 0-4000 Hz</span>
+            <span>Rows: latest at top</span>
+          </div>
+        </section>
       </div>
-    </section>
-    <section class="panel">
-      <canvas id="waterfall" width="300" height="180"></canvas>
-      <div class="meta-line">
-        <span>Waterfall: 0-4000 Hz</span>
-        <span>Rows: latest at top</span>
-      </div>
-    </section>
+      <section class="panel detail-panel">
+        <div class="label">Station Detail</div>
+        <div class="value" id="detail-call">No station selected</div>
+        <div class="detail-block">
+          <div class="label">Current State</div>
+          <div class="detail-lines" id="detail-state">Click a callsign in the bandmap or decode table.</div>
+        </div>
+        <div class="detail-block">
+          <div class="label">Recent QSOs</div>
+          <div class="detail-lines" id="detail-history"></div>
+        </div>
+        <div class="detail-block">
+          <div class="label">Live Activity</div>
+          <div class="activity-list" id="detail-logs"></div>
+        </div>
+      </section>
+    </div>
     <div class="maps">
       <section class="panel">
         <div class="label">Even Slots (:00 / :30)</div>
@@ -449,8 +628,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <script>
     const canvas = document.getElementById('waterfall');
     const ctx = canvas.getContext('2d');
+    let selectedCall = null;
+    let lastSnapshot = null;
     function fmtSec(value) {
       return value == null ? '-' : `${value.toFixed(2)}s`;
+    }
+    function pickCall(call) {
+      if (!call) return;
+      selectedCall = call;
+      if (lastSnapshot) renderDetail(lastSnapshot);
+    }
+    function renderCallValue(value, call) {
+      if (!call) return value;
+      return `<span class="pickable" data-call="${call}">${value}</span>`;
     }
     function renderWaterfall(rows) {
       if (!rows || rows.length === 0) {
@@ -518,7 +708,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
             const lightness = 72 - fade * 34;
             const saturation = 88 - fade * 58;
             line.style.color = `hsl(135 ${saturation}% ${lightness}%)`;
-            line.textContent = entry.detail ? `${entry.callsign} ${entry.detail}` : entry.callsign;
+            line.innerHTML = renderCallValue(
+              entry.detail ? `${entry.callsign} ${entry.detail}` : entry.callsign,
+              entry.callsign
+            );
             cell.appendChild(line);
           }
           root.appendChild(cell);
@@ -547,16 +740,55 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <td class="num">${row.dt_seconds.toFixed(2)}</td>
           <td class="num">${Math.round(row.freq_hz)}</td>
           <td>${row.kind}</td>
-          <td>${row.field1}</td>
-          <td>${row.field2}</td>
+          <td>${renderCallValue(row.field1, row.field1_select_call)}</td>
+          <td>${renderCallValue(row.field2, row.field2_select_call)}</td>
           <td>${row.info}</td>
           <td>${row.text}</td>`;
         body.appendChild(tr);
       }
     }
+    function renderDetail(data) {
+      const title = document.getElementById('detail-call');
+      const state = document.getElementById('detail-state');
+      const history = document.getElementById('detail-history');
+      const logs = document.getElementById('detail-logs');
+      const stations = new Map((data.stations || []).map((entry) => [entry.callsign, entry]));
+      if (!selectedCall || !stations.has(selectedCall)) {
+        title.textContent = selectedCall ? `${selectedCall} not active in last 60m` : 'No station selected';
+        state.textContent = selectedCall ? '' : 'Click a callsign in the bandmap or decode table.';
+        history.textContent = '';
+        logs.innerHTML = '';
+        return;
+      }
+      const station = stations.get(selectedCall);
+      title.textContent = station.callsign;
+      const current = station.is_in_qso
+        ? `In QSO since ${station.in_qso_since ?? '-'} with ${station.qso_with ?? '?'}`
+        : `Idle${station.last_qso_ended_at ? `, last ended ${station.last_qso_ended_at}` : ''}`;
+      state.textContent = `Last heard: ${station.last_heard_at}\n${current}`;
+      history.textContent = station.qso_history.length
+        ? station.qso_history.map((item) => `${item.started_at} -> ${item.ended_at}  ${item.peer}`).join('\n')
+        : 'No QSO history in last 60m.';
+      const related = (data.station_logs || []).filter((item) => (item.related_calls || []).includes(selectedCall));
+      logs.innerHTML = '';
+      if (!related.length) {
+        logs.innerHTML = '<div class="detail-empty">No related decodes in last 60m.</div>';
+        return;
+      }
+      for (const item of related) {
+        const div = document.createElement('div');
+        div.className = 'activity-item';
+        const peer = item.peer_after ?? item.peer_before ?? '-';
+        div.innerHTML = `
+          <div class="activity-head">${item.timestamp}  ${item.sender_call}  peer=${peer}  snr=${item.snr_db}  dT=${item.dt_seconds.toFixed(2)}  f=${Math.round(item.freq_hz)}</div>
+          <div>${item.text}</div>`;
+        logs.appendChild(div);
+      }
+    }
     async function refresh() {
       const response = await fetch('/api/state', { cache: 'no-store' });
       const data = await response.json();
+      lastSnapshot = data;
       document.getElementById('time').textContent = data.time_utc || '-';
       const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(3)} MHz`;
       document.getElementById('rig').textContent = `${freq}  ${data.rig_mode}  ${data.rig_band}`;
@@ -574,6 +806,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderBandMap('even-map', data.bandmaps.even);
       renderBandMap('odd-map', data.bandmaps.odd);
       renderDecodes(data.decodes);
+      renderDetail(data);
+      document.querySelectorAll('[data-call]').forEach((node) => {
+        node.addEventListener('click', (event) => {
+          event.preventDefault();
+          pickCall(node.dataset.call);
+        });
+      });
     }
     refresh().catch(console.error);
     setInterval(() => refresh().catch(console.error), 250);
@@ -708,6 +947,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let mut last_waterfall_sample_time = UNIX_EPOCH;
     let mut bandmaps = BandMapStore::default();
     let mut dt_frame_history = VecDeque::<Vec<DecodedMessage>>::with_capacity(DT_HISTORY_FRAMES);
+    let mut station_tracker = StationTracker::default();
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
@@ -756,6 +996,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                         dt_frame_history.pop_front();
                                     }
                                     dt_frame_history.push_back(display.full_decodes.clone());
+                                    station_tracker.ingest_frame(slot_start, &display.full_decodes);
                                     update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
                                 }
                             }
@@ -894,6 +1135,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             &waterfall_rows,
             &bandmaps,
             &dt_frame_history,
+            &station_tracker,
         );
         render(&display);
         thread::sleep(Duration::from_millis(50));
@@ -909,6 +1151,7 @@ fn refresh_web_snapshot(
     waterfall_rows: &VecDeque<Vec<u8>>,
     bandmaps: &BandMapStore,
     dt_frame_history: &VecDeque<Vec<DecodedMessage>>,
+    station_tracker: &StationTracker,
 ) {
     let now = SystemTime::now();
     let current_slot = current_slot_boundary(now);
@@ -928,7 +1171,9 @@ fn refresh_web_snapshot(
                 freq_hz: row.display.freq_hz,
                 kind,
                 field1,
+                field1_select_call: semantic_first_call_display_call(&row.display.message),
                 field2,
+                field2_select_call: semantic_sender_call(&row.display.message),
                 info,
                 text: row.display.text,
             }
@@ -983,6 +1228,8 @@ fn refresh_web_snapshot(
         even: build_bandmap_grid(&bandmaps.even, current_slot_index),
         odd: build_bandmap_grid(&bandmaps.odd, current_slot_index),
     };
+    guard.stations = station_tracker.web_station_summaries();
+    guard.station_logs = station_tracker.web_logs();
 }
 
 fn run_oneshot(cli: Cli) -> Result<(), AppError> {
@@ -1600,6 +1847,61 @@ fn decode_columns(decode: &DecodedMessage) -> (String, String, String, String) {
     }
 }
 
+fn semantic_sender_call(message: &StructuredMessage) -> Option<String> {
+    match message {
+        StructuredMessage::Standard { second, .. } => structured_call_station_name(second),
+        StructuredMessage::Nonstandard {
+            hashed_call,
+            plain_call,
+            hashed_is_second,
+            cq,
+            ..
+        } => {
+            if *cq {
+                Some(plain_call.callsign.clone())
+            } else if *hashed_is_second {
+                hashed_call.resolved_callsign.clone()
+            } else {
+                Some(plain_call.callsign.clone())
+            }
+        }
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
+    }
+}
+
+fn semantic_first_call_display_call(message: &StructuredMessage) -> Option<String> {
+    match message {
+        StructuredMessage::Standard { first, .. } => structured_call_station_name(first),
+        StructuredMessage::Nonstandard {
+            hashed_call,
+            plain_call,
+            hashed_is_second,
+            cq,
+            ..
+        } => {
+            if *cq {
+                None
+            } else if *hashed_is_second {
+                Some(plain_call.callsign.clone())
+            } else {
+                hashed_call.resolved_callsign.clone()
+            }
+        }
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
+    }
+}
+
+fn structured_call_station_name(field: &StructuredCallField) -> Option<String> {
+    match &field.value {
+        StructuredCallValue::StandardCall { callsign } => Some(callsign.clone()),
+        StructuredCallValue::Hash22 {
+            resolved_callsign: Some(callsign),
+            ..
+        } => Some(callsign.clone()),
+        StructuredCallValue::Token { .. } | StructuredCallValue::Hash22 { .. } => None,
+    }
+}
+
 fn bandmap_detail(message: &StructuredMessage) -> Option<String> {
     match message {
         StructuredMessage::Standard {
@@ -1708,6 +2010,341 @@ fn reply_word_text(word: ft8_decoder::ReplyWord) -> &'static str {
         ft8_decoder::ReplyWord::Rr73 => "RR73",
         ft8_decoder::ReplyWord::SeventyThree => "73",
     }
+}
+
+impl StationTracker {
+    fn ingest_frame(&mut self, received_at: SystemTime, decodes: &[DecodedMessage]) {
+        for decode in decodes {
+            self.ingest_decode(received_at, decode);
+        }
+        self.prune(received_at);
+    }
+
+    fn ingest_decode(&mut self, received_at: SystemTime, decode: &DecodedMessage) {
+        self.observe_message_resolutions(&decode.message);
+        let Some(sender_call) = semantic_sender_call(&decode.message) else {
+            return;
+        };
+        let first_peer = qso_peer_from_first_field(&decode.message, self);
+        let existing_active = self
+            .stations
+            .get(&sender_call)
+            .and_then(|state| state.active_qso.clone());
+        let peer_before = existing_active.as_ref().map(|qso| qso.peer.clone());
+
+        enum QsoTransition {
+            None,
+            End,
+            Keep(PeerRef),
+            Start(PeerRef),
+            Replace { old: ActiveQso, new_peer: PeerRef },
+        }
+
+        let transition = if message_ends_qso(&decode.message) {
+            QsoTransition::End
+        } else if let Some(peer) = first_peer {
+            match existing_active {
+                Some(active) if self.same_peer_identity(&active.peer, &peer) => {
+                    QsoTransition::Keep(self.prefer_peer_identity(active.peer, peer))
+                }
+                Some(active) => QsoTransition::Replace {
+                    old: active,
+                    new_peer: peer,
+                },
+                None => QsoTransition::Start(peer),
+            }
+        } else {
+            QsoTransition::None
+        };
+
+        let entry = self
+            .stations
+            .entry(sender_call.clone())
+            .or_insert_with(|| StationState {
+                last_heard_at: received_at,
+                active_qso: None,
+                last_qso_ended_at: None,
+                qso_history: Vec::new(),
+            });
+        entry.last_heard_at = received_at;
+
+        match transition {
+            QsoTransition::None => {}
+            QsoTransition::End => {
+                if let Some(active) = entry.active_qso.take() {
+                    entry.qso_history.push(CompletedQso {
+                        started_at: active.since,
+                        ended_at: received_at,
+                        peer: active.peer,
+                    });
+                    entry.last_qso_ended_at = Some(received_at);
+                }
+            }
+            QsoTransition::Keep(peer) => {
+                if let Some(active) = &mut entry.active_qso {
+                    active.peer = peer;
+                } else {
+                    entry.active_qso = Some(ActiveQso {
+                        since: received_at,
+                        peer,
+                    });
+                }
+            }
+            QsoTransition::Start(peer) => {
+                entry.active_qso = Some(ActiveQso {
+                    since: received_at,
+                    peer,
+                });
+            }
+            QsoTransition::Replace { old, new_peer } => {
+                entry.qso_history.push(CompletedQso {
+                    started_at: old.since,
+                    ended_at: received_at,
+                    peer: old.peer,
+                });
+                entry.active_qso = Some(ActiveQso {
+                    since: received_at,
+                    peer: new_peer,
+                });
+            }
+        }
+
+        let peer_after = entry
+            .active_qso
+            .as_ref()
+            .map(|active| active.peer.clone());
+        let (kind, field1, field2, info) = decode_columns(decode);
+        let mut related = BTreeSet::<String>::new();
+        related.insert(sender_call.clone());
+        if let Some(peer) = &peer_before {
+            if let Some(call) = self.peer_station_name(peer) {
+                related.insert(call);
+            }
+        }
+        if let Some(peer) = &peer_after {
+            if let Some(call) = self.peer_station_name(peer) {
+                related.insert(call);
+            }
+        }
+        self.logs.push_back(LoggedDecode {
+            received_at,
+            sender_call,
+            peer_before,
+            peer_after,
+            related_calls: related.into_iter().collect(),
+            snr_db: decode.snr_db,
+            dt_seconds: decode.dt_seconds,
+            freq_hz: decode.freq_hz,
+            kind,
+            field1,
+            field2,
+            info,
+            text: decode.text.clone(),
+        });
+    }
+
+    fn observe_message_resolutions(&mut self, message: &StructuredMessage) {
+        match message {
+            StructuredMessage::Standard { first, second, .. } => {
+                self.observe_structured_call(first);
+                self.observe_structured_call(second);
+            }
+            StructuredMessage::Nonstandard { hashed_call, .. } => {
+                if let Some(callsign) = &hashed_call.resolved_callsign {
+                    self.hash12_resolutions
+                        .insert(hashed_call.raw, callsign.clone());
+                }
+            }
+            StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {}
+        }
+    }
+
+    fn observe_structured_call(&mut self, field: &StructuredCallField) {
+        if let StructuredCallValue::Hash22 {
+            hash,
+            resolved_callsign: Some(callsign),
+        } = &field.value
+        {
+            self.hash22_resolutions.insert(*hash, callsign.clone());
+        }
+    }
+
+    fn resolve_peer(&self, peer: PeerRef) -> PeerRef {
+        match peer {
+            PeerRef::Callsign(_) => peer,
+            PeerRef::Hash12(raw) => self
+                .hash12_resolutions
+                .get(&raw)
+                .cloned()
+                .map(PeerRef::Callsign)
+                .unwrap_or(PeerRef::Hash12(raw)),
+            PeerRef::Hash22(raw) => self
+                .hash22_resolutions
+                .get(&raw)
+                .cloned()
+                .map(PeerRef::Callsign)
+                .unwrap_or(PeerRef::Hash22(raw)),
+        }
+    }
+
+    fn same_peer_identity(&self, left: &PeerRef, right: &PeerRef) -> bool {
+        match (self.resolve_peer(left.clone()), self.resolve_peer(right.clone())) {
+            (PeerRef::Callsign(left), PeerRef::Callsign(right)) => left == right,
+            (PeerRef::Hash12(left), PeerRef::Hash12(right)) => left == right,
+            (PeerRef::Hash22(left), PeerRef::Hash22(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn prefer_peer_identity(&self, existing: PeerRef, observed: PeerRef) -> PeerRef {
+        match (self.resolve_peer(existing.clone()), self.resolve_peer(observed.clone())) {
+            (PeerRef::Callsign(_), PeerRef::Callsign(_)) => self.resolve_peer(observed),
+            (PeerRef::Callsign(_), _) => self.resolve_peer(existing),
+            (_, PeerRef::Callsign(_)) => self.resolve_peer(observed),
+            _ => self.resolve_peer(observed),
+        }
+    }
+
+    fn peer_station_name(&self, peer: &PeerRef) -> Option<String> {
+        match self.resolve_peer(peer.clone()) {
+            PeerRef::Callsign(call) => Some(call),
+            PeerRef::Hash12(_) | PeerRef::Hash22(_) => None,
+        }
+    }
+
+    fn peer_display(&self, peer: &PeerRef) -> String {
+        match self.resolve_peer(peer.clone()) {
+            PeerRef::Callsign(call) => call,
+            PeerRef::Hash12(raw) => format!("<h12:{raw:03X}>"),
+            PeerRef::Hash22(raw) => format!("<h22:{raw:06X}>"),
+        }
+    }
+
+    fn prune(&mut self, now: SystemTime) {
+        while matches!(
+            self.logs.front(),
+            Some(entry) if now.duration_since(entry.received_at).unwrap_or_default() > STATION_RETENTION
+        ) {
+            self.logs.pop_front();
+        }
+        self.stations.retain(|_, state| {
+            let keep = now.duration_since(state.last_heard_at).unwrap_or_default() <= STATION_RETENTION;
+            if keep {
+                state.qso_history.retain(|qso| {
+                    now.duration_since(qso.ended_at).unwrap_or_default() <= STATION_RETENTION
+                });
+            }
+            keep
+        });
+    }
+
+    fn web_station_summaries(&self) -> Vec<WebStationSummary> {
+        self.stations
+            .iter()
+            .map(|(callsign, state)| WebStationSummary {
+                callsign: callsign.clone(),
+                last_heard_at: format_time(state.last_heard_at),
+                is_in_qso: state.active_qso.is_some(),
+                in_qso_since: state.active_qso.as_ref().map(|qso| format_time(qso.since)),
+                qso_with: state
+                    .active_qso
+                    .as_ref()
+                    .map(|qso| self.peer_display(&qso.peer)),
+                last_qso_ended_at: state.last_qso_ended_at.map(format_time),
+                qso_history: state
+                    .qso_history
+                    .iter()
+                    .map(|qso| WebCompletedQso {
+                        started_at: format_time(qso.started_at),
+                        ended_at: format_time(qso.ended_at),
+                        peer: self.peer_display(&qso.peer),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn web_logs(&self) -> Vec<WebStationLog> {
+        self.logs
+            .iter()
+            .map(|entry| WebStationLog {
+                timestamp: format_time(entry.received_at),
+                sender_call: entry.sender_call.clone(),
+                peer_before: entry.peer_before.as_ref().map(|peer| self.peer_display(peer)),
+                peer_after: entry.peer_after.as_ref().map(|peer| self.peer_display(peer)),
+                related_calls: entry.related_calls.clone(),
+                snr_db: entry.snr_db,
+                dt_seconds: entry.dt_seconds,
+                freq_hz: entry.freq_hz,
+                kind: entry.kind.clone(),
+                field1: entry.field1.clone(),
+                field2: entry.field2.clone(),
+                info: entry.info.clone(),
+                text: entry.text.clone(),
+            })
+            .collect()
+    }
+}
+
+fn qso_peer_from_first_field(message: &StructuredMessage, tracker: &StationTracker) -> Option<PeerRef> {
+    match message {
+        StructuredMessage::Standard { first, .. } => match &first.value {
+            StructuredCallValue::StandardCall { callsign } => Some(PeerRef::Callsign(callsign.clone())),
+            StructuredCallValue::Hash22 { hash, .. } => Some(tracker.resolve_peer(PeerRef::Hash22(*hash))),
+            StructuredCallValue::Token { .. } => None,
+        },
+        StructuredMessage::Nonstandard {
+            hashed_call,
+            plain_call,
+            hashed_is_second,
+            cq,
+            ..
+        } => {
+            if *cq {
+                None
+            } else if *hashed_is_second {
+                Some(PeerRef::Callsign(plain_call.callsign.clone()))
+            } else {
+                Some(tracker.resolve_peer(PeerRef::Hash12(hashed_call.raw)))
+            }
+        }
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
+    }
+}
+
+fn message_ends_qso(message: &StructuredMessage) -> bool {
+    if message_is_cq(message) {
+        return true;
+    }
+    match message {
+        StructuredMessage::Standard { info, .. } => matches!(
+            info.value,
+            StructuredInfoValue::Reply {
+                word: ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree
+            }
+        ),
+        StructuredMessage::Nonstandard { reply, .. } => matches!(
+            reply,
+            ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree
+        ),
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => false,
+    }
+}
+
+fn message_is_cq(message: &StructuredMessage) -> bool {
+    match message {
+        StructuredMessage::Standard { first, .. } => matches!(
+            &first.value,
+            StructuredCallValue::Token { token } if token == "CQ" || token.starts_with("CQ ")
+        ),
+        StructuredMessage::Nonstandard { cq, .. } => *cq,
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => false,
+    }
+}
+
+fn format_time(time: SystemTime) -> String {
+    let utc: DateTime<Utc> = time.into();
+    utc.format("%H:%M:%S").to_string()
 }
 
 fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {
@@ -1841,25 +2478,10 @@ fn prune_bandmap(map: &mut BTreeMap<String, BandMapEntry>, current_slot_index: u
 
 fn bandmap_calls_from_decode(decode: &DecodedMessage) -> Vec<(String, Option<String>)> {
     let detail = bandmap_detail(&decode.message);
-    visible_call_text(decode.message.second_call_field())
+    semantic_sender_call(&decode.message)
         .into_iter()
         .map(|call| (call, detail.clone()))
         .collect()
-}
-
-fn visible_call_text(field: Option<MessageCallField<'_>>) -> Option<String> {
-    match field? {
-        MessageCallField::Standard(field) => match &field.value {
-            StructuredCallValue::StandardCall { callsign } => Some(callsign.clone()),
-            StructuredCallValue::Hash22 {
-                resolved_callsign: Some(callsign),
-                ..
-            } => Some(callsign.clone()),
-            StructuredCallValue::Token { .. } | StructuredCallValue::Hash22 { .. } => None,
-        },
-        MessageCallField::Hashed12(field) => field.resolved_callsign.clone(),
-        MessageCallField::Plain58(field) => Some(field.callsign.clone()),
-    }
 }
 
 fn build_bandmap_grid(
