@@ -1519,9 +1519,18 @@ fn bandmap_detail(message: &StructuredMessage) -> Option<String> {
             }
             (!parts.is_empty()).then(|| parts.join(" "))
         }
-        StructuredMessage::FreeText { .. }
-        | StructuredMessage::Nonstandard { .. }
-        | StructuredMessage::Unsupported { .. } => None,
+        StructuredMessage::Nonstandard { reply, cq, .. } => {
+            let mut parts = Vec::new();
+            if *cq {
+                parts.push("CQ".to_string());
+            }
+            let reply_text = reply_word_text(*reply);
+            if !reply_text.is_empty() {
+                parts.push(reply_text.to_string());
+            }
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
     }
 }
 
