@@ -1850,8 +1850,8 @@ fn sync8_score(
 
     for (offset, costas) in FT8_COSTAS.iter().copied().enumerate() {
         let m = lag + nominal_start + (offset as isize * 4);
-        if (0..nhsym as isize).contains(&m) {
-            let row = m as usize * row_len;
+        if (1..=nhsym as isize).contains(&m) {
+            let row = (m as usize - 1) * row_len;
             ta += symbol_power[row + bin + 2 * costas];
             for tone in 0..7 {
                 t0a += symbol_power[row + bin + 2 * tone];
@@ -1859,8 +1859,8 @@ fn sync8_score(
         }
 
         let mb = m + 36 * 4;
-        if (0..nhsym as isize).contains(&mb) {
-            let row = mb as usize * row_len;
+        if (1..=nhsym as isize).contains(&mb) {
+            let row = (mb as usize - 1) * row_len;
             tb += symbol_power[row + bin + 2 * costas];
             for tone in 0..7 {
                 t0b += symbol_power[row + bin + 2 * tone];
@@ -1868,8 +1868,8 @@ fn sync8_score(
         }
 
         let mc = m + 72 * 4;
-        if (0..nhsym as isize).contains(&mc) {
-            let row = mc as usize * row_len;
+        if (1..=nhsym as isize).contains(&mc) {
+            let row = (mc as usize - 1) * row_len;
             tc += symbol_power[row + bin + 2 * costas];
             for tone in 0..7 {
                 t0c += symbol_power[row + bin + 2 * tone];
