@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::encode::{channel_symbols_from_codeword_bits, synthesize_channel_reference};
 use crate::ldpc::ParityMatrix;
-use crate::message::{DecodedPayload, GridReport, HashResolver, MessageKind, Payload, unpack_message};
+use crate::message::{GridReport, HashResolver, Payload, StructuredMessage, unpack_message};
 use crate::protocol::{
     FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES, FT8_TONE_SPACING_HZ,
     HOP_SAMPLES, HOPS_PER_SYMBOL, all_costas_positions,
@@ -133,7 +133,7 @@ pub struct DecodedMessage {
     pub text: String,
     pub candidate_score: f32,
     pub ldpc_iterations: usize,
-    pub payload: DecodedPayload,
+    pub message: StructuredMessage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -400,14 +400,19 @@ impl DecoderSession {
 
         let mut updates = Vec::new();
         let mut current_state = state.cloned();
-        for stage in [DecodeStage::Early41, DecodeStage::Early47, DecodeStage::Full] {
+        for stage in [
+            DecodeStage::Early41,
+            DecodeStage::Early47,
+            DecodeStage::Full,
+        ] {
             if self.emitted_stages.contains(&stage) {
                 continue;
             }
             if !stage_is_enabled(stage, options) || audio.samples.len() < stage.required_samples() {
                 continue;
             }
-            let (update, next_state) = self.decode_stage_with_state(audio, options, stage, current_state.as_ref())?;
+            let (update, next_state) =
+                self.decode_stage_with_state(audio, options, stage, current_state.as_ref())?;
             current_state = Some(next_state.clone());
             updates.push((update, next_state));
         }
@@ -466,9 +471,13 @@ impl DecoderSession {
                 self.early47 = Some(search.clone());
                 search
             }
-            DecodeStage::Full => {
-                run_full_search(audio, options, self.early41.as_ref(), self.early47.as_ref(), state)
-            }
+            DecodeStage::Full => run_full_search(
+                audio,
+                options,
+                self.early41.as_ref(),
+                self.early47.as_ref(),
+                state,
+            ),
         };
 
         let report = build_decode_report_with_resolver(audio, options, search.clone(), state);
@@ -657,8 +666,8 @@ fn debug_candidate_pcm_inner(
             let decoded =
                 decode_llr_set_with_known_bits(parity, &llrs, known_bits, 0, &mut counters).map(
                     |(payload, _, iterations)| {
-                        let rendered = payload.render(&resolver);
-                        (rendered.text, iterations)
+                        let message = payload.to_message(&resolver);
+                        (message.to_text(), iterations)
                     },
                 );
             let (truth_hard_errors, truth_weighted_distance) = truth_codeword_bits
@@ -725,10 +734,11 @@ fn append_debug_single_pass(
 ) {
     let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
     let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-    let decoded = decode_llr_set(parity, llrs, max_osd, counters).map(|(payload, _, iterations)| {
-        let rendered = payload.render(resolver);
-        (rendered.text, iterations)
-    });
+    let decoded =
+        decode_llr_set(parity, llrs, max_osd, counters).map(|(payload, _, iterations)| {
+            let message = payload.to_message(resolver);
+            (message.to_text(), iterations)
+        });
     let (truth_hard_errors, truth_weighted_distance) = truth_codeword_bits
         .and_then(|truth| truth_metrics(llrs, truth))
         .unwrap_or((None, None));
@@ -752,11 +762,11 @@ fn merged_resolver(base: Option<&HashResolver>, successes: &[SuccessfulDecode]) 
 }
 
 fn rendered_success_key(success: &SuccessfulDecode, resolver: &HashResolver) -> String {
-    let rendered = success.payload.render(resolver);
-    if rendered.text.trim().is_empty() {
+    let rendered = success.payload.to_message(resolver).to_text();
+    if rendered.trim().is_empty() {
         format!("{:?}", success.payload)
     } else {
-        rendered.text
+        rendered
     }
 }
 
@@ -924,15 +934,15 @@ fn build_decode_report_with_resolver(
 
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
-        let payload = success.payload.render(&resolver);
-        if matches!(payload.kind, MessageKind::Unsupported) {
+        let message = success.payload.to_message(&resolver);
+        if matches!(message, StructuredMessage::Unsupported { .. }) {
             continue;
         }
-        let text = payload.text.clone();
+        let text = message.to_text();
         if text.trim().is_empty() {
             continue;
         }
-        let message = DecodedMessage {
+        let decode = DecodedMessage {
             utc: "000000".to_string(),
             snr_db: success.snr_db,
             dt_seconds: success.candidate.dt_seconds,
@@ -940,12 +950,12 @@ fn build_decode_report_with_resolver(
             text: text.clone(),
             candidate_score: success.candidate.score,
             ldpc_iterations: success.ldpc_iterations,
-            payload,
+            message,
         };
         match dedup.get(&text) {
-            Some(existing) if existing.candidate_score >= message.candidate_score => {}
+            Some(existing) if existing.candidate_score >= decode.candidate_score => {}
             _ => {
-                dedup.insert(text, message);
+                dedup.insert(text, decode);
             }
         }
     }
@@ -1506,9 +1516,11 @@ fn try_candidate(
         );
 
         if best.is_none() && matches!(options.profile, DecodeProfile::Medium) {
-            if let Some(seed) =
-                extract_candidate_from_baseband(&initial_baseband, candidate.start_seconds, coarse_freq_hz)
-            {
+            if let Some(seed) = extract_candidate_from_baseband(
+                &initial_baseband,
+                candidate.start_seconds,
+                coarse_freq_hz,
+            ) {
                 best = try_refined_candidate(
                     &seed,
                     candidate.score,
@@ -2056,9 +2068,7 @@ fn compute_bitmetric_passes(full_tones: &[[Complex32; 8]]) -> [Vec<f32>; 4] {
 fn compute_symbol_bit_llrs(full_tones: &[[Complex32; 8]]) -> Vec<f32> {
     let data_tones: Vec<[f32; 8]> = crate::protocol::FT8_DATA_POSITIONS
         .iter()
-        .map(|&symbol_index| {
-            std::array::from_fn(|tone| full_tones[symbol_index][tone].norm_sqr())
-        })
+        .map(|&symbol_index| std::array::from_fn(|tone| full_tones[symbol_index][tone].norm_sqr()))
         .collect();
     ParityMatrix::symbol_bit_llrs(&data_tones)
         .into_iter()
@@ -2082,7 +2092,7 @@ fn decode_llr_set(
     let Some(payload) = unpack_message(&bits) else {
         return None;
     };
-    if matches!(payload, Payload::Unsupported(_, _)) {
+    if matches!(payload, Payload::Unsupported(_)) {
         return None;
     }
     counters.parsed_payloads += 1;
@@ -2108,7 +2118,7 @@ fn decode_llr_set_with_known_bits(
     let Some(payload) = unpack_message(&bits) else {
         return None;
     };
-    if matches!(payload, Payload::Unsupported(_, _)) {
+    if matches!(payload, Payload::Unsupported(_)) {
         return None;
     }
     counters.parsed_payloads += 1;
@@ -2368,7 +2378,9 @@ mod tests {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; EARLY_41_SAMPLES],
         };
-        let updates = session.decode_available(&early41, &options).expect("early41 decode");
+        let updates = session
+            .decode_available(&early41, &options)
+            .expect("early41 decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Early41);
 
@@ -2376,7 +2388,9 @@ mod tests {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; EARLY_47_SAMPLES],
         };
-        let updates = session.decode_available(&early47, &options).expect("early47 decode");
+        let updates = session
+            .decode_available(&early47, &options)
+            .expect("early47 decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Early47);
 
@@ -2384,11 +2398,15 @@ mod tests {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; LONG_INPUT_SAMPLES],
         };
-        let updates = session.decode_available(&full, &options).expect("full decode");
+        let updates = session
+            .decode_available(&full, &options)
+            .expect("full decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Full);
 
-        let updates = session.decode_available(&full, &options).expect("repeat decode");
+        let updates = session
+            .decode_available(&full, &options)
+            .expect("repeat decode");
         assert!(updates.is_empty());
     }
 
@@ -2403,15 +2421,18 @@ mod tests {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; LONG_INPUT_SAMPLES],
         };
-        let updates = session.decode_available(&full, &options).expect("quick decode");
+        let updates = session
+            .decode_available(&full, &options)
+            .expect("quick decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Full);
     }
 
     #[test]
     fn decode_pcm_with_state_resolves_hash22_callsign() {
-        let learned_frame = encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
-            .expect("encode learned");
+        let learned_frame =
+            encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
+                .expect("encode learned");
         let learned_audio = synthesize_rectangular_waveform(
             &learned_frame,
             &WaveformOptions {
@@ -2420,8 +2441,8 @@ mod tests {
             },
         )
         .expect("learned waveform");
-        let hashed_frame =
-            encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank).expect("encode hashed");
+        let hashed_frame = encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank)
+            .expect("encode hashed");
         let hashed_audio = synthesize_rectangular_waveform(
             &hashed_frame,
             &WaveformOptions {
@@ -2436,22 +2457,37 @@ mod tests {
             ..DecodeOptions::default()
         };
 
-        let (unresolved, _) = decode_pcm_with_state(&hashed_audio, &options, None).expect("decode unresolved");
-        let unresolved_texts: Vec<_> = unresolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let (unresolved, _) =
+            decode_pcm_with_state(&hashed_audio, &options, None).expect("decode unresolved");
+        let unresolved_texts: Vec<_> = unresolved
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
             unresolved_texts.iter().any(|text| text.contains("<...>")),
             "expected unresolved hash in {unresolved_texts:?}"
         );
 
-        let (learned, state) = decode_pcm_with_state(&learned_audio, &options, None).expect("decode learned");
-        let learned_texts: Vec<_> = learned.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let (learned, state) =
+            decode_pcm_with_state(&learned_audio, &options, None).expect("decode learned");
+        let learned_texts: Vec<_> = learned
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
             learned_texts.iter().any(|text| *text == "CQ HF19NY"),
             "expected plain learned call in {learned_texts:?}"
         );
 
-        let (resolved, _) = decode_pcm_with_state(&hashed_audio, &options, Some(&state)).expect("decode resolved");
-        let resolved_texts: Vec<_> = resolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let (resolved, _) =
+            decode_pcm_with_state(&hashed_audio, &options, Some(&state)).expect("decode resolved");
+        let resolved_texts: Vec<_> = resolved
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
             resolved_texts.iter().any(|text| *text == "CQ HF19NY"),
             "expected resolved call in {resolved_texts:?}"

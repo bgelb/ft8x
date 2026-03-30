@@ -14,34 +14,242 @@ pub enum MessageKind {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct DecodedPayload {
-    pub kind: MessageKind,
-    pub text: String,
-    pub primary_call: Option<String>,
-    pub secondary_call: Option<String>,
+pub enum CallModifier {
+    R,
+    P,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum StructuredCallValue {
+    Token {
+        token: String,
+    },
+    StandardCall {
+        callsign: String,
+    },
+    Hash22 {
+        hash: u32,
+        resolved_callsign: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StructuredCallField {
+    pub raw: u32,
+    pub value: StructuredCallValue,
+    pub modifier: Option<CallModifier>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum StructuredInfoValue {
+    Grid { locator: String },
+    SignalReport { db: i16 },
+    Blank,
+    Reply { word: ReplyWord },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StructuredInfoField {
+    pub raw: u16,
+    pub value: StructuredInfoValue,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HashedCallField12 {
+    pub raw: u16,
+    pub resolved_callsign: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlainCallField58 {
+    pub raw: u128,
+    pub callsign: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MessageCallField<'a> {
+    Standard(&'a StructuredCallField),
+    Hashed12(&'a HashedCallField12),
+    Plain58(&'a PlainCallField58),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum StructuredMessage {
+    FreeText {
+        i3: u8,
+        n3: u8,
+        raw: u128,
+        text: String,
+    },
+    Standard {
+        i3: u8,
+        first: StructuredCallField,
+        second: StructuredCallField,
+        acknowledge: bool,
+        info: StructuredInfoField,
+    },
+    Nonstandard {
+        i3: u8,
+        hashed_call: HashedCallField12,
+        plain_call: PlainCallField58,
+        hashed_is_second: bool,
+        reply: ReplyWord,
+        cq: bool,
+    },
+    Unsupported {
+        i3: u8,
+        n3: Option<u8>,
+        message_bits: Vec<u8>,
+    },
+}
+
+impl StructuredMessage {
+    pub fn kind(&self) -> MessageKind {
+        match self {
+            StructuredMessage::FreeText { .. } => MessageKind::FreeText,
+            StructuredMessage::Standard { .. } => MessageKind::Standard,
+            StructuredMessage::Nonstandard { .. } => MessageKind::Nonstandard,
+            StructuredMessage::Unsupported { .. } => MessageKind::Unsupported,
+        }
+    }
+
+    pub fn to_text(&self) -> String {
+        match self {
+            StructuredMessage::FreeText { text, .. } => text.trim().to_string(),
+            StructuredMessage::Standard {
+                first,
+                second,
+                acknowledge,
+                info,
+                ..
+            } => {
+                let first = render_structured_call(first);
+                let second = render_structured_call(second);
+                let trailing = render_structured_info(*acknowledge, info);
+                if trailing.is_empty() {
+                    format!("{first} {second}")
+                } else {
+                    format!("{first} {second} {trailing}")
+                }
+            }
+            StructuredMessage::Nonstandard {
+                hashed_call,
+                plain_call,
+                hashed_is_second,
+                reply,
+                cq,
+                ..
+            } => {
+                let hash_text = hashed_call
+                    .resolved_callsign
+                    .as_ref()
+                    .map(|callsign| format!("<{callsign}>"))
+                    .unwrap_or_else(|| "<...>".to_string());
+                let mut parts = Vec::new();
+                if *cq {
+                    parts.push("CQ".to_string());
+                    parts.push(plain_call.callsign.clone());
+                } else if *hashed_is_second {
+                    parts.push(plain_call.callsign.clone());
+                    parts.push(hash_text);
+                } else {
+                    parts.push(hash_text);
+                    parts.push(plain_call.callsign.clone());
+                }
+                let reply = render_reply_word(*reply);
+                if !reply.is_empty() {
+                    parts.push(reply.to_string());
+                }
+                parts.join(" ")
+            }
+            StructuredMessage::Unsupported { i3, n3, .. } => match n3 {
+                Some(subtype) => format!("<unsupported:{i3}.{subtype}>"),
+                None => format!("<unsupported:{i3}>"),
+            },
+        }
+    }
+
+    pub fn first_call_field(&self) -> Option<MessageCallField<'_>> {
+        match self {
+            StructuredMessage::Standard { first, .. } => Some(MessageCallField::Standard(first)),
+            StructuredMessage::Nonstandard {
+                hashed_call,
+                plain_call,
+                hashed_is_second,
+                ..
+            } => {
+                if *hashed_is_second {
+                    Some(MessageCallField::Plain58(plain_call))
+                } else {
+                    Some(MessageCallField::Hashed12(hashed_call))
+                }
+            }
+            StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
+        }
+    }
+
+    pub fn second_call_field(&self) -> Option<MessageCallField<'_>> {
+        match self {
+            StructuredMessage::Standard { second, .. } => Some(MessageCallField::Standard(second)),
+            StructuredMessage::Nonstandard {
+                hashed_call,
+                plain_call,
+                hashed_is_second,
+                ..
+            } => {
+                if *hashed_is_second {
+                    Some(MessageCallField::Hashed12(hashed_call))
+                } else {
+                    Some(MessageCallField::Plain58(plain_call))
+                }
+            }
+            StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Payload {
-    FreeText(String),
+    FreeText(FreeTextMessage),
     Standard(StandardMessage),
     Nonstandard(NonstandardMessage),
-    Unsupported(u8, Option<u8>),
+    Unsupported(UnsupportedMessage),
+}
+
+#[derive(Debug, Clone)]
+pub struct FreeTextMessage {
+    pub i3: u8,
+    pub n3: u8,
+    pub raw: u128,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnsupportedMessage {
+    pub i3: u8,
+    pub n3: Option<u8>,
+    pub message_bits: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StandardMessage {
+    pub i3: u8,
+    pub first_raw: u32,
     pub first: CallField,
-    pub first_suffix: Option<&'static str>,
+    pub first_modifier: Option<CallModifier>,
+    pub second_raw: u32,
     pub second: CallField,
-    pub second_suffix: Option<&'static str>,
+    pub second_modifier: Option<CallModifier>,
     pub acknowledge: bool,
+    pub info_raw: u16,
     pub info: GridReport,
 }
 
 #[derive(Debug, Clone)]
 pub struct NonstandardMessage {
+    pub i3: u8,
     pub hashed: u16,
+    pub plain_raw: u128,
     pub plain: String,
     pub hashed_is_second: bool,
     pub reply: ReplyWord,
@@ -63,7 +271,7 @@ pub enum GridReport {
     Reply(ReplyWord),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub enum ReplyWord {
     Blank,
     Rrr,
@@ -122,54 +330,60 @@ pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
         0 => {
             let n3 = read_bits(message_bits, 71, 3) as u8;
             match n3 {
-                0 => Some(Payload::FreeText(decode_free_text(read_bits_u128(
-                    message_bits,
-                    0,
-                    71,
-                )))),
-                _ => Some(Payload::Unsupported(i3, Some(n3))),
+                0 => {
+                    let raw = read_bits_u128(message_bits, 0, 71);
+                    Some(Payload::FreeText(FreeTextMessage {
+                        i3,
+                        n3,
+                        raw,
+                        text: decode_free_text(raw),
+                    }))
+                }
+                _ => Some(Payload::Unsupported(UnsupportedMessage {
+                    i3,
+                    n3: Some(n3),
+                    message_bits: message_bits.to_vec(),
+                })),
             }
         }
-        1 => Some(Payload::Standard(StandardMessage {
-            first: decode_c28(read_bits(message_bits, 0, 28)),
-            first_suffix: if read_bits(message_bits, 28, 1) == 1 {
-                Some("/R")
+        1 | 2 => {
+            let first_raw = read_bits(message_bits, 0, 28) as u32;
+            let second_raw = read_bits(message_bits, 29, 28) as u32;
+            let modifier = if i3 == 1 {
+                CallModifier::R
             } else {
-                None
-            },
-            second: decode_c28(read_bits(message_bits, 29, 28)),
-            second_suffix: if read_bits(message_bits, 57, 1) == 1 {
-                Some("/R")
-            } else {
-                None
-            },
-            acknowledge: read_bits(message_bits, 58, 1) == 1,
-            info: decode_g15(read_bits(message_bits, 59, 15)),
-        })),
-        2 => Some(Payload::Standard(StandardMessage {
-            first: decode_c28(read_bits(message_bits, 0, 28)),
-            first_suffix: if read_bits(message_bits, 28, 1) == 1 {
-                Some("/P")
-            } else {
-                None
-            },
-            second: decode_c28(read_bits(message_bits, 29, 28)),
-            second_suffix: if read_bits(message_bits, 57, 1) == 1 {
-                Some("/P")
-            } else {
-                None
-            },
-            acknowledge: read_bits(message_bits, 58, 1) == 1,
-            info: decode_g15(read_bits(message_bits, 59, 15)),
-        })),
+                CallModifier::P
+            };
+            let info_raw = read_bits(message_bits, 59, 15) as u16;
+            Some(Payload::Standard(StandardMessage {
+                i3,
+                first_raw,
+                first: decode_c28(first_raw as u64),
+                first_modifier: read_bits(message_bits, 28, 1)
+                    .eq(&1)
+                    .then_some(modifier.clone()),
+                second_raw,
+                second: decode_c28(second_raw as u64),
+                second_modifier: read_bits(message_bits, 57, 1).eq(&1).then_some(modifier),
+                acknowledge: read_bits(message_bits, 58, 1) == 1,
+                info_raw,
+                info: decode_g15(info_raw as u64),
+            }))
+        }
         4 => Some(Payload::Nonstandard(NonstandardMessage {
+            i3,
             hashed: read_bits(message_bits, 0, 12) as u16,
+            plain_raw: read_bits_u128(message_bits, 12, 58),
             plain: decode_c58(read_bits_u128(message_bits, 12, 58)),
             hashed_is_second: read_bits(message_bits, 70, 1) == 1,
             reply: decode_r2(read_bits(message_bits, 71, 2) as u8),
             cq: read_bits(message_bits, 73, 1) == 1,
         })),
-        other => Some(Payload::Unsupported(other, None)),
+        other => Some(Payload::Unsupported(UnsupportedMessage {
+            i3: other,
+            n3: None,
+            message_bits: message_bits.to_vec(),
+        })),
     }
 }
 
@@ -187,121 +401,138 @@ impl Payload {
             Payload::Nonstandard(message) => {
                 resolver.insert_callsign(&message.plain);
             }
-            Payload::FreeText(_) | Payload::Unsupported(_, _) => {}
+            Payload::FreeText(_) | Payload::Unsupported(_) => {}
         }
     }
 
-    pub fn render(&self, resolver: &HashResolver) -> DecodedPayload {
+    pub fn to_message(&self, resolver: &HashResolver) -> StructuredMessage {
         match self {
-            Payload::FreeText(text) => DecodedPayload {
-                kind: MessageKind::FreeText,
-                text: text.trim().to_string(),
-                primary_call: None,
-                secondary_call: None,
+            Payload::FreeText(message) => StructuredMessage::FreeText {
+                i3: message.i3,
+                n3: message.n3,
+                raw: message.raw,
+                text: message.text.trim().to_string(),
             },
-            Payload::Standard(message) => {
-                let first = render_call(&message.first, resolver);
-                let second = render_call(&message.second, resolver);
-                let first_with_suffix = append_suffix(&first, message.first_suffix);
-                let second_with_suffix = append_suffix(&second, message.second_suffix);
-                let trailing = render_standard_info(message.acknowledge, &message.info);
-                let text = if trailing.is_empty() {
-                    format!("{first_with_suffix} {second_with_suffix}")
-                } else {
-                    format!("{first_with_suffix} {second_with_suffix} {trailing}")
-                };
-                DecodedPayload {
-                    kind: MessageKind::Standard,
-                    text,
-                    primary_call: extract_named_call(&message.first, resolver),
-                    secondary_call: extract_named_call(&message.second, resolver),
-                }
-            }
-            Payload::Nonstandard(message) => {
-                let hash_text = resolver
-                    .resolve12(message.hashed)
-                    .map(|callsign| format!("<{callsign}>"))
-                    .unwrap_or_else(|| "<...>".to_string());
-                let mut parts = Vec::new();
-                if message.cq {
-                    parts.push("CQ".to_string());
-                    parts.push(message.plain.clone());
-                } else if message.hashed_is_second {
-                    parts.push(message.plain.clone());
-                    parts.push(hash_text);
-                } else {
-                    parts.push(hash_text);
-                    parts.push(message.plain.clone());
-                }
-                let reply = render_reply_word(message.reply);
-                if !reply.is_empty() {
-                    parts.push(reply.to_string());
-                }
-                DecodedPayload {
-                    kind: MessageKind::Nonstandard,
-                    text: parts.join(" "),
-                    primary_call: Some(message.plain.clone()),
-                    secondary_call: resolver.resolve12(message.hashed).map(ToOwned::to_owned),
-                }
-            }
-            Payload::Unsupported(i3, n3) => DecodedPayload {
-                kind: MessageKind::Unsupported,
-                text: match n3 {
-                    Some(subtype) => format!("<unsupported:{i3}.{subtype}>"),
-                    None => format!("<unsupported:{i3}>"),
+            Payload::Standard(message) => StructuredMessage::Standard {
+                i3: message.i3,
+                first: structured_call_field(
+                    message.first_raw,
+                    &message.first,
+                    message.first_modifier.clone(),
+                    resolver,
+                ),
+                second: structured_call_field(
+                    message.second_raw,
+                    &message.second,
+                    message.second_modifier.clone(),
+                    resolver,
+                ),
+                acknowledge: message.acknowledge,
+                info: structured_info_field(message.info_raw, &message.info),
+            },
+            Payload::Nonstandard(message) => StructuredMessage::Nonstandard {
+                i3: message.i3,
+                hashed_call: HashedCallField12 {
+                    raw: message.hashed,
+                    resolved_callsign: resolver.resolve12(message.hashed).map(ToOwned::to_owned),
                 },
-                primary_call: None,
-                secondary_call: None,
+                plain_call: PlainCallField58 {
+                    raw: message.plain_raw,
+                    callsign: message.plain.clone(),
+                },
+                hashed_is_second: message.hashed_is_second,
+                reply: message.reply,
+                cq: message.cq,
+            },
+            Payload::Unsupported(message) => StructuredMessage::Unsupported {
+                i3: message.i3,
+                n3: message.n3,
+                message_bits: message.message_bits.clone(),
             },
         }
     }
 }
 
-fn extract_named_call(field: &CallField, resolver: &HashResolver) -> Option<String> {
-    match field {
-        CallField::Standard(callsign) => Some(callsign.clone()),
-        CallField::Hash22(hash) => resolver.resolve22(*hash).map(ToOwned::to_owned),
-        CallField::Token(_) => None,
+fn structured_call_field(
+    raw: u32,
+    field: &CallField,
+    modifier: Option<CallModifier>,
+    resolver: &HashResolver,
+) -> StructuredCallField {
+    let value = match field {
+        CallField::Token(token) => StructuredCallValue::Token {
+            token: token.clone(),
+        },
+        CallField::Standard(callsign) => StructuredCallValue::StandardCall {
+            callsign: callsign.clone(),
+        },
+        CallField::Hash22(hash) => StructuredCallValue::Hash22 {
+            hash: *hash,
+            resolved_callsign: resolver.resolve22(*hash).map(ToOwned::to_owned),
+        },
+    };
+    StructuredCallField {
+        raw,
+        value,
+        modifier,
     }
 }
 
-fn append_suffix(callsign: &str, suffix: Option<&'static str>) -> String {
-    match suffix {
-        Some(suffix) => format!("{callsign}{suffix}"),
-        None => callsign.to_string(),
+fn structured_info_field(raw: u16, info: &GridReport) -> StructuredInfoField {
+    let value = match info {
+        GridReport::Grid(locator) => StructuredInfoValue::Grid {
+            locator: locator.clone(),
+        },
+        GridReport::Signal(db) => StructuredInfoValue::SignalReport { db: *db },
+        GridReport::Blank => StructuredInfoValue::Blank,
+        GridReport::Reply(word) => StructuredInfoValue::Reply { word: *word },
+    };
+    StructuredInfoField { raw, value }
+}
+
+fn apply_modifier(text: String, modifier: &Option<CallModifier>) -> String {
+    match modifier {
+        Some(CallModifier::R) => format!("{text}/R"),
+        Some(CallModifier::P) => format!("{text}/P"),
+        None => text,
     }
 }
 
-fn render_call(field: &CallField, resolver: &HashResolver) -> String {
-    match field {
-        CallField::Token(token) => token.clone(),
-        CallField::Standard(callsign) => callsign.clone(),
-        CallField::Hash22(hash) => resolver
-            .resolve22(*hash)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "<...>".to_string()),
-    }
+fn render_structured_call(field: &StructuredCallField) -> String {
+    let text = match &field.value {
+        StructuredCallValue::Token { token } => token.clone(),
+        StructuredCallValue::StandardCall { callsign } => callsign.clone(),
+        StructuredCallValue::Hash22 {
+            resolved_callsign: Some(callsign),
+            ..
+        } => callsign.clone(),
+        StructuredCallValue::Hash22 {
+            resolved_callsign: None,
+            ..
+        } => "<...>".to_string(),
+    };
+    apply_modifier(text, &field.modifier)
 }
 
-fn render_standard_info(acknowledge: bool, info: &GridReport) -> String {
-    match info {
-        GridReport::Blank => {
+fn render_structured_info(acknowledge: bool, info: &StructuredInfoField) -> String {
+    match &info.value {
+        StructuredInfoValue::Blank => {
             if acknowledge {
                 "R".to_string()
             } else {
                 String::new()
             }
         }
-        GridReport::Reply(reply) => render_reply_word(*reply).to_string(),
-        GridReport::Grid(grid) => {
+        StructuredInfoValue::Reply { word } => render_reply_word(*word).to_string(),
+        StructuredInfoValue::Grid { locator } => {
             if acknowledge {
-                format!("R {grid}")
+                format!("R {locator}")
             } else {
-                grid.clone()
+                locator.clone()
             }
         }
-        GridReport::Signal(report) => {
-            let body = format!("{report:+03}");
+        StructuredInfoValue::SignalReport { db } => {
+            let body = format!("{db:+03}");
             if acknowledge {
                 format!("R{body}")
             } else {
@@ -487,4 +718,239 @@ pub fn hash_callsign(callsign: &str, nbits: u8) -> u64 {
     value
         .wrapping_mul(HASH_MULTIPLIER)
         .wrapping_shr((64 - nbits) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crc::crc14_ft8;
+    use crate::encode::{encode_nonstandard_message, encode_standard_message};
+
+    #[test]
+    fn structured_standard_to_text_preserves_acknowledge_rules() {
+        let first = StructuredCallField {
+            raw: 0,
+            value: StructuredCallValue::Token {
+                token: "K1ABC".to_string(),
+            },
+            modifier: None,
+        };
+        let second = StructuredCallField {
+            raw: 0,
+            value: StructuredCallValue::StandardCall {
+                callsign: "W1XYZ".to_string(),
+            },
+            modifier: None,
+        };
+
+        let blank = StructuredMessage::Standard {
+            i3: 1,
+            first: first.clone(),
+            second: second.clone(),
+            acknowledge: true,
+            info: StructuredInfoField {
+                raw: 0,
+                value: StructuredInfoValue::Blank,
+            },
+        };
+        assert_eq!(blank.to_text(), "K1ABC W1XYZ R");
+
+        let grid = StructuredMessage::Standard {
+            i3: 1,
+            first: first.clone(),
+            second: second.clone(),
+            acknowledge: true,
+            info: StructuredInfoField {
+                raw: 0,
+                value: StructuredInfoValue::Grid {
+                    locator: "FN31".to_string(),
+                },
+            },
+        };
+        assert_eq!(grid.to_text(), "K1ABC W1XYZ R FN31");
+
+        let signal = StructuredMessage::Standard {
+            i3: 1,
+            first,
+            second,
+            acknowledge: true,
+            info: StructuredInfoField {
+                raw: 0,
+                value: StructuredInfoValue::SignalReport { db: -7 },
+            },
+        };
+        assert_eq!(signal.to_text(), "K1ABC W1XYZ R-07");
+    }
+
+    #[test]
+    fn structured_nonstandard_to_text_preserves_variants() {
+        let unresolved = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 0,
+                resolved_callsign: None,
+            },
+            plain_call: PlainCallField58 {
+                raw: 0,
+                callsign: "K1ABC".to_string(),
+            },
+            hashed_is_second: false,
+            reply: ReplyWord::Rrr,
+            cq: false,
+        };
+        assert_eq!(unresolved.to_text(), "<...> K1ABC RRR");
+
+        let resolved_second = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 0,
+                resolved_callsign: Some("HF19NY".to_string()),
+            },
+            plain_call: PlainCallField58 {
+                raw: 0,
+                callsign: "K1ABC".to_string(),
+            },
+            hashed_is_second: true,
+            reply: ReplyWord::Blank,
+            cq: false,
+        };
+        assert_eq!(resolved_second.to_text(), "K1ABC <HF19NY>");
+
+        let cq = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 0,
+                resolved_callsign: Some("HF19NY".to_string()),
+            },
+            plain_call: PlainCallField58 {
+                raw: 0,
+                callsign: "K1ABC".to_string(),
+            },
+            hashed_is_second: false,
+            reply: ReplyWord::Blank,
+            cq: true,
+        };
+        assert_eq!(cq.to_text(), "CQ K1ABC");
+    }
+
+    #[test]
+    fn ordered_call_fields_preserve_nonstandard_position() {
+        let first_hashed = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 12,
+                resolved_callsign: Some("K1ABC".to_string()),
+            },
+            plain_call: PlainCallField58 {
+                raw: 34,
+                callsign: "HF19NY".to_string(),
+            },
+            hashed_is_second: false,
+            reply: ReplyWord::Blank,
+            cq: false,
+        };
+        assert!(matches!(
+            first_hashed.first_call_field(),
+            Some(MessageCallField::Hashed12(_))
+        ));
+        assert!(matches!(
+            first_hashed.second_call_field(),
+            Some(MessageCallField::Plain58(_))
+        ));
+
+        let second_hashed = StructuredMessage::Nonstandard {
+            i3: 4,
+            hashed_call: HashedCallField12 {
+                raw: 12,
+                resolved_callsign: Some("K1ABC".to_string()),
+            },
+            plain_call: PlainCallField58 {
+                raw: 34,
+                callsign: "HF19NY".to_string(),
+            },
+            hashed_is_second: true,
+            reply: ReplyWord::Blank,
+            cq: false,
+        };
+        assert!(matches!(
+            second_hashed.first_call_field(),
+            Some(MessageCallField::Plain58(_))
+        ));
+        assert!(matches!(
+            second_hashed.second_call_field(),
+            Some(MessageCallField::Hashed12(_))
+        ));
+    }
+
+    #[test]
+    fn payload_to_message_preserves_standard_modifiers() {
+        let frame =
+            encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank).expect("encode");
+
+        let mut message_bits = frame.message_bits.to_vec();
+        write_bits(&mut message_bits, 28, 1, 1);
+        write_bits(&mut message_bits, 57, 1, 1);
+        write_bits(&mut message_bits, 74, 3, 1);
+        let payload = payload_from_message_bits(&message_bits);
+        assert_eq!(
+            payload.to_message(&HashResolver::default()).to_text(),
+            "CQ/R K1ABC/R"
+        );
+
+        let mut portable_bits = frame.message_bits.to_vec();
+        write_bits(&mut portable_bits, 28, 1, 1);
+        write_bits(&mut portable_bits, 57, 1, 0);
+        write_bits(&mut portable_bits, 74, 3, 2);
+        let portable = payload_from_message_bits(&portable_bits);
+        assert_eq!(
+            portable.to_message(&HashResolver::default()).to_text(),
+            "CQ/P K1ABC"
+        );
+    }
+
+    #[test]
+    fn payload_to_message_preserves_nonstandard_hash_positions() {
+        let frame = encode_nonstandard_message("K1ABC", "HF19NY", true, ReplyWord::Rr73, false)
+            .expect("encode");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let unresolved = payload.to_message(&HashResolver::default());
+        assert_eq!(unresolved.to_text(), "HF19NY <...> RR73");
+
+        let mut resolver = HashResolver::default();
+        resolver.insert_callsign("K1ABC");
+        let resolved = payload.to_message(&resolver);
+        assert_eq!(resolved.to_text(), "HF19NY <K1ABC> RR73");
+    }
+
+    #[test]
+    fn structured_misc_rendering_matches_legacy_contract() {
+        let free = StructuredMessage::FreeText {
+            i3: 0,
+            n3: 0,
+            raw: 0,
+            text: " HELLO WORLD ".to_string(),
+        };
+        assert_eq!(free.to_text(), "HELLO WORLD");
+
+        let unsupported = StructuredMessage::Unsupported {
+            i3: 5,
+            n3: Some(3),
+            message_bits: vec![0; 77],
+        };
+        assert_eq!(unsupported.to_text(), "<unsupported:5.3>");
+    }
+
+    fn payload_from_message_bits(message_bits: &[u8]) -> Payload {
+        let mut codeword = Vec::with_capacity(91);
+        codeword.extend_from_slice(message_bits);
+        codeword.extend_from_slice(&crc14_ft8(message_bits));
+        unpack_message(&codeword).expect("payload")
+    }
+
+    fn write_bits(bits: &mut [u8], start: usize, len: usize, value: u64) {
+        for offset in 0..len {
+            let shift = len - offset - 1;
+            bits[start + offset] = ((value >> shift) & 1) as u8;
+        }
+    }
 }

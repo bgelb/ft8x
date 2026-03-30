@@ -88,8 +88,8 @@ fn resample_linear(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f
         return samples.to_vec();
     }
 
-    let output_len =
-        ((samples.len() as u64 * dst_rate_hz as u64) + (src_rate_hz as u64 / 2)) / src_rate_hz as u64;
+    let output_len = ((samples.len() as u64 * dst_rate_hz as u64) + (src_rate_hz as u64 / 2))
+        / src_rate_hz as u64;
     let mut output = Vec::with_capacity(output_len as usize);
     let scale = src_rate_hz as f64 / dst_rate_hz as f64;
     for index in 0..output_len as usize {

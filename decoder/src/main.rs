@@ -169,8 +169,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             message,
             pretty,
         } => {
-            let (first, second, acknowledge, info) =
-                parse_rendered_standard_message(&message).map_err(|message| {
+            let (first, second, acknowledge, info) = parse_rendered_standard_message(&message)
+                .map_err(|message| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
                 })?;
             let frame =
@@ -277,9 +277,7 @@ fn parse_rendered_standard_message(
         0 => Err(format!(
             "could not parse rendered standard message: {message:?}"
         )),
-        _ => Err(format!(
-            "ambiguous rendered standard message: {message:?}"
-        )),
+        _ => Err(format!("ambiguous rendered standard message: {message:?}")),
     }
 }
 
