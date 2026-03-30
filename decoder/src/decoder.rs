@@ -374,8 +374,20 @@ impl DecoderSession {
         audio: &AudioBuffer,
         options: &DecodeOptions,
     ) -> Result<Vec<StageDecodeReport>, DecoderError> {
-        let updates = self.decode_available_with_state(audio, options, None)?;
-        Ok(updates.into_iter().map(|(report, _)| report).collect())
+        validate_audio(audio)?;
+
+        let mut updates = Vec::new();
+        for stage in [DecodeStage::Early41, DecodeStage::Early47, DecodeStage::Full] {
+            if self.emitted_stages.contains(&stage) {
+                continue;
+            }
+            if !stage_is_enabled(stage, options) || audio.samples.len() < stage.required_samples() {
+                continue;
+            }
+            let update = self.decode_stage(audio, options, stage)?;
+            updates.push(update);
+        }
+        Ok(updates)
     }
 
     pub fn decode_available_with_state(
@@ -459,8 +471,8 @@ impl DecoderSession {
             }
         };
 
+        let report = build_decode_report_with_resolver(audio, options, search.clone(), state);
         let state = build_decoder_state(state, &search);
-        let report = build_decode_report_with_resolver(audio, options, search, Some(&state));
         let (new_decodes, updated_decodes) = diff_decodes(&self.last_decodes, &report.decodes);
         self.last_decodes = report
             .decodes
@@ -906,7 +918,9 @@ fn build_decode_report_with_resolver(
     search: SearchResult,
     base_state: Option<&DecoderState>,
 ) -> DecodeReport {
-    let resolver = merged_resolver(base_state.map(|state| &state.resolver), &search.successes);
+    let resolver = base_state
+        .map(|state| state.resolver.clone())
+        .unwrap_or_default();
 
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
