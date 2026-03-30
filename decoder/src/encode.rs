@@ -6,16 +6,21 @@ use thiserror::Error;
 
 use crate::crc::crc14_ft8;
 use crate::message::{GridReport, ReplyWord, hash_callsign};
+use crate::modes::ft8::{
+    FT8_GEOMETRY, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES,
+};
+use crate::modes::populate_channel_symbols;
 use crate::protocol::{
-    CALL_NTOKENS, CALL_STANDARD_BASE, FT8_COSTAS, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE,
-    FT8_SYMBOL_SAMPLES, GRAY_TONES_TO_BITS,
+    CALL_NTOKENS, CALL_STANDARD_BASE, FTX_CODEWORD_BITS, FTX_DATA_SYMBOLS, FTX_INFO_BITS,
+    FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_STANDARD_SLASH_R,
+    FTX_NONSTANDARD_LAYOUT, FTX_STANDARD_LAYOUT, GRAY_TONES_TO_BITS,
 };
 use crate::wave::{AudioBuffer, DecoderError, write_wav};
 
-const MESSAGE_BITS: usize = 77;
-const INFO_BITS: usize = 91;
-const CODEWORD_BITS: usize = 174;
-const DATA_SYMBOLS: usize = 58;
+const MESSAGE_BITS: usize = FTX_MESSAGE_BITS;
+const INFO_BITS: usize = FTX_INFO_BITS;
+const CODEWORD_BITS: usize = FTX_CODEWORD_BITS;
+const DATA_SYMBOLS: usize = FTX_DATA_SYMBOLS;
 const GFSK_BT: f32 = 2.0;
 
 #[derive(Debug, Clone)]
@@ -64,13 +69,48 @@ pub fn encode_standard_message(
     info: &GridReport,
 ) -> Result<EncodedFrame, EncodeError> {
     let mut message_bits = [0u8; MESSAGE_BITS];
-    write_bits(&mut message_bits, 0, 28, u64::from(encode_c28(first)?));
-    write_bits(&mut message_bits, 28, 1, 0);
-    write_bits(&mut message_bits, 29, 28, u64::from(encode_c28(second)?));
-    write_bits(&mut message_bits, 57, 1, 0);
-    write_bits(&mut message_bits, 58, 1, acknowledge as u64);
-    write_bits(&mut message_bits, 59, 15, u64::from(encode_g15(info)?));
-    write_bits(&mut message_bits, 74, 3, 1);
+    write_bits(
+        &mut message_bits,
+        FTX_STANDARD_LAYOUT.first_call.start,
+        FTX_STANDARD_LAYOUT.first_call.len,
+        u64::from(encode_c28(first)?),
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_STANDARD_LAYOUT.first_suffix.start,
+        FTX_STANDARD_LAYOUT.first_suffix.len,
+        0,
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_STANDARD_LAYOUT.second_call.start,
+        FTX_STANDARD_LAYOUT.second_call.len,
+        u64::from(encode_c28(second)?),
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_STANDARD_LAYOUT.second_suffix.start,
+        FTX_STANDARD_LAYOUT.second_suffix.len,
+        0,
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_STANDARD_LAYOUT.acknowledge.start,
+        FTX_STANDARD_LAYOUT.acknowledge.len,
+        acknowledge as u64,
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_STANDARD_LAYOUT.info.start,
+        FTX_STANDARD_LAYOUT.info.len,
+        u64::from(encode_g15(info)?),
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_STANDARD_LAYOUT.kind.start,
+        FTX_STANDARD_LAYOUT.kind.len,
+        u64::from(FTX_MESSAGE_KIND_STANDARD_SLASH_R),
+    );
     build_frame(message_bits)
 }
 
@@ -84,20 +124,40 @@ pub fn encode_nonstandard_message(
     let mut message_bits = [0u8; MESSAGE_BITS];
     write_bits(
         &mut message_bits,
-        0,
-        12,
+        FTX_NONSTANDARD_LAYOUT.hashed_call.start,
+        FTX_NONSTANDARD_LAYOUT.hashed_call.len,
         hash_callsign(&hashed_callsign.trim().to_uppercase(), 12),
     );
     write_bits(
         &mut message_bits,
-        12,
-        58,
+        FTX_NONSTANDARD_LAYOUT.plain_call.start,
+        FTX_NONSTANDARD_LAYOUT.plain_call.len,
         encode_c58(plain_callsign)? as u64,
     );
-    write_bits(&mut message_bits, 70, 1, hashed_is_second as u64);
-    write_bits(&mut message_bits, 71, 2, encode_r2(reply) as u64);
-    write_bits(&mut message_bits, 73, 1, cq as u64);
-    write_bits(&mut message_bits, 74, 3, 4);
+    write_bits(
+        &mut message_bits,
+        FTX_NONSTANDARD_LAYOUT.hashed_is_second.start,
+        FTX_NONSTANDARD_LAYOUT.hashed_is_second.len,
+        hashed_is_second as u64,
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_NONSTANDARD_LAYOUT.reply.start,
+        FTX_NONSTANDARD_LAYOUT.reply.len,
+        encode_r2(reply) as u64,
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_NONSTANDARD_LAYOUT.cq.start,
+        FTX_NONSTANDARD_LAYOUT.cq.len,
+        cq as u64,
+    );
+    write_bits(
+        &mut message_bits,
+        FTX_NONSTANDARD_LAYOUT.kind.start,
+        FTX_NONSTANDARD_LAYOUT.kind.len,
+        u64::from(FTX_MESSAGE_KIND_NONSTANDARD),
+    );
     build_frame(message_bits)
 }
 
@@ -124,11 +184,8 @@ fn build_frame(message_bits: [u8; MESSAGE_BITS]) -> Result<EncodedFrame, EncodeE
     }
 
     let mut channel_symbols = [0u8; FT8_MESSAGE_SYMBOLS];
-    channel_symbols[..7].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[36..43].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[72..79].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[7..36].copy_from_slice(&data_symbols[..29]);
-    channel_symbols[43..72].copy_from_slice(&data_symbols[29..]);
+    populate_channel_symbols(&mut channel_symbols, &FT8_GEOMETRY, &data_symbols)
+        .expect("ft8 channel layout");
 
     Ok(EncodedFrame {
         message_bits,
@@ -236,11 +293,8 @@ pub fn channel_symbols_from_codeword_bits(
     }
 
     let mut channel_symbols = [0u8; FT8_MESSAGE_SYMBOLS];
-    channel_symbols[..7].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[36..43].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[72..79].copy_from_slice(&FT8_COSTAS.map(|tone| tone as u8));
-    channel_symbols[7..36].copy_from_slice(&data_symbols[..29]);
-    channel_symbols[43..72].copy_from_slice(&data_symbols[29..]);
+    populate_channel_symbols(&mut channel_symbols, &FT8_GEOMETRY, &data_symbols)
+        .expect("ft8 channel layout");
     Some(channel_symbols)
 }
 

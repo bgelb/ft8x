@@ -3,7 +3,12 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::crc;
-use crate::protocol::{CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, HASH_MULTIPLIER};
+use crate::protocol::{
+    CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FTX_INFO_BITS,
+    FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_STANDARD_SLASH_P,
+    FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT, FTX_STANDARD_LAYOUT,
+    HASH_MULTIPLIER,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub enum MessageKind {
@@ -316,19 +321,23 @@ impl HashResolver {
 }
 
 pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
-    if codeword.len() < 91 {
+    if codeword.len() < FTX_INFO_BITS {
         return None;
     }
-    let message_bits = &codeword[..77];
-    let crc_bits = &codeword[77..91];
+    let message_bits = &codeword[..FTX_MESSAGE_BITS];
+    let crc_bits = &codeword[FTX_MESSAGE_BITS..FTX_INFO_BITS];
     if !crc::crc_matches(message_bits, crc_bits) {
         return None;
     }
 
-    let i3 = read_bits(message_bits, 74, 3) as u8;
+    let i3 = read_bits(
+        message_bits,
+        FTX_STANDARD_LAYOUT.kind.start,
+        FTX_STANDARD_LAYOUT.kind.len,
+    ) as u8;
     match i3 {
         0 => {
-            let n3 = read_bits(message_bits, 71, 3) as u8;
+            let n3 = read_bits(message_bits, FTX_NONSTANDARD_LAYOUT.reply.start, 3) as u8;
             match n3 {
                 0 => {
                     let raw = read_bits_u128(message_bits, 0, 71);
@@ -346,38 +355,88 @@ pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
                 })),
             }
         }
-        1 | 2 => {
-            let first_raw = read_bits(message_bits, 0, 28) as u32;
-            let second_raw = read_bits(message_bits, 29, 28) as u32;
-            let modifier = if i3 == 1 {
+        FTX_MESSAGE_KIND_STANDARD_SLASH_R | FTX_MESSAGE_KIND_STANDARD_SLASH_P => {
+            let first_raw = read_bits(
+                message_bits,
+                FTX_STANDARD_LAYOUT.first_call.start,
+                FTX_STANDARD_LAYOUT.first_call.len,
+            ) as u32;
+            let second_raw = read_bits(
+                message_bits,
+                FTX_STANDARD_LAYOUT.second_call.start,
+                FTX_STANDARD_LAYOUT.second_call.len,
+            ) as u32;
+            let modifier = if i3 == FTX_MESSAGE_KIND_STANDARD_SLASH_R {
                 CallModifier::R
             } else {
                 CallModifier::P
             };
-            let info_raw = read_bits(message_bits, 59, 15) as u16;
+            let info_raw = read_bits(
+                message_bits,
+                FTX_STANDARD_LAYOUT.info.start,
+                FTX_STANDARD_LAYOUT.info.len,
+            ) as u16;
             Some(Payload::Standard(StandardMessage {
                 i3,
                 first_raw,
                 first: decode_c28(first_raw as u64),
-                first_modifier: read_bits(message_bits, 28, 1)
-                    .eq(&1)
+                first_modifier: (read_bits(
+                    message_bits,
+                    FTX_STANDARD_LAYOUT.first_suffix.start,
+                    FTX_STANDARD_LAYOUT.first_suffix.len,
+                ) == 1)
                     .then_some(modifier.clone()),
                 second_raw,
                 second: decode_c28(second_raw as u64),
-                second_modifier: read_bits(message_bits, 57, 1).eq(&1).then_some(modifier),
-                acknowledge: read_bits(message_bits, 58, 1) == 1,
+                second_modifier: (read_bits(
+                    message_bits,
+                    FTX_STANDARD_LAYOUT.second_suffix.start,
+                    FTX_STANDARD_LAYOUT.second_suffix.len,
+                ) == 1)
+                    .then_some(modifier),
+                acknowledge: read_bits(
+                    message_bits,
+                    FTX_STANDARD_LAYOUT.acknowledge.start,
+                    FTX_STANDARD_LAYOUT.acknowledge.len,
+                ) == 1,
                 info_raw,
                 info: decode_g15(info_raw as u64),
             }))
         }
-        4 => Some(Payload::Nonstandard(NonstandardMessage {
+        FTX_MESSAGE_KIND_NONSTANDARD => Some(Payload::Nonstandard(NonstandardMessage {
             i3,
-            hashed: read_bits(message_bits, 0, 12) as u16,
-            plain_raw: read_bits_u128(message_bits, 12, 58),
-            plain: decode_c58(read_bits_u128(message_bits, 12, 58)),
-            hashed_is_second: read_bits(message_bits, 70, 1) == 1,
-            reply: decode_r2(read_bits(message_bits, 71, 2) as u8),
-            cq: read_bits(message_bits, 73, 1) == 1,
+            hashed: read_bits(
+                message_bits,
+                FTX_NONSTANDARD_LAYOUT.hashed_call.start,
+                FTX_NONSTANDARD_LAYOUT.hashed_call.len,
+            ) as u16,
+            plain_raw: read_bits_u128(
+                message_bits,
+                FTX_NONSTANDARD_LAYOUT.plain_call.start,
+                FTX_NONSTANDARD_LAYOUT.plain_call.len,
+            ),
+            plain: decode_c58(read_bits_u128(
+                message_bits,
+                FTX_NONSTANDARD_LAYOUT.plain_call.start,
+                FTX_NONSTANDARD_LAYOUT.plain_call.len,
+            )),
+            hashed_is_second: read_bits(
+                message_bits,
+                FTX_NONSTANDARD_LAYOUT.hashed_is_second.start,
+                FTX_NONSTANDARD_LAYOUT.hashed_is_second.len,
+            ) == 1,
+            reply: decode_r2(
+                read_bits(
+                    message_bits,
+                    FTX_NONSTANDARD_LAYOUT.reply.start,
+                    FTX_NONSTANDARD_LAYOUT.reply.len,
+                ) as u8,
+            ),
+            cq: read_bits(
+                message_bits,
+                FTX_NONSTANDARD_LAYOUT.cq.start,
+                FTX_NONSTANDARD_LAYOUT.cq.len,
+            ) == 1,
         })),
         other => Some(Payload::Unsupported(UnsupportedMessage {
             i3: other,

@@ -3,6 +3,7 @@ mod decoder;
 mod encode;
 mod ldpc;
 mod message;
+mod modes;
 mod protocol;
 mod wave;
 
