@@ -11,8 +11,11 @@ use crate::encode::{channel_symbols_from_codeword_bits, synthesize_channel_refer
 use crate::ldpc::ParityMatrix;
 use crate::message::{GridReport, HashResolver, Payload, StructuredMessage, unpack_message};
 use crate::modes::{ModeSpec, all_costas_positions};
-use crate::modes::ft8::{FT8_SAMPLE_RATE, FT8_SPEC, FT8_SYMBOL_SAMPLES};
+use crate::modes::ft8::FT8_SPEC;
 use crate::wave::{AudioBuffer, DecoderError, load_wav};
+
+#[cfg(test)]
+use crate::modes::ft8::FT8_SAMPLE_RATE;
 
 mod metrics;
 mod refine;
@@ -173,6 +176,10 @@ pub enum DecodeStage {
 }
 
 impl DecodeStage {
+    pub const fn ordered() -> [Self; 3] {
+        [Self::Early41, Self::Early47, Self::Full]
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Early41 => "early41",
@@ -183,8 +190,8 @@ impl DecodeStage {
 
     pub fn required_samples(self) -> usize {
         match self {
-            Self::Early41 => EARLY_41_SAMPLES,
-            Self::Early47 => EARLY_47_SAMPLES,
+            Self::Early41 => ACTIVE_MODE.early41_samples(),
+            Self::Early47 => ACTIVE_MODE.early47_samples(),
             Self::Full => LONG_INPUT_SAMPLES,
         }
     }
@@ -271,7 +278,6 @@ struct DecodeCounters {
 #[derive(Debug, Clone)]
 struct SearchResult {
     successes: Vec<SuccessfulDecode>,
-    residual_audio: AudioBuffer,
     frame_count: usize,
     usable_bins: usize,
     top_candidates: Vec<DecodeCandidate>,
@@ -329,10 +335,9 @@ const ACTIVE_MODE: ModeSpec = FT8_SPEC;
 
 const LONG_INPUT_SAMPLES: usize = ACTIVE_MODE.tuning.long_input_samples;
 const LONG_FFT_SAMPLES: usize = ACTIVE_MODE.tuning.long_fft_samples;
-const DOWNSAMPLE_FACTOR: usize = ACTIVE_MODE.tuning.downsample_factor;
 const SYNC8_EARLY_THRESHOLD: f32 = ACTIVE_MODE.tuning.sync_early_threshold;
-const BASEBAND_SAMPLES: usize = LONG_FFT_SAMPLES / DOWNSAMPLE_FACTOR;
-const BASEBAND_SYMBOL_SAMPLES: usize = ACTIVE_MODE.geometry.symbol_samples / DOWNSAMPLE_FACTOR;
+const BASEBAND_SAMPLES: usize = ACTIVE_MODE.baseband_samples();
+const BASEBAND_SYMBOL_SAMPLES: usize = ACTIVE_MODE.baseband_symbol_samples();
 const BASEBAND_TAPER_LEN: usize = ACTIVE_MODE.tuning.baseband_taper_len;
 const SUBTRACT_FILTER_SAMPLES: usize = ACTIVE_MODE.tuning.subtract_filter_samples;
 const SUBTRACT_FILTER_HALF: usize = SUBTRACT_FILTER_SAMPLES / 2;
@@ -394,13 +399,20 @@ fn debug_candidate_pcm_inner(
     freq_hz: f32,
     truth_codeword_bits: Option<&[u8]>,
 ) -> Option<CandidateDebugReport> {
-    if audio.sample_rate_hz != FT8_SAMPLE_RATE || audio.samples.len() < FT8_SYMBOL_SAMPLES {
+    if audio.sample_rate_hz != ACTIVE_MODE.geometry.sample_rate_hz
+        || audio.samples.len() < ACTIVE_MODE.geometry.symbol_samples
+    {
         return None;
     }
 
     let long_spectrum = build_long_spectrum(audio);
     let baseband_plan = BasebandPlan::new();
-    let refined = refine_candidate(&long_spectrum, &baseband_plan, dt_seconds + 0.5, freq_hz)?;
+    let refined = refine_candidate(
+        &long_spectrum,
+        &baseband_plan,
+        ACTIVE_MODE.start_seconds_from_dt(dt_seconds),
+        freq_hz,
+    )?;
     let parity = ParityMatrix::global();
     let mut counters = DecodeCounters::default();
     let mut passes = Vec::new();
@@ -467,9 +479,12 @@ fn debug_candidate_pcm_inner(
         truth_codeword_bits,
     );
 
-    if let Some(seed) =
-        extract_candidate_at(&long_spectrum, &baseband_plan, dt_seconds + 0.5, freq_hz)
-    {
+    if let Some(seed) = extract_candidate_at(
+        &long_spectrum,
+        &baseband_plan,
+        ACTIVE_MODE.start_seconds_from_dt(dt_seconds),
+        freq_hz,
+    ) {
         append_debug_passes(
             &mut passes,
             "seed",
@@ -539,11 +554,11 @@ fn debug_candidate_pcm_inner(
     }
 
     Some(CandidateDebugReport {
-        coarse_start_seconds: dt_seconds + 0.5,
+        coarse_start_seconds: ACTIVE_MODE.start_seconds_from_dt(dt_seconds),
         coarse_dt_seconds: dt_seconds,
         coarse_freq_hz: freq_hz,
         refined_start_seconds: refined.start_seconds,
-        refined_dt_seconds: refined.start_seconds - 0.5,
+        refined_dt_seconds: ACTIVE_MODE.dt_seconds_from_start(refined.start_seconds),
         refined_freq_hz: refined.freq_hz,
         sync_score: refined.sync_score,
         snr_db: refined.snr_db,
@@ -658,7 +673,7 @@ mod tests {
         eprintln!(
             "refined start={:.4} dt={:.4} freq={:.4} sync={:.3} snr={}",
             refined.start_seconds,
-            refined.start_seconds - 0.5,
+            ACTIVE_MODE.dt_seconds_from_start(refined.start_seconds),
             refined.freq_hz,
             refined.sync_score,
             refined.snr_db
@@ -824,6 +839,42 @@ mod tests {
             assert!(
                 source.contains("ACTIVE_MODE"),
                 "shared decoder module should route geometry through ACTIVE_MODE"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_decoder_modules_avoid_raw_ft8_timing_literals() {
+        for source in [
+            include_str!("decoder/search.rs"),
+            include_str!("decoder/refine.rs"),
+            include_str!("decoder/subtract.rs"),
+            include_str!("decoder/metrics.rs"),
+            include_str!("decoder/session.rs"),
+        ] {
+            for fragment in ["dt_seconds + 0.5", "start_seconds - 0.5", "(lag as f32 - 0.5)"] {
+                assert!(
+                    !source.contains(fragment),
+                    "shared decoder module still contains raw FT8 timing literal: {fragment}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_agents_file_codifies_cleanup_contract() {
+        let agents = include_str!("../AGENTS.md");
+        for required in [
+            "## Decoder Code Contract",
+            "Route geometry, layout, and timing semantics through `ModeSpec`",
+            "Don’t add direct `FT8_` references to shared decoder submodules.",
+            "Don’t add raw FT8 timing arithmetic like `dt + 0.5`",
+            "## Future Modes",
+            "Run `cargo test`, `cargo build --release`, and the full `medium` regression",
+        ] {
+            assert!(
+                agents.contains(required),
+                "decoder/AGENTS.md missing required guidance: {required}"
             );
         }
     }

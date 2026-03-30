@@ -40,7 +40,7 @@ pub(super) fn refine_candidate_with_cache(
     let mut best_freq_hz = coarse_freq_hz;
     best_score = f32::NEG_INFINITY;
     for ifr in -5..=5 {
-        let residual_hz = ifr as f32 * 0.5;
+        let residual_hz = ACTIVE_MODE.residual_hz_from_half_step(ifr);
         let sync_score = sync8d(initial_baseband, ibest, residual_hz);
         if sync_score > best_score {
             best_score = sync_score;
@@ -178,24 +178,17 @@ pub(super) fn downsample_candidate(
     }
 
     let mut baseband = vec![Complex32::new(0.0, 0.0); BASEBAND_SAMPLES];
-    let mut copied = 0usize;
-    for bin in ib..=it {
-        let index = copied;
-        if index >= baseband.len() {
-            break;
-        }
-        baseband[index] = long_spectrum.bins[bin as usize];
-        copied += 1;
-    }
+    let copied = copy_band_into_baseband(
+        &mut baseband,
+        &long_spectrum.bins,
+        ib as usize,
+        it as usize + 1,
+    );
     if copied <= BASEBAND_TAPER_LEN * 2 {
         return None;
     }
 
-    let taper = baseband_taper();
-    for index in 0..=BASEBAND_TAPER_LEN {
-        baseband[index] *= taper[BASEBAND_TAPER_LEN - index];
-        baseband[copied - 1 - index] *= taper[BASEBAND_TAPER_LEN - index];
-    }
+    apply_symmetric_taper(&mut baseband[..copied], baseband_taper());
 
     let shift = (i0 - ib).max(0) as usize;
     let rotate = shift.min(baseband.len());
@@ -212,7 +205,7 @@ pub(super) fn downsample_candidate(
 pub(super) fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
     let geometry = &ACTIVE_MODE.geometry;
     let mut sync = 0.0f32;
-    let valid_samples = baseband.len().min(ACTIVE_MODE.tuning.baseband_valid_samples);
+    let valid_samples = baseband.len().min(ACTIVE_MODE.baseband_valid_samples());
     let waveforms = sync8d_waveforms();
     let tweak = (residual_hz != 0.0).then(|| sync8d_tweak(residual_hz));
     for (offset, tone) in geometry.costas_pattern.iter().copied().enumerate() {
@@ -246,7 +239,7 @@ pub(super) fn extract_symbol_tones(
 ) -> Vec<[Complex32; 8]> {
     let geometry = &ACTIVE_MODE.geometry;
     let mut tones = vec![[Complex32::new(0.0, 0.0); 8]; geometry.message_symbols];
-    let valid_samples = baseband.len().min(ACTIVE_MODE.tuning.baseband_valid_samples);
+    let valid_samples = baseband.len().min(ACTIVE_MODE.baseband_valid_samples());
     for (symbol_index, symbol_tones) in tones.iter_mut().enumerate() {
         let sample_index = start_index + (symbol_index * BASEBAND_SYMBOL_SAMPLES) as isize;
         if sample_index < 0 || sample_index as usize + BASEBAND_SYMBOL_SAMPLES > valid_samples {
@@ -264,7 +257,7 @@ pub(super) fn extract_symbol_tones(
 pub(super) fn baseband_taper() -> &'static [f32] {
     static TAPER: OnceLock<Vec<f32>> = OnceLock::new();
     TAPER.get_or_init(|| {
-        let taper_len = ACTIVE_MODE.tuning.baseband_taper_len;
+        let taper_len = ACTIVE_MODE.baseband_taper_len();
         (0..=taper_len)
             .map(|index| {
                 0.5 * (1.0
@@ -272,6 +265,25 @@ pub(super) fn baseband_taper() -> &'static [f32] {
             })
             .collect()
     })
+}
+
+pub(super) fn copy_band_into_baseband(
+    baseband: &mut [Complex32],
+    bins: &[Complex32],
+    start_bin: usize,
+    end_bin: usize,
+) -> usize {
+    let copied = baseband.len().min(end_bin.saturating_sub(start_bin));
+    baseband[..copied].copy_from_slice(&bins[start_bin..start_bin + copied]);
+    copied
+}
+
+pub(super) fn apply_symmetric_taper(baseband: &mut [Complex32], taper: &[f32]) {
+    for (offset, &gain) in taper.iter().rev().enumerate() {
+        baseband[offset] *= gain;
+        let tail_index = baseband.len() - 1 - offset;
+        baseband[tail_index] *= gain;
+    }
 }
 
 pub(super) fn correlate_tone_nominal(segment: &[Complex32], tone: usize) -> Complex32 {
@@ -389,13 +401,12 @@ mod tests {
 
     #[test]
     fn baseband_taper_application_is_symmetric() {
-        let taper = baseband_taper();
         let copied = BASEBAND_TAPER_LEN * 2 + 8;
-        let mut gains = vec![1.0f32; copied];
-        for index in 0..=BASEBAND_TAPER_LEN {
-            gains[index] *= taper[BASEBAND_TAPER_LEN - index];
-            gains[copied - 1 - index] *= taper[BASEBAND_TAPER_LEN - index];
-        }
+        let mut gains: Vec<_> = vec![1.0f32; copied]
+            .into_iter()
+            .map(|value| Complex32::new(value, 0.0))
+            .collect();
+        apply_symmetric_taper(&mut gains, baseband_taper());
 
         for index in 0..=BASEBAND_TAPER_LEN {
             assert_eq!(gains[index], gains[copied - 1 - index]);

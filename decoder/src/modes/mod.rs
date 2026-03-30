@@ -48,6 +48,7 @@ pub struct SearchTuning {
     pub early_block_samples: usize,
     pub subtraction_refine_cutoff_seconds: f32,
     pub subtraction_refine_probe_step_samples: isize,
+    pub refine_residual_step_hz: f32,
     pub nfqso_hz: f32,
     pub nfqso_priority_window_hz: f32,
     pub candidate_separation_hz: f32,
@@ -66,6 +67,10 @@ pub struct ModeSpec {
 }
 
 impl ModeSpec {
+    pub const fn nominal_start_seconds(&self) -> f32 {
+        self.tuning.nominal_start_seconds
+    }
+
     pub fn sync_fft_samples(&self) -> usize {
         self.geometry.symbol_samples * self.tuning.sync_fft_symbol_window
     }
@@ -78,15 +83,24 @@ impl ModeSpec {
         self.sync_step_samples() as f32 / self.geometry.sample_rate_hz as f32
     }
 
+    pub fn nominal_start_sync_lag(&self) -> isize {
+        (self.nominal_start_seconds() / self.sync_step_seconds()) as isize
+    }
+
+    pub fn nominal_start_sync_fraction(&self) -> f32 {
+        self.nominal_start_seconds() / self.sync_step_seconds()
+            - self.nominal_start_sync_lag() as f32
+    }
+
     pub fn baseband_rate_hz(&self) -> f32 {
         self.geometry.sample_rate_hz as f32 / self.tuning.downsample_factor as f32
     }
 
-    pub fn baseband_samples(&self) -> usize {
+    pub const fn baseband_samples(&self) -> usize {
         self.tuning.long_fft_samples / self.tuning.downsample_factor
     }
 
-    pub fn baseband_symbol_samples(&self) -> usize {
+    pub const fn baseband_symbol_samples(&self) -> usize {
         self.geometry.symbol_samples / self.tuning.downsample_factor
     }
 
@@ -106,10 +120,57 @@ impl ModeSpec {
         47 * self.tuning.early_block_samples
     }
 
+    pub const fn baseband_taper_len(&self) -> usize {
+        self.tuning.baseband_taper_len
+    }
+
+    pub const fn baseband_valid_samples(&self) -> usize {
+        self.tuning.baseband_valid_samples
+    }
+
+    pub const fn codeword_half_bits(&self) -> usize {
+        self.geometry.data_symbol_positions.len() * 3 / 2
+    }
+
+    pub const fn groups_per_half(&self) -> usize {
+        self.geometry.data_symbol_positions.len() / 2
+    }
+
+    pub fn bitmetric_half_start_symbols(&self) -> [usize; 2] {
+        let groups_per_half = self.groups_per_half();
+        [
+            self.geometry.data_symbol_positions[0] - 1,
+            self.geometry.data_symbol_positions[groups_per_half] - 1,
+        ]
+    }
+
+    pub const fn sync_tone_span_bins(&self) -> usize {
+        self.geometry.costas_pattern.len()
+    }
+
+    pub fn start_seconds_from_dt(&self, dt_seconds: f32) -> f32 {
+        dt_seconds + self.nominal_start_seconds()
+    }
+
+    pub fn dt_seconds_from_start(&self, start_seconds: f32) -> f32 {
+        start_seconds - self.nominal_start_seconds()
+    }
+
+    pub fn candidate_start_seconds_from_lag(&self, lag: isize) -> f32 {
+        self.start_seconds_from_dt(self.candidate_dt_seconds_from_lag(lag))
+    }
+
+    pub fn candidate_dt_seconds_from_lag(&self, lag: isize) -> f32 {
+        (lag as f32 - self.nominal_start_sync_fraction()) * self.sync_step_seconds()
+    }
+
+    pub fn residual_hz_from_half_step(&self, step: isize) -> f32 {
+        step as f32 * self.tuning.refine_residual_step_hz
+    }
+
     pub fn start_sample_from_dt(&self, dt_seconds: f32) -> isize {
-        ((dt_seconds + self.tuning.nominal_start_seconds) * self.geometry.sample_rate_hz as f32
-            + 1.0)
-            .trunc() as isize
+        ((self.start_seconds_from_dt(dt_seconds) * self.geometry.sample_rate_hz as f32 + 1.0)
+            .trunc()) as isize
             - 1
     }
 
@@ -199,6 +260,7 @@ mod tests {
         early_block_samples: 96,
         subtraction_refine_cutoff_seconds: 0.125,
         subtraction_refine_probe_step_samples: 12,
+        refine_residual_step_hz: 0.25,
         nfqso_hz: 900.0,
         nfqso_priority_window_hz: 5.0,
         candidate_separation_hz: 2.0,
@@ -238,6 +300,18 @@ mod tests {
         assert_eq!(MOCK_SPEC.baseband_symbol_samples(), 20);
         assert_eq!(MOCK_SPEC.early41_samples(), 3_936);
         assert_eq!(MOCK_SPEC.early47_samples(), 4_512);
+        assert_eq!(MOCK_SPEC.nominal_start_sync_lag(), 25);
+        assert_eq!(MOCK_SPEC.nominal_start_sync_fraction(), 0.0);
+        assert_eq!(MOCK_SPEC.codeword_half_bits(), 6);
+        assert_eq!(MOCK_SPEC.groups_per_half(), 2);
+        assert_eq!(MOCK_SPEC.bitmetric_half_start_symbols(), [1, 5]);
+        assert_eq!(MOCK_SPEC.sync_tone_span_bins(), 2);
+        assert_eq!(MOCK_SPEC.nominal_start_seconds(), 0.25);
+        assert!((MOCK_SPEC.start_seconds_from_dt(0.1) - 0.35).abs() < 1e-6);
+        assert!((MOCK_SPEC.dt_seconds_from_start(0.35) - 0.1).abs() < 1e-6);
+        assert!((MOCK_SPEC.candidate_start_seconds_from_lag(3) - 0.28).abs() < 1e-6);
+        assert!((MOCK_SPEC.candidate_dt_seconds_from_lag(3) - 0.03).abs() < 1e-6);
+        assert_eq!(MOCK_SPEC.residual_hz_from_half_step(2), 0.5);
         assert_eq!(MOCK_SPEC.start_sample_from_dt(0.0), 1_000);
     }
 }

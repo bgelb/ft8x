@@ -6,6 +6,7 @@ pub const FT8_SYMBOL_SAMPLES: usize = 1_920;
 pub const FT8_TONE_SPACING_HZ: f32 = 6.25;
 pub const FT8_MESSAGE_SYMBOLS: usize = 79;
 pub const FT8_PAYLOAD_SYMBOLS: usize = FTX_DATA_SYMBOLS;
+pub const FT8_HOPS_PER_SYMBOL: usize = 8;
 pub const FT8_SYNC_BLOCK_STARTS: [usize; 3] = [0, 36, 72];
 pub const FT8_COSTAS: [usize; 7] = [3, 1, 4, 0, 6, 5, 2];
 pub const FT8_DATA_POSITIONS: [usize; FT8_PAYLOAD_SYMBOLS] = [
@@ -13,8 +14,7 @@ pub const FT8_DATA_POSITIONS: [usize; FT8_PAYLOAD_SYMBOLS] = [
     31, 32, 33, 34, 35, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
     62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
 ];
-pub const FT8_HOP_SAMPLES: usize = 240;
-pub const FT8_HOPS_PER_SYMBOL: usize = FT8_SYMBOL_SAMPLES / FT8_HOP_SAMPLES;
+pub const FT8_HOP_SAMPLES: usize = FT8_SYMBOL_SAMPLES / FT8_HOPS_PER_SYMBOL;
 
 pub const FT8_GEOMETRY: FrameGeometry = FrameGeometry {
     sample_rate_hz: FT8_SAMPLE_RATE,
@@ -48,6 +48,7 @@ pub const FT8_TUNING: SearchTuning = SearchTuning {
     early_block_samples: 3_456,
     subtraction_refine_cutoff_seconds: 0.396,
     subtraction_refine_probe_step_samples: 90,
+    refine_residual_step_hz: 0.5,
     nfqso_hz: 1_500.0,
     nfqso_priority_window_hz: 10.0,
     candidate_separation_hz: 4.0,
