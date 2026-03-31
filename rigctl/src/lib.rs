@@ -1,5 +1,8 @@
 pub mod audio {
-    pub use audiolib::{AudioDevice, AudioStreamConfig, CaptureStats, Error, Result, SampleStream, list_input_devices};
+    pub use audiolib::{
+        AudioDevice, AudioStreamConfig, CaptureStats, Error, Result, SampleStream, list_input_devices,
+        list_output_devices, play_tone,
+    };
 }
 
 use serialport::{ClearBuffer, SerialPort};
@@ -263,6 +266,35 @@ pub struct SignalLevel {
     pub receiving: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarGraphReading {
+    pub level: u8,
+    pub receiving: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxMeterMode {
+    Rf,
+    Alc,
+}
+
+impl TxMeterMode {
+    fn code(self) -> u8 {
+        match self {
+            Self::Rf => 0,
+            Self::Alc => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Rf),
+            1 => Some(Self::Alc),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RigState {
     pub frequency_hz: u64,
@@ -378,14 +410,87 @@ impl K3s {
         let high_res = self.query("SMH;", &["SMH"]).ok().and_then(|rsp| parse_prefixed_u16("SMH", &rsp).ok());
         let coarse_rsp = self.query("SM;", &["SM"])?;
         let coarse = parse_prefixed_u16("SM", &coarse_rsp)?;
-        let bar_rsp = self.query("BG;", &["BG"])?;
-        let (bar_graph, receiving) = parse_bg(&bar_rsp)?;
+        let bar_graph = self.get_bar_graph()?;
         Ok(SignalLevel {
             coarse,
             high_res,
-            bar_graph: Some(bar_graph),
-            receiving,
+            bar_graph: Some(bar_graph.level),
+            receiving: bar_graph.receiving,
         })
+    }
+
+    pub fn get_bar_graph(&mut self) -> Result<BarGraphReading> {
+        let bar_rsp = self.query("BG;", &["BG"])?;
+        let (level, receiving) = parse_bg(&bar_rsp)?;
+        Ok(BarGraphReading { level, receiving })
+    }
+
+    pub fn get_configured_power_w(&mut self) -> Result<f32> {
+        let response = self.query("PC;", &["PC"])?;
+        parse_power_control(&response)
+    }
+
+    pub fn set_configured_power_w(&mut self, watts: f32) -> Result<()> {
+        if !(0.1..=110.0).contains(&watts) {
+            return Err(Error::UnexpectedResponse {
+                command: "PC;".to_string(),
+                response: format!("unsupported power setting {watts}"),
+            });
+        }
+        let command = if watts < 10.0 {
+            let tenths = (watts * 10.0).round() as u16;
+            format!("PC{tenths:03}0;")
+        } else {
+            let whole = watts.round() as u16;
+            format!("PC{whole:03}1;")
+        };
+        self.send_set(&command)
+    }
+
+    pub fn set_tx_meter_mode(&mut self, mode: TxMeterMode) -> Result<()> {
+        self.send_set(&format!("TM{};", mode.code()))
+    }
+
+    pub fn get_tx_meter_mode(&mut self) -> Result<TxMeterMode> {
+        let response = self.query("TM;", &["TM"])?;
+        let code = parse_prefixed_u8("TM", &response)?;
+        TxMeterMode::from_code(code).ok_or_else(|| Error::UnexpectedResponse {
+            command: "TM;".to_string(),
+            response,
+        })
+    }
+
+    pub fn is_transmitting(&mut self) -> Result<bool> {
+        let response = self.query("TQ;", &["TQ"])?;
+        let code = parse_prefixed_u8("TQ", &response)?;
+        match code {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::UnexpectedResponse {
+                command: "TQ;".to_string(),
+                response,
+            }),
+        }
+    }
+
+    pub fn enter_tx(&mut self) -> Result<()> {
+        self.send_set("TX;")
+    }
+
+    pub fn enter_rx(&mut self) -> Result<()> {
+        self.send_set("RX;")
+    }
+
+    pub fn get_last_tx_swr(&mut self) -> Result<f32> {
+        let response = self.query("SW;", &["SW"])?;
+        let tenths = parse_prefixed_u16("SW", &response)?;
+        Ok(tenths as f32 / 10.0)
+    }
+
+    pub fn get_tx_output_power_w(&mut self) -> Result<f32> {
+        let response = self.query("PO;", &["PO"])?;
+        let tenths = parse_prefixed_u16("PO", &response)?;
+        Ok(tenths as f32 / 10.0)
     }
 
     pub fn read_state(&mut self) -> Result<RigState> {
@@ -473,6 +578,34 @@ pub fn detect_k3s_audio_device(override_spec: Option<&str>) -> audio::Result<aud
     best.ok_or_else(|| audio::Error::CaptureInit("K3S audio capture device not found".to_string()))
 }
 
+pub fn detect_k3s_audio_output_device(override_spec: Option<&str>) -> audio::Result<audio::AudioDevice> {
+    if let Some(spec) = override_spec {
+        return Ok(audio::AudioDevice {
+            name: spec.to_string(),
+            spec: spec.to_string(),
+            description: None,
+        });
+    }
+
+    let devices = audio::list_output_devices()?;
+    let mut best = None;
+    for device in devices {
+        let desc = device.description.as_deref().unwrap_or_default();
+        let looks_like_codec =
+            device.spec.contains("CARD=CODEC") || device.name.contains("USB Audio CODEC") || desc.contains("USB Audio CODEC");
+        let looks_like_device0 = device.spec.contains("DEV=0");
+        let looks_like_pcm = device.spec.starts_with("plughw:") || device.spec.starts_with("hw:");
+        if looks_like_codec && looks_like_device0 && looks_like_pcm {
+            if device.spec.starts_with("plughw:") {
+                return Ok(device);
+            }
+            best = Some(device);
+        }
+    }
+
+    best.ok_or_else(|| audio::Error::CaptureInit("K3S audio playback device not found".to_string()))
+}
+
 fn parse_prefixed_u64(prefix: &str, response: &str) -> Result<u64> {
     let value = response
         .strip_prefix(prefix)
@@ -537,6 +670,46 @@ fn parse_bg(response: &str) -> Result<(u8, bool)> {
     Ok((level, receiving))
 }
 
+fn parse_power_control(response: &str) -> Result<f32> {
+    let body = response
+        .strip_prefix("PC")
+        .and_then(|tail| tail.strip_suffix(';'))
+        .ok_or_else(|| Error::UnexpectedResponse {
+            command: "PC;".to_string(),
+            response: response.to_string(),
+        })?;
+    let watts = match body.len() {
+        3 => body.parse::<u16>().map(|watts| watts as f32).map_err(|_| Error::UnexpectedResponse {
+            command: "PC;".to_string(),
+            response: response.to_string(),
+        })?,
+        4 => {
+            let value = body[..3].parse::<u16>().map_err(|_| Error::UnexpectedResponse {
+                command: "PC;".to_string(),
+                response: response.to_string(),
+            })?;
+            let range = body.as_bytes()[3];
+            match range {
+                b'0' => value as f32 / 10.0,
+                b'1' => value as f32,
+                _ => {
+                    return Err(Error::UnexpectedResponse {
+                        command: "PC;".to_string(),
+                        response: response.to_string(),
+                    });
+                }
+            }
+        }
+        _ => {
+            return Err(Error::UnexpectedResponse {
+                command: "PC;".to_string(),
+                response: response.to_string(),
+            });
+        }
+    };
+    Ok(watts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +733,12 @@ mod tests {
         assert_eq!(parse_prefixed_u64("FA", "FA00014074000;").unwrap(), 14_074_000);
         assert_eq!(parse_prefixed_u8("BN", "BN05;").unwrap(), 5);
         assert_eq!(parse_bg("BG00R;").unwrap(), (0, true));
+        assert_eq!(parse_power_control("PC050;").unwrap(), 50.0);
+        assert_eq!(parse_power_control("PC0500;").unwrap(), 5.0);
+        assert_eq!(parse_power_control("PC0501;").unwrap(), 50.0);
+        assert_eq!(parse_prefixed_u8("TM", "TM1;").unwrap(), 1);
+        assert_eq!(parse_prefixed_u8("TQ", "TQ0;").unwrap(), 0);
+        assert_eq!(parse_prefixed_u16("SW", "SW015;").unwrap(), 15);
+        assert_eq!(parse_prefixed_u16("PO", "PO050;").unwrap(), 50);
     }
 }
