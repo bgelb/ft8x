@@ -1,4 +1,5 @@
-use std::io::Read;
+use std::f32::consts::TAU;
+use std::io::{Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -284,6 +285,105 @@ pub fn list_input_devices() -> Result<Vec<AudioDevice>> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn list_input_devices() -> Result<Vec<AudioDevice>> {
+    Err(Error::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
+    use alsa::Direction;
+    use alsa::device_name::HintIter;
+
+    let mut devices = Vec::new();
+    for hint in HintIter::new_str(None, "pcm")? {
+        let Some(spec) = hint.name else {
+            continue;
+        };
+        let is_playback = hint.direction.is_none() || hint.direction == Some(Direction::Playback);
+        if !is_playback {
+            continue;
+        }
+        let description = hint.desc;
+        let name = description
+            .as_deref()
+            .and_then(|desc| desc.lines().next())
+            .unwrap_or(&spec)
+            .trim()
+            .to_string();
+        devices.push(AudioDevice {
+            name,
+            spec,
+            description,
+        });
+    }
+    Ok(devices)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
+    Err(Error::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+pub fn play_tone(
+    device: &AudioDevice,
+    sample_rate_hz: u32,
+    channels: usize,
+    frequency_hz: f32,
+    duration: Duration,
+    amplitude: f32,
+) -> Result<()> {
+    let channel_count = channels.max(1);
+    let mut child = Command::new("aplay")
+        .arg("-D")
+        .arg(&device.spec)
+        .arg("-q")
+        .arg("-t")
+        .arg("raw")
+        .arg("-f")
+        .arg("S16_LE")
+        .arg("-r")
+        .arg(sample_rate_hz.to_string())
+        .arg("-c")
+        .arg(channel_count.to_string())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::CaptureInit("aplay stdin unavailable".to_string()))?;
+    let frame_count =
+        ((duration.as_secs_f64() * sample_rate_hz as f64).round() as usize).max(sample_rate_hz as usize / 10);
+    let gain = amplitude.clamp(0.0, 1.0) * i16::MAX as f32;
+    let mut bytes = Vec::with_capacity(frame_count * channel_count * std::mem::size_of::<i16>());
+    for index in 0..frame_count {
+        let phase = TAU * frequency_hz * index as f32 / sample_rate_hz as f32;
+        let sample = (phase.sin() * gain).round() as i16;
+        for _ in 0..channel_count {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+    stdin.write_all(&bytes)?;
+    drop(stdin);
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::CaptureInit(format!(
+            "aplay exited with status {status}"
+        )))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn play_tone(
+    _device: &AudioDevice,
+    _sample_rate_hz: u32,
+    _channels: usize,
+    _frequency_hz: f32,
+    _duration: Duration,
+    _amplitude: f32,
+) -> Result<()> {
     Err(Error::UnsupportedPlatform)
 }
 
