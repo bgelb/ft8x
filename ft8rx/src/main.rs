@@ -932,6 +932,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           event.preventDefault();
           pickCall(node.dataset.call);
         });
+      });
       } finally {
         refreshInFlight.value = false;
         scheduleRefresh(250);

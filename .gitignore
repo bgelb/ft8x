@@ -4,6 +4,7 @@ __pycache__/
 artifacts/
 
 decoder/target/
+**/Cargo.lock
 decoded.txt
 jt9_wisdom.dat
 timer.out
