@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 audiolib = { path = "../audiolib" }
 clap = { version = "4.5.40", features = ["derive"] }
+ft8_decoder = { path = "../decoder" }
 serialport = "4.8.1"
 thiserror = "2.0.12"
