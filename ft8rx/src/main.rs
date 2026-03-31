@@ -225,6 +225,7 @@ struct WebCompletedQso {
 struct WebStationLog {
     timestamp: String,
     sender_call: String,
+    display_peer: Option<String>,
     peer_before: Option<String>,
     peer_after: Option<String>,
     related_calls: Vec<String>,
@@ -278,6 +279,7 @@ enum PeerRef {
 struct LoggedDecode {
     received_at: SystemTime,
     sender_call: String,
+    display_peer: Option<PeerRef>,
     peer_before: Option<PeerRef>,
     peer_after: Option<PeerRef>,
     related_calls: Vec<String>,
@@ -872,7 +874,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       for (const item of related) {
         const div = document.createElement('div');
         div.className = 'activity-item';
-        const peer = item.peer_after ?? item.peer_before ?? '-';
+        const peer = item.display_peer ?? '-';
         div.innerHTML = `
           <div class="activity-col">${item.timestamp}</div>
           <div class="activity-col">${renderParty(peer, selectedCall)}</div>
@@ -2325,9 +2327,15 @@ impl StationTracker {
             .as_ref()
             .map(|active| active.peer.clone());
         let (kind, field1, field2, info) = decode_columns(decode);
+        let display_peer = if message_is_cq(&decode.message) {
+            None
+        } else {
+            peer_after.clone().or_else(|| peer_before.clone())
+        };
         self.logs.push_back(LoggedDecode {
             received_at,
             sender_call,
+            display_peer,
             peer_before,
             peer_after,
             related_calls: message_related_calls(&decode.message),
@@ -2462,6 +2470,7 @@ impl StationTracker {
             .map(|entry| WebStationLog {
                 timestamp: format_time(entry.received_at),
                 sender_call: entry.sender_call.clone(),
+                display_peer: entry.display_peer.as_ref().map(|peer| self.peer_display(peer)),
                 peer_before: entry.peer_before.as_ref().map(|peer| self.peer_display(peer)),
                 peer_after: entry.peer_after.as_ref().map(|peer| self.peer_display(peer)),
                 related_calls: entry.related_calls.clone(),
@@ -2743,6 +2752,25 @@ mod tests {
         }
     }
 
+    fn token_call(token: &str) -> StructuredCallField {
+        StructuredCallField {
+            raw: 0,
+            value: StructuredCallValue::Token {
+                token: token.to_string(),
+            },
+            modifier: None,
+        }
+    }
+
+    fn grid_info(locator: &str) -> StructuredInfoField {
+        StructuredInfoField {
+            raw: 0,
+            value: StructuredInfoValue::Grid {
+                locator: locator.to_string(),
+            },
+        }
+    }
+
     fn directed_decode(from: &str, to: &str) -> DecodedMessage {
         let message = StructuredMessage::Standard {
             i3: 0,
@@ -2750,6 +2778,26 @@ mod tests {
             second: standard_call(from),
             acknowledge: false,
             info: blank_info(),
+        };
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -10,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: message.to_text(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message,
+        }
+    }
+
+    fn cq_decode(from: &str) -> DecodedMessage {
+        let message = StructuredMessage::Standard {
+            i3: 0,
+            first: token_call("CQ"),
+            second: standard_call(from),
+            acknowledge: false,
+            info: grid_info("FN20"),
         };
         DecodedMessage {
             utc: "00:00:00".to_string(),
@@ -2778,5 +2826,20 @@ mod tests {
         assert_eq!(logs[1].peer_before.as_deref(), Some("A"));
         assert_eq!(logs[1].peer_after.as_deref(), Some("C"));
         assert!(!logs[1].related_calls.iter().any(|call| call == "A"));
+    }
+
+    #[test]
+    fn cq_clears_display_peer_after_qso() {
+        let mut tracker = StationTracker::default();
+        let now = UNIX_EPOCH + Duration::from_secs(1);
+
+        tracker.ingest_decode(now, &directed_decode("B", "A"));
+        tracker.ingest_decode(now + Duration::from_secs(15), &cq_decode("B"));
+
+        let logs = tracker.web_logs();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[1].peer_before.as_deref(), Some("A"));
+        assert_eq!(logs[1].peer_after, None);
+        assert_eq!(logs[1].display_peer, None);
     }
 }
