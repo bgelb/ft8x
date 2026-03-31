@@ -388,6 +388,74 @@ pub fn play_tone(
 }
 
 #[cfg(target_os = "linux")]
+pub fn play_mono_samples(
+    device: &AudioDevice,
+    sample_rate_hz: u32,
+    channels: usize,
+    samples: &[f32],
+) -> Result<()> {
+    let channel_count = channels.max(1);
+    let mut bytes =
+        Vec::with_capacity(samples.len() * channel_count * std::mem::size_of::<i16>());
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let pcm = (clamped * i16::MAX as f32).round() as i16;
+        for _ in 0..channel_count {
+            bytes.extend_from_slice(&pcm.to_le_bytes());
+        }
+    }
+    play_pcm_bytes(device, sample_rate_hz, channel_count, &bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn play_mono_samples(
+    _device: &AudioDevice,
+    _sample_rate_hz: u32,
+    _channels: usize,
+    _samples: &[f32],
+) -> Result<()> {
+    Err(Error::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+fn play_pcm_bytes(
+    device: &AudioDevice,
+    sample_rate_hz: u32,
+    channels: usize,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut child = Command::new("aplay")
+        .arg("-D")
+        .arg(&device.spec)
+        .arg("-q")
+        .arg("-t")
+        .arg("raw")
+        .arg("-f")
+        .arg("S16_LE")
+        .arg("-r")
+        .arg(sample_rate_hz.to_string())
+        .arg("-c")
+        .arg(channels.to_string())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::CaptureInit("aplay stdin unavailable".to_string()))?;
+    stdin.write_all(bytes)?;
+    drop(stdin);
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::CaptureInit(format!(
+            "aplay exited with status {status}"
+        )))
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn linux_spawn_capture(device_spec: &str, config: &AudioStreamConfig) -> Result<Child> {
     Ok(Command::new("arecord")
         .arg("-D")

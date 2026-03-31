@@ -1,7 +1,7 @@
 pub mod audio {
     pub use audiolib::{
         AudioDevice, AudioStreamConfig, CaptureStats, Error, Result, SampleStream, list_input_devices,
-        list_output_devices, play_tone,
+        list_output_devices, play_mono_samples, play_tone,
     };
 }
 
