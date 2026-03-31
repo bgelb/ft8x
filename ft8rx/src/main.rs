@@ -530,6 +530,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       line-height: 1.45;
       white-space: pre-wrap;
     }
+    .history-list {
+      max-height: 8.2em;
+      overflow: auto;
+      padding-right: 4px;
+    }
     .detail-empty {
       color: var(--muted);
       font-size: 13px;
@@ -550,9 +555,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       font-size: 12px;
       line-height: 1.15;
       display: grid;
-      grid-template-columns: 64px 78px 110px 34px 46px 50px minmax(0, 1fr);
+      grid-template-columns: 64px 110px 78px 34px 46px 50px minmax(0, 1fr);
       gap: 6px;
       align-items: baseline;
+    }
+    .activity-head {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      border: 0;
+      padding: 0 6px 2px;
+      background: linear-gradient(180deg, rgba(13, 29, 41, 0.98), rgba(13, 29, 41, 0.92));
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
     .activity-col {
       color: var(--muted);
@@ -612,11 +628,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </div>
         <div class="detail-block">
           <div class="label">Recent QSOs</div>
-          <div class="detail-lines" id="detail-history"></div>
+          <div class="detail-lines history-list" id="detail-history"></div>
         </div>
         <div class="detail-block">
           <div class="label">Live Activity</div>
-          <div class="activity-list" id="detail-logs"></div>
+          <div class="activity-list" id="detail-logs">
+            <div class="activity-item activity-head">
+              <div class="activity-col">Time</div>
+              <div class="activity-col">To</div>
+              <div class="activity-col">De</div>
+              <div class="activity-col">SNR</div>
+              <div class="activity-col">dT</div>
+              <div class="activity-col">Freq</div>
+              <div class="activity-col">Msg</div>
+            </div>
+          </div>
         </div>
       </section>
     </div>
@@ -810,12 +836,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
         : `Idle${station.last_qso_ended_at ? `, last ended ${station.last_qso_ended_at}` : ''}`;
       state.textContent = `Last heard: ${station.last_heard_at}\n${current}`;
       history.textContent = station.qso_history.length
-        ? station.qso_history.map((item) => `${item.started_at} -> ${item.ended_at}  ${item.peer}`).join('\n')
+        ? [...station.qso_history]
+            .reverse()
+            .map((item) => `${item.started_at} -> ${item.ended_at}  ${item.peer}`)
+            .join('\n')
         : 'No QSO history in last 60m.';
       const related = (data.station_logs || []).filter((item) => (item.related_calls || []).includes(selectedCall));
-      logs.innerHTML = '';
+      logs.innerHTML = `
+        <div class="activity-item activity-head">
+          <div class="activity-col">Time</div>
+          <div class="activity-col">To</div>
+          <div class="activity-col">De</div>
+          <div class="activity-col">SNR</div>
+          <div class="activity-col">dT</div>
+          <div class="activity-col">Freq</div>
+          <div class="activity-col">Msg</div>
+        </div>`;
       if (!related.length) {
-        logs.innerHTML = '<div class="detail-empty">No related decodes in last 60m.</div>';
+        logs.innerHTML += '<div class="detail-empty">No related decodes in last 60m.</div>';
         return;
       }
       for (const item of related) {
@@ -824,8 +862,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
         const peer = item.peer_after ?? item.peer_before ?? '-';
         div.innerHTML = `
           <div class="activity-col">${item.timestamp}</div>
-          <div class="activity-col">${renderParty(item.sender_call, selectedCall)}</div>
           <div class="activity-col">${renderParty(peer, selectedCall)}</div>
+          <div class="activity-col">${renderParty(item.sender_call, selectedCall)}</div>
           <div class="activity-col">${item.snr_db}</div>
           <div class="activity-col">${item.dt_seconds.toFixed(2)}</div>
           <div class="activity-col">${Math.round(item.freq_hz)}</div>
@@ -2070,14 +2108,38 @@ fn reply_word_text(word: ft8_decoder::ReplyWord) -> &'static str {
 
 impl StationTracker {
     fn ingest_frame(&mut self, received_at: SystemTime, decodes: &[DecodedMessage]) {
+        let mut grouped = BTreeMap::<String, Vec<&DecodedMessage>>::new();
+        let mut passthrough = Vec::<&DecodedMessage>::new();
         for decode in decodes {
+            self.observe_message_resolutions(&decode.message);
+            if let Some(sender_call) = semantic_sender_call(&decode.message) {
+                grouped.entry(sender_call).or_default().push(decode);
+            } else {
+                passthrough.push(decode);
+            }
+        }
+
+        for decode in passthrough {
             self.ingest_decode(received_at, decode);
+        }
+
+        for sender_decodes in grouped.values() {
+            let mut ordered = sender_decodes.clone();
+            ordered.sort_by_key(|decode| {
+                if message_ends_qso(&decode.message) {
+                    1_u8
+                } else {
+                    0_u8
+                }
+            });
+            for decode in ordered {
+                self.ingest_decode(received_at, decode);
+            }
         }
         self.prune(received_at);
     }
 
     fn ingest_decode(&mut self, received_at: SystemTime, decode: &DecodedMessage) {
-        self.observe_message_resolutions(&decode.message);
         let Some(sender_call) = semantic_sender_call(&decode.message) else {
             return;
         };
