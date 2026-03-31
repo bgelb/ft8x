@@ -655,10 +655,10 @@ pub fn decode_pcm_with_state(
 mod tests {
     use super::*;
     use crate::encode::{
-        WaveformOptions, encode_nonstandard_message, encode_standard_message,
-        synthesize_rectangular_waveform,
+        TxDirectedPayload, TxMessage, WaveformOptions, encode_nonstandard_message,
+        encode_standard_message, synthesize_rectangular_waveform, synthesize_tx_message,
     };
-    use crate::message::ReplyWord;
+    use crate::message::{GridReport, ReplyWord};
 
     #[test]
     #[ignore = "diagnostic"]
@@ -820,6 +820,155 @@ mod tests {
         assert!(
             resolved_texts.iter().any(|text| *text == "CQ HF19NY"),
             "expected resolved call in {resolved_texts:?}"
+        );
+    }
+
+    #[test]
+    fn standard_message_tx_round_trips_cover_core_qso_messages() {
+        struct Case {
+            message: TxMessage,
+            expected: &'static str,
+            base_freq_hz: f32,
+        }
+
+        let cases = [
+            Case {
+                message: TxMessage::Cq {
+                    my_call: "K1ABC".to_string(),
+                },
+                expected: "CQ K1ABC",
+                base_freq_hz: 650.0,
+            },
+            Case {
+                message: TxMessage::Directed {
+                    peer_call: "W1XYZ".to_string(),
+                    my_call: "K1ABC".to_string(),
+                    payload: TxDirectedPayload::Grid("FN31".to_string()),
+                },
+                expected: "W1XYZ K1ABC FN31",
+                base_freq_hz: 900.0,
+            },
+            Case {
+                message: TxMessage::Directed {
+                    peer_call: "W1XYZ".to_string(),
+                    my_call: "K1ABC".to_string(),
+                    payload: TxDirectedPayload::Signal(-7),
+                },
+                expected: "W1XYZ K1ABC -07",
+                base_freq_hz: 1_150.0,
+            },
+            Case {
+                message: TxMessage::Directed {
+                    peer_call: "W1XYZ".to_string(),
+                    my_call: "K1ABC".to_string(),
+                    payload: TxDirectedPayload::SignalWithAck(-7),
+                },
+                expected: "W1XYZ K1ABC R-07",
+                base_freq_hz: 1_400.0,
+            },
+            Case {
+                message: TxMessage::Directed {
+                    peer_call: "W1XYZ".to_string(),
+                    my_call: "K1ABC".to_string(),
+                    payload: TxDirectedPayload::Reply(ReplyWord::Rrr),
+                },
+                expected: "W1XYZ K1ABC RRR",
+                base_freq_hz: 1_650.0,
+            },
+            Case {
+                message: TxMessage::Directed {
+                    peer_call: "W1XYZ".to_string(),
+                    my_call: "K1ABC".to_string(),
+                    payload: TxDirectedPayload::Reply(ReplyWord::Rr73),
+                },
+                expected: "W1XYZ K1ABC RR73",
+                base_freq_hz: 1_900.0,
+            },
+            Case {
+                message: TxMessage::Directed {
+                    peer_call: "W1XYZ".to_string(),
+                    my_call: "K1ABC".to_string(),
+                    payload: TxDirectedPayload::Reply(ReplyWord::SeventyThree),
+                },
+                expected: "W1XYZ K1ABC 73",
+                base_freq_hz: 2_150.0,
+            },
+        ];
+
+        let options = DecodeOptions {
+            max_candidates: 16,
+            max_successes: 4,
+            ..DecodeOptions::default()
+        };
+
+        for case in cases {
+            let synthesized = synthesize_tx_message(
+                &case.message,
+                &WaveformOptions {
+                    base_freq_hz: case.base_freq_hz,
+                    ..WaveformOptions::default()
+                },
+            )
+            .expect("synthesize");
+            assert_eq!(synthesized.rendered_text, case.expected);
+            let report = decode_pcm(&synthesized.audio, &options).expect("decode");
+            let decoded: Vec<_> = report.decodes.iter().map(|decode| decode.text.as_str()).collect();
+            assert!(
+                decoded.contains(&case.expected),
+                "expected {:?} in decoded messages {:?}",
+                case.expected,
+                decoded
+            );
+        }
+    }
+
+    #[test]
+    fn tx_api_supports_hashed_partner_callsign() {
+        let learned_frame =
+            encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
+                .expect("encode learned");
+        let learned_audio = synthesize_rectangular_waveform(
+            &learned_frame,
+            &WaveformOptions {
+                base_freq_hz: 900.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("learned waveform");
+        let message = TxMessage::Directed {
+            peer_call: "HF19NY".to_string(),
+            my_call: "K1ABC".to_string(),
+            payload: TxDirectedPayload::SignalWithAck(-7),
+        };
+        let synthesized = synthesize_tx_message(
+            &message,
+            &WaveformOptions {
+                base_freq_hz: 1_234.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("synthesize hashed partner");
+        let options = DecodeOptions {
+            max_candidates: 8,
+            max_successes: 2,
+            ..DecodeOptions::default()
+        };
+
+        let (unresolved, _) = decode_pcm_with_state(&synthesized.audio, &options, None).expect("decode unresolved");
+        let unresolved_texts: Vec<_> =
+            unresolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        assert!(
+            unresolved_texts.iter().any(|text| text.contains("<...> K1ABC R-07")),
+            "expected unresolved hashed partner in {unresolved_texts:?}"
+        );
+
+        let (_, state) = decode_pcm_with_state(&learned_audio, &options, None).expect("learn learned call");
+        let (resolved, _) =
+            decode_pcm_with_state(&synthesized.audio, &options, Some(&state)).expect("decode resolved");
+        let resolved_texts: Vec<_> = resolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        assert!(
+            resolved_texts.iter().any(|text| *text == "HF19NY K1ABC R-07"),
+            "expected resolved hashed partner in {resolved_texts:?}"
         );
     }
 
