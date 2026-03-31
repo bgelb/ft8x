@@ -11,7 +11,7 @@ use ft8_decoder::{
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
-use rigctl::{K3s, K3sConfig, RigState, detect_k3s_audio_device};
+use rigctl::{Band, K3s, K3sConfig, Mode, detect_k3s_audio_device};
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
 use serde::Serialize;
@@ -71,7 +71,7 @@ enum AppError {
 
 #[derive(Debug, Clone)]
 struct DisplayState {
-    rig: Option<RigState>,
+    rig: Option<RigSnapshot>,
     audio: AudioDevice,
     capture_rms_dbfs: f32,
     capture_latest_sample_time: Option<SystemTime>,
@@ -89,6 +89,16 @@ struct DisplayState {
     early41_decodes: Vec<DecodedMessage>,
     early47_decodes: Vec<DecodedMessage>,
     full_decodes: Vec<DecodedMessage>,
+}
+
+#[derive(Debug, Clone)]
+struct RigSnapshot {
+    frequency_hz: u64,
+    mode: Mode,
+    band: Band,
+    configured_power_w: Option<f32>,
+    bar_graph: Option<u8>,
+    transmitting: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +129,9 @@ struct WebSnapshot {
     rig_frequency_hz: Option<u64>,
     rig_mode: String,
     rig_band: String,
+    rig_power_w: Option<f32>,
+    rig_bargraph: Option<u8>,
+    rig_is_tx: Option<bool>,
     decode_status: String,
     audio_stats: WebAudioStats,
     decode_times: WebDecodeTimes,
@@ -893,27 +906,29 @@ const INDEX_HTML: &str = r#"<!doctype html>
         lastSnapshot = data;
         document.getElementById('time').textContent = data.time_utc || '-';
         const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(3)} MHz`;
-        document.getElementById('rig').textContent = `${freq}  ${data.rig_mode}  ${data.rig_band}`;
-        document.getElementById('audio').textContent =
-          `latest=${data.audio_stats.latest_sample ?? '-'}  ch=${data.audio_stats.selected_channel}  L=${data.audio_stats.left_dbfs.toFixed(1)}  R=${data.audio_stats.right_dbfs.toFixed(1)}  all=${data.audio_stats.overall_dbfs.toFixed(1)} dBFS  rec=${data.audio_stats.recoveries}`;
-        document.getElementById('status').textContent = data.decode_status || '-';
-        document.getElementById('slot').textContent =
-          `${data.current_slot}${data.last_done_slot ? `  last=${data.last_done_slot}` : ''}`;
-        document.getElementById('times').textContent =
-          `early=${fmtSec(data.decode_times.early_seconds)}  mid=${fmtSec(data.decode_times.mid_seconds)}  late=${fmtSec(data.decode_times.late_seconds)}  tx_margin=${fmtSec(data.decode_times.tx_margin_seconds)}`;
-        document.getElementById('dtstats').textContent =
-          `cur avg=${fmtSec(data.dt_stats.current_mean_seconds)}  med=${fmtSec(data.dt_stats.current_median_seconds)}  std=${fmtSec(data.dt_stats.current_stddev_seconds)}  n=${data.dt_stats.current_count}  10m avg=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}  med=${fmtSec(data.dt_stats.ten_minute_median_seconds)}  n=${data.dt_stats.ten_minute_count}`;
-        document.getElementById('count').textContent = `${data.decodes.length} visible`;
-        renderWaterfall(data.waterfall);
-        renderBandMap('even-map', data.bandmaps.even);
-        renderBandMap('odd-map', data.bandmaps.odd);
-        renderDecodes(data.decodes);
-        renderDetail(data);
-        document.querySelectorAll('[data-call]').forEach((node) => {
-          node.addEventListener('click', (event) => {
-            event.preventDefault();
-            pickCall(node.dataset.call);
-          });
+      const rigDir = data.rig_is_tx == null ? '?' : (data.rig_is_tx ? 'TX' : 'RX');
+      const rigPower = data.rig_power_w == null ? '-' : `${data.rig_power_w.toFixed(1)}W`;
+      const rigBg = data.rig_bargraph == null ? '-' : data.rig_bargraph;
+      document.getElementById('rig').textContent = `${freq}  ${data.rig_mode}  ${data.rig_band}  ${rigDir}  P=${rigPower}  BG=${rigBg}`;
+      document.getElementById('audio').textContent =
+        `latest=${data.audio_stats.latest_sample ?? '-'}  ch=${data.audio_stats.selected_channel}  L=${data.audio_stats.left_dbfs.toFixed(1)}  R=${data.audio_stats.right_dbfs.toFixed(1)}  all=${data.audio_stats.overall_dbfs.toFixed(1)} dBFS  rec=${data.audio_stats.recoveries}`;
+      document.getElementById('status').textContent = data.decode_status || '-';
+      document.getElementById('slot').textContent =
+        `${data.current_slot}${data.last_done_slot ? `  last=${data.last_done_slot}` : ''}`;
+      document.getElementById('times').textContent =
+        `early=${fmtSec(data.decode_times.early_seconds)}  mid=${fmtSec(data.decode_times.mid_seconds)}  late=${fmtSec(data.decode_times.late_seconds)}  tx_margin=${fmtSec(data.decode_times.tx_margin_seconds)}`;
+      document.getElementById('dtstats').textContent =
+        `cur avg=${fmtSec(data.dt_stats.current_mean_seconds)}  med=${fmtSec(data.dt_stats.current_median_seconds)}  std=${fmtSec(data.dt_stats.current_stddev_seconds)}  n=${data.dt_stats.current_count}  10m avg=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}  med=${fmtSec(data.dt_stats.ten_minute_median_seconds)}  n=${data.dt_stats.ten_minute_count}`;
+      document.getElementById('count').textContent = `${data.decodes.length} visible`;
+      renderWaterfall(data.waterfall);
+      renderBandMap('even-map', data.bandmaps.even);
+      renderBandMap('odd-map', data.bandmaps.odd);
+      renderDecodes(data.decodes);
+      renderDetail(data);
+      document.querySelectorAll('[data-call]').forEach((node) => {
+        node.addEventListener('click', (event) => {
+          event.preventDefault();
+          pickCall(node.dataset.call);
         });
       } finally {
         refreshInFlight.value = false;
@@ -1028,7 +1043,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     .map_err(std::io::Error::other)?;
 
     let mut display = DisplayState {
-        rig: read_rig_state(&mut rig),
+        rig: read_rig_snapshot(&mut rig),
         audio,
         capture_rms_dbfs: -120.0,
         capture_latest_sample_time: None,
@@ -1070,7 +1085,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
         let now = SystemTime::now();
         if now.duration_since(last_rig_poll).unwrap_or_default() >= Duration::from_secs(2) {
-            display.rig = read_rig_state(&mut rig);
+            display.rig = read_rig_snapshot(&mut rig);
             last_rig_poll = now;
         }
 
@@ -1306,6 +1321,9 @@ fn refresh_web_snapshot(
         .as_ref()
         .map(|state| state.band.to_string())
         .unwrap_or_else(|| "unavailable".to_string());
+    guard.rig_power_w = display.rig.as_ref().and_then(|state| state.configured_power_w);
+    guard.rig_bargraph = display.rig.as_ref().and_then(|state| state.bar_graph);
+    guard.rig_is_tx = display.rig.as_ref().and_then(|state| state.transmitting);
     guard.decode_status = display.decode_status.clone();
     guard.audio_stats = WebAudioStats {
         latest_sample: display.capture_latest_sample_time.map(format_slot_time),
@@ -1386,8 +1404,16 @@ fn run_oneshot(cli: Cli) -> Result<(), AppError> {
     Ok(())
 }
 
-fn read_rig_state(rig: &mut Option<K3s>) -> Option<RigState> {
-    rig.as_mut().and_then(|rig| rig.read_state().ok())
+fn read_rig_snapshot(rig: &mut Option<K3s>) -> Option<RigSnapshot> {
+    let rig = rig.as_mut()?;
+    Some(RigSnapshot {
+        frequency_hz: rig.get_frequency_hz().ok()?,
+        mode: rig.get_mode().ok()?,
+        band: rig.get_band().ok()?,
+        configured_power_w: rig.get_configured_power_w().ok(),
+        bar_graph: rig.get_bar_graph().ok().map(|reading| reading.level),
+        transmitting: rig.is_transmitting().ok(),
+    })
 }
 
 fn extract_slot_capture(capture: &SampleStream, slot_start: SystemTime) -> Result<Vec<i16>, AppError> {
@@ -1575,6 +1601,24 @@ fn render(display: &DisplayState) {
         .as_ref()
         .map(|state| state.band.to_string())
         .unwrap_or_else(|| "unavailable".to_string());
+    let rig_direction = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.transmitting)
+        .map(|tx| if tx { "TX" } else { "RX" })
+        .unwrap_or("?");
+    let rig_power = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.configured_power_w)
+        .map(|watts| format!("{watts:.1}W"))
+        .unwrap_or_else(|| "-".to_string());
+    let rig_bargraph = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.bar_graph)
+        .map(|level| level.to_string())
+        .unwrap_or_else(|| "-".to_string());
     let display_decodes = preferred_stage_decodes(display);
     let dt_stats = summarize_dt(display_decodes);
     let composite_rows = composite_rows(display);
@@ -1587,7 +1631,11 @@ fn render(display: &DisplayState) {
 
     let mut output = String::new();
     let _ = writeln!(output, "\x1b[2J\x1b[HFT8RX    {}", now_local.format("%Y-%m-%d %H:%M:%S %Z"));
-    let _ = writeln!(output, "Rig      {}  {}  {}", rig_frequency, rig_mode, rig_band);
+    let _ = writeln!(
+        output,
+        "Rig      {}  {}  {}  {}  P={}  BG={}",
+        rig_frequency, rig_mode, rig_band, rig_direction, rig_power, rig_bargraph
+    );
     let _ = writeln!(output, "Audio    {} ({})", display.audio.name, display.audio.spec);
     let _ = writeln!(
         output,
