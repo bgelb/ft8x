@@ -874,37 +874,53 @@ const INDEX_HTML: &str = r#"<!doctype html>
         logs.scrollTop = logs.scrollHeight;
       }
     }
+    let refreshInFlight = { value: false };
+    let refreshTimer = { value: null };
+    function scheduleRefresh(delayMs) {
+      if (refreshTimer.value != null) {
+        clearTimeout(refreshTimer.value);
+      }
+      refreshTimer.value = setTimeout(() => refresh().catch(console.error), delayMs);
+    }
     async function refresh() {
-      const response = await fetch('/api/state', { cache: 'no-store' });
-      const data = await response.json();
-      lastSnapshot = data;
-      document.getElementById('time').textContent = data.time_utc || '-';
-      const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(3)} MHz`;
-      document.getElementById('rig').textContent = `${freq}  ${data.rig_mode}  ${data.rig_band}`;
-      document.getElementById('audio').textContent =
-        `latest=${data.audio_stats.latest_sample ?? '-'}  ch=${data.audio_stats.selected_channel}  L=${data.audio_stats.left_dbfs.toFixed(1)}  R=${data.audio_stats.right_dbfs.toFixed(1)}  all=${data.audio_stats.overall_dbfs.toFixed(1)} dBFS  rec=${data.audio_stats.recoveries}`;
-      document.getElementById('status').textContent = data.decode_status || '-';
-      document.getElementById('slot').textContent =
-        `${data.current_slot}${data.last_done_slot ? `  last=${data.last_done_slot}` : ''}`;
-      document.getElementById('times').textContent =
-        `early=${fmtSec(data.decode_times.early_seconds)}  mid=${fmtSec(data.decode_times.mid_seconds)}  late=${fmtSec(data.decode_times.late_seconds)}  tx_margin=${fmtSec(data.decode_times.tx_margin_seconds)}`;
-      document.getElementById('dtstats').textContent =
-        `cur avg=${fmtSec(data.dt_stats.current_mean_seconds)}  med=${fmtSec(data.dt_stats.current_median_seconds)}  std=${fmtSec(data.dt_stats.current_stddev_seconds)}  n=${data.dt_stats.current_count}  10m avg=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}  med=${fmtSec(data.dt_stats.ten_minute_median_seconds)}  n=${data.dt_stats.ten_minute_count}`;
-      document.getElementById('count').textContent = `${data.decodes.length} visible`;
-      renderWaterfall(data.waterfall);
-      renderBandMap('even-map', data.bandmaps.even);
-      renderBandMap('odd-map', data.bandmaps.odd);
-      renderDecodes(data.decodes);
-      renderDetail(data);
-      document.querySelectorAll('[data-call]').forEach((node) => {
-        node.addEventListener('click', (event) => {
-          event.preventDefault();
-          pickCall(node.dataset.call);
+      if (refreshInFlight.value) {
+        return;
+      }
+      refreshInFlight.value = true;
+      try {
+        const response = await fetch('/api/state', { cache: 'no-store' });
+        const data = await response.json();
+        lastSnapshot = data;
+        document.getElementById('time').textContent = data.time_utc || '-';
+        const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(3)} MHz`;
+        document.getElementById('rig').textContent = `${freq}  ${data.rig_mode}  ${data.rig_band}`;
+        document.getElementById('audio').textContent =
+          `latest=${data.audio_stats.latest_sample ?? '-'}  ch=${data.audio_stats.selected_channel}  L=${data.audio_stats.left_dbfs.toFixed(1)}  R=${data.audio_stats.right_dbfs.toFixed(1)}  all=${data.audio_stats.overall_dbfs.toFixed(1)} dBFS  rec=${data.audio_stats.recoveries}`;
+        document.getElementById('status').textContent = data.decode_status || '-';
+        document.getElementById('slot').textContent =
+          `${data.current_slot}${data.last_done_slot ? `  last=${data.last_done_slot}` : ''}`;
+        document.getElementById('times').textContent =
+          `early=${fmtSec(data.decode_times.early_seconds)}  mid=${fmtSec(data.decode_times.mid_seconds)}  late=${fmtSec(data.decode_times.late_seconds)}  tx_margin=${fmtSec(data.decode_times.tx_margin_seconds)}`;
+        document.getElementById('dtstats').textContent =
+          `cur avg=${fmtSec(data.dt_stats.current_mean_seconds)}  med=${fmtSec(data.dt_stats.current_median_seconds)}  std=${fmtSec(data.dt_stats.current_stddev_seconds)}  n=${data.dt_stats.current_count}  10m avg=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}  med=${fmtSec(data.dt_stats.ten_minute_median_seconds)}  n=${data.dt_stats.ten_minute_count}`;
+        document.getElementById('count').textContent = `${data.decodes.length} visible`;
+        renderWaterfall(data.waterfall);
+        renderBandMap('even-map', data.bandmaps.even);
+        renderBandMap('odd-map', data.bandmaps.odd);
+        renderDecodes(data.decodes);
+        renderDetail(data);
+        document.querySelectorAll('[data-call]').forEach((node) => {
+          node.addEventListener('click', (event) => {
+            event.preventDefault();
+            pickCall(node.dataset.call);
+          });
         });
-      });
+      } finally {
+        refreshInFlight.value = false;
+        scheduleRefresh(250);
+      }
     }
     refresh().catch(console.error);
-    setInterval(() => refresh().catch(console.error), 250);
     document.getElementById('detail-logs').addEventListener('scroll', (event) => {
       const node = event.currentTarget;
       const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
