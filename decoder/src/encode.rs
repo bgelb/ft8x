@@ -34,11 +34,37 @@ pub struct EncodedFrame {
 }
 
 #[derive(Debug, Clone)]
+pub struct SynthesizedTxMessage {
+    pub frame: EncodedFrame,
+    pub audio: AudioBuffer,
+    pub rendered_text: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct WaveformOptions {
     pub base_freq_hz: f32,
     pub start_seconds: f32,
     pub total_seconds: f32,
     pub amplitude: f32,
+}
+
+#[derive(Debug, Clone)]
+pub enum TxDirectedPayload {
+    Blank,
+    Grid(String),
+    Signal(i16),
+    SignalWithAck(i16),
+    Reply(ReplyWord),
+}
+
+#[derive(Debug, Clone)]
+pub enum TxMessage {
+    Cq { my_call: String },
+    Directed {
+        my_call: String,
+        peer_call: String,
+        payload: TxDirectedPayload,
+    },
 }
 
 impl Default for WaveformOptions {
@@ -99,6 +125,20 @@ pub fn encode_standard_message(
         u64::from(FTX_MESSAGE_KIND_STANDARD_SLASH_R),
     );
     build_frame(message_bits)
+}
+
+pub fn synthesize_tx_message(
+    message: &TxMessage,
+    options: &WaveformOptions,
+) -> Result<SynthesizedTxMessage, EncodeError> {
+    let (first, second, acknowledge, info, rendered_text) = tx_message_fields(message);
+    let frame = encode_standard_message(&first, &second, acknowledge, &info)?;
+    let audio = synthesize_rectangular_waveform(&frame, options)?;
+    Ok(SynthesizedTxMessage {
+        frame,
+        audio,
+        rendered_text,
+    })
 }
 
 pub fn encode_nonstandard_message(
@@ -312,6 +352,77 @@ pub fn parse_standard_info(text: &str) -> Result<GridReport, EncodeError> {
         }
     }
     Err(EncodeError::UnsupportedInfo(text.to_string()))
+}
+
+fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, String) {
+    match message {
+        TxMessage::Cq { my_call } => (
+            "CQ".to_string(),
+            my_call.clone(),
+            false,
+            GridReport::Blank,
+            format!("CQ {}", my_call.trim()),
+        ),
+        TxMessage::Directed {
+            my_call,
+            peer_call,
+            payload,
+        } => {
+            let (acknowledge, info) = tx_payload_fields(payload);
+            let rendered = render_standard_message(peer_call, my_call, acknowledge, &info);
+            (peer_call.clone(), my_call.clone(), acknowledge, info, rendered)
+        }
+    }
+}
+
+fn tx_payload_fields(payload: &TxDirectedPayload) -> (bool, GridReport) {
+    match payload {
+        TxDirectedPayload::Blank => (false, GridReport::Blank),
+        TxDirectedPayload::Grid(locator) => (false, GridReport::Grid(locator.clone())),
+        TxDirectedPayload::Signal(db) => (false, GridReport::Signal(*db)),
+        TxDirectedPayload::SignalWithAck(db) => (true, GridReport::Signal(*db)),
+        TxDirectedPayload::Reply(word) => (false, GridReport::Reply(*word)),
+    }
+}
+
+fn render_standard_message(first: &str, second: &str, acknowledge: bool, info: &GridReport) -> String {
+    let trailing = render_standard_info(acknowledge, info);
+    if trailing.is_empty() {
+        format!("{} {}", first.trim(), second.trim())
+    } else {
+        format!("{} {} {}", first.trim(), second.trim(), trailing)
+    }
+}
+
+fn render_standard_info(acknowledge: bool, info: &GridReport) -> String {
+    match info {
+        GridReport::Blank => {
+            if acknowledge {
+                "R".to_string()
+            } else {
+                String::new()
+            }
+        }
+        GridReport::Grid(locator) => {
+            if acknowledge {
+                format!("R {}", locator)
+            } else {
+                locator.clone()
+            }
+        }
+        GridReport::Signal(db) => {
+            let value = format!("{db:+03}");
+            if acknowledge {
+                format!("R{value}")
+            } else {
+                value
+            }
+        }
+        GridReport::Reply(ReplyWord::Blank) => String::new(),
+        GridReport::Reply(ReplyWord::Rrr) => "RRR".to_string(),
+        GridReport::Reply(ReplyWord::Rr73) => "RR73".to_string(),
+        GridReport::Reply(ReplyWord::SeventyThree) => "73".to_string(),
+    }
 }
 
 fn map_wave_error(error: DecoderError) -> EncodeError {
