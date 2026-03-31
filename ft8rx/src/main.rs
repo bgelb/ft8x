@@ -1996,6 +1996,35 @@ fn structured_call_station_name(field: &StructuredCallField) -> Option<String> {
     }
 }
 
+fn message_related_calls(message: &StructuredMessage) -> Vec<String> {
+    let mut related = BTreeSet::<String>::new();
+    match message {
+        StructuredMessage::Standard { first, second, .. } => {
+            if let Some(call) = structured_call_station_name(first) {
+                related.insert(call);
+            }
+            if let Some(call) = structured_call_station_name(second) {
+                related.insert(call);
+            }
+        }
+        StructuredMessage::Nonstandard {
+            hashed_call,
+            plain_call,
+            cq,
+            ..
+        } => {
+            related.insert(plain_call.callsign.clone());
+            if !*cq {
+                if let Some(call) = &hashed_call.resolved_callsign {
+                    related.insert(call.clone());
+                }
+            }
+        }
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {}
+    }
+    related.into_iter().collect()
+}
+
 fn bandmap_detail(message: &StructuredMessage) -> Option<String> {
     match message {
         StructuredMessage::Standard {
@@ -2232,24 +2261,12 @@ impl StationTracker {
             .as_ref()
             .map(|active| active.peer.clone());
         let (kind, field1, field2, info) = decode_columns(decode);
-        let mut related = BTreeSet::<String>::new();
-        related.insert(sender_call.clone());
-        if let Some(peer) = &peer_before {
-            if let Some(call) = self.peer_station_name(peer) {
-                related.insert(call);
-            }
-        }
-        if let Some(peer) = &peer_after {
-            if let Some(call) = self.peer_station_name(peer) {
-                related.insert(call);
-            }
-        }
         self.logs.push_back(LoggedDecode {
             received_at,
             sender_call,
             peer_before,
             peer_after,
-            related_calls: related.into_iter().collect(),
+            related_calls: message_related_calls(&decode.message),
             snr_db: decode.snr_db,
             dt_seconds: decode.dt_seconds,
             freq_hz: decode.freq_hz,
@@ -2320,13 +2337,6 @@ impl StationTracker {
             (PeerRef::Callsign(_), _) => self.resolve_peer(existing),
             (_, PeerRef::Callsign(_)) => self.resolve_peer(observed),
             _ => self.resolve_peer(observed),
-        }
-    }
-
-    fn peer_station_name(&self, peer: &PeerRef) -> Option<String> {
-        match self.resolve_peer(peer.clone()) {
-            PeerRef::Callsign(call) => Some(call),
-            PeerRef::Hash12(_) | PeerRef::Hash22(_) => None,
         }
     }
 
@@ -2645,4 +2655,64 @@ fn build_bandmap_grid(
                 .collect()
         })
         .collect()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn standard_call(callsign: &str) -> StructuredCallField {
+        StructuredCallField {
+            raw: 0,
+            value: StructuredCallValue::StandardCall {
+                callsign: callsign.to_string(),
+            },
+            modifier: None,
+        }
+    }
+
+    fn blank_info() -> StructuredInfoField {
+        StructuredInfoField {
+            raw: 0,
+            value: StructuredInfoValue::Blank,
+        }
+    }
+
+    fn directed_decode(from: &str, to: &str) -> DecodedMessage {
+        let message = StructuredMessage::Standard {
+            i3: 0,
+            first: standard_call(to),
+            second: standard_call(from),
+            acknowledge: false,
+            info: blank_info(),
+        };
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -10,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: message.to_text(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message,
+        }
+    }
+
+    #[test]
+    fn related_calls_ignore_previous_qso_peer() {
+        let mut tracker = StationTracker::default();
+        let now = UNIX_EPOCH + Duration::from_secs(1);
+
+        tracker.ingest_decode(now, &directed_decode("B", "A"));
+        tracker.ingest_decode(now + Duration::from_secs(15), &directed_decode("B", "C"));
+
+        let logs = tracker.web_logs();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].related_calls, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(logs[1].related_calls, vec!["B".to_string(), "C".to_string()]);
+        assert_eq!(logs[1].peer_before.as_deref(), Some("A"));
+        assert_eq!(logs[1].peer_after.as_deref(), Some("C"));
+        assert!(!logs[1].related_calls.iter().any(|call| call == "A"));
+    }
 }
