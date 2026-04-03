@@ -234,6 +234,9 @@ impl QsoController {
             session.latest_partner_snr_db = snr_db;
         }
         session.last_rx_event = Some(event.summary());
+        session.last_rx_stage = Some(stage);
+        session.last_rx_text = event.message_text();
+        session.last_rx_structured_json = event.structured_json();
         Self::push_transcript(session, now, "RX:", session.state, event.transcript_text());
         Self::log_fsm(
             session,
@@ -819,6 +822,9 @@ impl QsoController {
             no_msg_count: 0,
             no_fwd_count: 0,
             last_rx_event: None,
+            last_rx_stage: None,
+            last_rx_text: None,
+            last_rx_structured_json: None,
             current_rx_slot: None,
             rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
@@ -933,7 +939,13 @@ impl QsoController {
                 .unwrap_or(Duration::ZERO)
                 .as_secs(),
             latest_partner_snr_db = session.latest_partner_snr_db,
+            last_rx_stage = session
+                .last_rx_stage
+                .map(DecodeStage::as_str)
+                .unwrap_or(""),
             last_rx_event = %rx_summary,
+            last_rx_text = session.last_rx_text.clone().unwrap_or_default(),
+            last_rx_structured_json = session.last_rx_structured_json.clone().unwrap_or_default(),
             rx_text = rx_text.unwrap_or_default(),
             tx_text = tx_text.unwrap_or_default(),
             started_at = %format_timestamp(session.started_at),
@@ -985,10 +997,16 @@ impl QsoController {
             state_after = %desired_state.as_str(),
             no_msg_count = session.no_msg_count,
             no_fwd_count = session.no_fwd_count,
+            last_rx_stage = session
+                .last_rx_stage
+                .map(DecodeStage::as_str)
+                .unwrap_or(""),
             last_rx_event = %session
                 .last_rx_event
                 .clone()
                 .unwrap_or_else(|| "none".to_string()),
+            last_rx_text = session.last_rx_text.clone().unwrap_or_default(),
+            last_rx_structured_json = session.last_rx_structured_json.clone().unwrap_or_default(),
             started_at = %format_timestamp(session.started_at),
             deadline_at = %format_timestamp(session.deadline_at),
             "qso_fsm"
@@ -1065,6 +1083,9 @@ struct ActiveSession {
     no_msg_count: u32,
     no_fwd_count: u32,
     last_rx_event: Option<String>,
+    last_rx_stage: Option<DecodeStage>,
+    last_rx_text: Option<String>,
+    last_rx_structured_json: Option<String>,
     current_rx_slot: Option<SystemTime>,
     rx_slot_consumed_stage: Option<DecodeStage>,
     transcript: VecDeque<WebQsoTranscriptEntry>,
@@ -1277,22 +1298,27 @@ enum PartnerEvent {
     ToUs {
         event: ToUsEvent,
         text: String,
+        structured_json: String,
         snr_db: i32,
     },
     ToOther {
         text: String,
+        structured_json: String,
         snr_db: i32,
     },
     Cq {
         text: String,
+        structured_json: String,
         snr_db: i32,
     },
     NonCallFirstField {
         text: String,
+        structured_json: String,
         snr_db: i32,
     },
     Freeform {
         text: String,
+        structured_json: String,
     },
 }
 
@@ -1326,7 +1352,7 @@ impl PartnerEvent {
             | Self::ToOther { text, .. }
             | Self::Cq { text, .. }
             | Self::NonCallFirstField { text, .. }
-            | Self::Freeform { text } => format!("RX: {text}"),
+            | Self::Freeform { text, .. } => format!("RX: {text}"),
         }
     }
 
@@ -1337,7 +1363,26 @@ impl PartnerEvent {
             | Self::ToOther { text, .. }
             | Self::Cq { text, .. }
             | Self::NonCallFirstField { text, .. }
-            | Self::Freeform { text } => Some(text.clone()),
+            | Self::Freeform { text, .. } => Some(text.clone()),
+        }
+    }
+
+    fn structured_json(&self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::ToUs {
+                structured_json, ..
+            }
+            | Self::ToOther {
+                structured_json, ..
+            }
+            | Self::Cq {
+                structured_json, ..
+            }
+            | Self::NonCallFirstField {
+                structured_json, ..
+            }
+            | Self::Freeform { structured_json, .. } => Some(structured_json.clone()),
         }
     }
 
@@ -1452,6 +1497,7 @@ fn classify_partner_event(
                 let candidate = PartnerEvent::ToUs {
                     event,
                     text: decode.text.clone(),
+                    structured_json: serialize_structured_message(&decode.message),
                     snr_db: decode.snr_db,
                 };
                 if best_to_us
@@ -1465,24 +1511,28 @@ fn classify_partner_event(
             SingleClass::ToOther => {
                 to_other.get_or_insert(PartnerEvent::ToOther {
                     text: decode.text.clone(),
+                    structured_json: serialize_structured_message(&decode.message),
                     snr_db: decode.snr_db,
                 });
             }
             SingleClass::Cq => {
                 cq.get_or_insert(PartnerEvent::Cq {
                     text: decode.text.clone(),
+                    structured_json: serialize_structured_message(&decode.message),
                     snr_db: decode.snr_db,
                 });
             }
             SingleClass::NonCallFirstField => {
                 noncall_first_field.get_or_insert(PartnerEvent::NonCallFirstField {
                     text: decode.text.clone(),
+                    structured_json: serialize_structured_message(&decode.message),
                     snr_db: decode.snr_db,
                 });
             }
             SingleClass::Freeform => {
                 freeform.get_or_insert(PartnerEvent::Freeform {
                     text: decode.text.clone(),
+                    structured_json: serialize_structured_message(&decode.message),
                 });
             }
             SingleClass::Irrelevant => {}
@@ -1880,6 +1930,16 @@ fn reply_text(word: ReplyWord) -> &'static str {
     }
 }
 
+fn serialize_structured_message(message: &StructuredMessage) -> String {
+    serde_json::to_string(message).unwrap_or_else(|error| {
+        format!(
+            "{{\"serialize_error\":{},\"fallback_text\":{}}}",
+            serde_json::to_string(&error.to_string()).unwrap_or_else(|_| "\"unknown\"".to_string()),
+            serde_json::to_string(&message.to_text()).unwrap_or_else(|_| "\"\"".to_string())
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1887,7 +1947,9 @@ mod tests {
         FsmConfig, LoggingConfig, NoFwdThreshold, RetryThresholds, StationConfig, TxConfig,
     };
     use ft8_decoder::{
-        DecodedMessage, StructuredCallField, StructuredCallValue, StructuredInfoField,
+        DecodeOptions, DecodeProfile, DecodedMessage, DecoderSession, StructuredCallField,
+        StructuredCallValue, StructuredInfoField, TxDirectedPayload, TxMessage,
+        WaveformOptions, synthesize_tx_message,
     };
 
     #[derive(Default)]
@@ -2088,6 +2150,29 @@ mod tests {
         }
     }
 
+    fn synthesized_stage_reports(message: TxMessage) -> Vec<ft8_decoder::StageDecodeReport> {
+        let synthesized = synthesize_tx_message(
+            &message,
+            &WaveformOptions {
+                base_freq_hz: 1_000.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("synthesize tx message");
+        let mut session = DecoderSession::new();
+        session
+            .decode_available(
+                &synthesized.audio,
+                &DecodeOptions {
+                    profile: DecodeProfile::Medium,
+                    max_candidates: 16,
+                    max_successes: 4,
+                    ..DecodeOptions::default()
+                },
+            )
+            .expect("decode synthesized audio")
+    }
+
     #[test]
     fn start_infers_opposite_slot_family() {
         let mut controller =
@@ -2192,6 +2277,78 @@ mod tests {
             now + Duration::from_secs(15),
         );
         assert_eq!(controller.snapshot(now).state, "send_sig_ack");
+    }
+
+    #[test]
+    fn synthesized_rr73_decode_advances_send_sig_ack_to_send_73() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "W5XO".to_string(),
+                tx_freq_hz: 1_000.0,
+            },
+            Some(StationStartInfo {
+                callsign: "W5XO".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+            }),
+            now,
+        );
+        controller.session.as_mut().expect("session").state = QsoState::SendSigAck;
+
+        let reports = synthesized_stage_reports(TxMessage::Directed {
+            my_call: "W5XO".to_string(),
+            peer_call: "N1VF".to_string(),
+            payload: TxDirectedPayload::Reply(ReplyWord::Rr73),
+        });
+        assert!(
+            !reports.is_empty(),
+            "expected at least one decode stage for synthesized RR73"
+        );
+
+        let mut saw_rr73 = false;
+        for report in &reports {
+            let texts: Vec<_> = report
+                .report
+                .decodes
+                .iter()
+                .map(|decode| decode.text.as_str())
+                .collect();
+            if texts.contains(&"N1VF W5XO RR73") {
+                saw_rr73 = true;
+                assert!(
+                    matches!(
+                        classify_partner_event(
+                            &report.report.decodes,
+                            "W5XO",
+                            "N1VF",
+                            QsoState::SendSigAck,
+                        ),
+                        PartnerEvent::ToUs {
+                            event: ToUsEvent::Reply(ReplyWord::Rr73),
+                            ..
+                        }
+                    ),
+                    "decoded RR73 should classify as reply, stage={}, texts={texts:?}",
+                    report.stage.as_str(),
+                );
+            }
+            controller.on_decode_stage(
+                rx_slot_start,
+                report.stage,
+                &report.report.decodes,
+                rx_slot_start + Duration::from_secs(11),
+            );
+        }
+
+        assert!(saw_rr73, "expected synthesized RR73 in decoder outputs");
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_73");
+        assert_eq!(snapshot.last_rx_event.as_deref(), Some("to_us_reply_rr73"));
     }
 
     #[test]
@@ -2417,6 +2574,9 @@ mod tests {
             no_msg_count: 0,
             no_fwd_count: 0,
             last_rx_event: None,
+            last_rx_stage: None,
+            last_rx_text: None,
+            last_rx_structured_json: None,
             current_rx_slot: None,
             rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
