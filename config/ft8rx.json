@@ -5,10 +5,10 @@
   },
   "tx": {
     "base_freq_hz": 1000.0,
-    "drive_level": 0.12,
+    "drive_level": 0.28,
     "playback_channels": 2,
     "output_device": null,
-    "power_w": null,
+    "power_w": 20.0,
     "tx_freq_min_hz": 200.0,
     "tx_freq_max_hz": 3500.0
   },
