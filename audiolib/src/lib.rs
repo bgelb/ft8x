@@ -1,6 +1,4 @@
 use std::f32::consts::TAU;
-use std::io::Read;
-use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -134,6 +132,10 @@ impl AudioRing {
         }
     }
 
+    fn mark_recovery(&mut self) {
+        self.recoveries += 1;
+    }
+
     fn extract_window(&self, sample_rate_hz: u32, start_time: SystemTime, sample_count: usize) -> Result<Vec<i16>> {
         let latest_time = self.latest_sample_time.ok_or(Error::WindowNotReady)?;
         let end_time = start_time + samples_to_duration(sample_rate_hz, sample_count as u64);
@@ -169,7 +171,6 @@ pub struct SampleStream {
     device: AudioDevice,
     ring: Arc<Mutex<AudioRing>>,
     stop: Arc<AtomicBool>,
-    child: Option<Child>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -192,15 +193,10 @@ impl SampleStream {
             let (tx, rx) = mpsc::channel();
             let thread_ring = Arc::clone(&ring);
             let thread_stop = Arc::clone(&stop);
-
-            let mut child = linux_spawn_capture(&device.spec, &config)?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| Error::CaptureInit("arecord stdout unavailable".to_string()))?;
+            let device_spec = device.spec.clone();
             let thread_config = config.clone();
             let join = thread::spawn(move || {
-                let result = run_capture_loop(stdout, thread_ring, thread_stop, thread_config, tx);
+                let result = run_capture_loop(device_spec, thread_ring, thread_stop, thread_config, tx);
                 if let Err(error) = result {
                     eprintln!("audio capture thread failed: {error}");
                 }
@@ -212,7 +208,6 @@ impl SampleStream {
                     device,
                     ring,
                     stop,
-                    child: Some(child),
                     join: Some(join),
                 }),
                 Ok(Err(error)) => Err(Error::CaptureInit(error)),
@@ -244,10 +239,6 @@ impl SampleStream {
 impl Drop for SampleStream {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -491,51 +482,81 @@ fn interleave_mono_samples_i16(samples: &[f32], channels: usize) -> Vec<i16> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_spawn_capture(device_spec: &str, config: &AudioStreamConfig) -> Result<Child> {
-    Ok(Command::new("arecord")
-        .arg("-D")
-        .arg(device_spec)
-        .arg("-q")
-        .arg("-t")
-        .arg("raw")
-        .arg("-f")
-        .arg("S16_LE")
-        .arg("-r")
-        .arg(config.sample_rate_hz.to_string())
-        .arg("-c")
-        .arg(config.channels.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?)
-}
-
 fn run_capture_loop(
-    mut stdout: ChildStdout,
+    device_spec: String,
     ring: Arc<Mutex<AudioRing>>,
     stop: Arc<AtomicBool>,
     config: AudioStreamConfig,
     init: mpsc::Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
-    let _ = init.send(Ok(()));
+    use alsa::ValueOr;
+    use alsa::pcm::{Access, Format, HwParams, PCM, State};
 
-    let mut bytes = vec![0u8; config.frames_per_read * config.channels * std::mem::size_of::<i16>()];
-    while !stop.load(Ordering::Relaxed) {
-        if let Err(error) = stdout.read_exact(&mut bytes) {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let message = format!("audio stream read failed: {error}");
+    let pcm = match PCM::new(&device_spec, alsa::Direction::Capture, false) {
+        Ok(pcm) => pcm,
+        Err(error) => {
+            let message = format!("alsa capture open failed: {error}");
             let _ = init.send(Err(message.clone()));
             return Err(Error::CaptureInit(message));
         }
+    };
+    let hwp = match HwParams::any(&pcm) {
+        Ok(params) => params,
+        Err(error) => {
+            let message = format!("alsa capture params failed: {error}");
+            let _ = init.send(Err(message.clone()));
+            return Err(Error::CaptureInit(message));
+        }
+    };
+    for result in [
+        hwp.set_channels(config.channels as u32),
+        hwp.set_rate(config.sample_rate_hz, ValueOr::Nearest),
+        hwp.set_format(Format::s16()),
+        hwp.set_access(Access::RWInterleaved),
+    ] {
+        if let Err(error) = result {
+            let message = format!("alsa capture setup failed: {error}");
+            let _ = init.send(Err(message.clone()));
+            return Err(Error::CaptureInit(message));
+        }
+    }
+    if let Err(error) = pcm.hw_params(&hwp).and_then(|_| pcm.prepare()) {
+        let message = format!("alsa capture prepare failed: {error}");
+        let _ = init.send(Err(message.clone()));
+        return Err(Error::CaptureInit(message));
+    }
+    let io = match pcm.io_i16() {
+        Ok(io) => io,
+        Err(error) => {
+            let message = format!("alsa capture io init failed: {error}");
+            let _ = init.send(Err(message.clone()));
+            return Err(Error::CaptureInit(message));
+        }
+    };
+    let _ = init.send(Ok(()));
 
-        let interleaved: Vec<i16> = bytes
-            .chunks_exact(2)
-            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+    let mut interleaved = vec![0i16; config.frames_per_read * config.channels];
+    while !stop.load(Ordering::Relaxed) {
+        let frames_read = match io.readi(&mut interleaved) {
+            Ok(frames) => frames,
+            Err(error) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if pcm.state() == State::XRun {
+                    pcm.prepare()?;
+                    ring.lock().expect("audio ring poisoned").mark_recovery();
+                    continue;
+                }
+                let message = format!("audio capture read failed: {error}");
+                let _ = init.send(Err(message.clone()));
+                return Err(Error::CaptureInit(message));
+            }
+        };
+        let samples = &interleaved[..frames_read * config.channels];
         let per_channel: Vec<Vec<i16>> = (0..config.channels)
             .map(|channel| {
-                interleaved
+                samples
                     .chunks_exact(config.channels)
                     .map(|frame| frame[channel])
                     .collect()
