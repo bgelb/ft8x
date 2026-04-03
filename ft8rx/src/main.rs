@@ -273,7 +273,7 @@ struct WebCompletedQso {
 struct WebStationLog {
     timestamp: String,
     sender_call: String,
-    display_peer: Option<String>,
+    peer: Option<String>,
     peer_before: Option<String>,
     peer_after: Option<String>,
     related_calls: Vec<String>,
@@ -342,7 +342,7 @@ enum PeerRef {
 struct LoggedDecode {
     received_at: SystemTime,
     sender_call: String,
-    display_peer: Option<PeerRef>,
+    peer: Option<PeerRef>,
     peer_before: Option<PeerRef>,
     peer_after: Option<PeerRef>,
     related_calls: Vec<String>,
@@ -1173,7 +1173,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       for (const item of related) {
         const div = document.createElement('div');
         div.className = 'activity-item';
-        const peer = item.display_peer ?? '-';
+        const peer = item.peer ?? '-';
         div.innerHTML = `
           <div class="activity-col">${item.timestamp}</div>
           <div class="activity-col">${renderParty(peer, selectedCall)}</div>
@@ -2809,7 +2809,7 @@ impl StationTracker {
         let Some(sender_call) = semantic_sender_call(&decode.message) else {
             return;
         };
-        let first_peer = qso_peer_from_first_field(&decode.message, self);
+        let observed_peer = qso_peer_from_first_field(&decode.message, self);
         let existing_active = self
             .stations
             .get(&sender_call)
@@ -2826,7 +2826,7 @@ impl StationTracker {
 
         let transition = if message_ends_qso(&decode.message) {
             QsoTransition::End
-        } else if let Some(peer) = first_peer {
+        } else if let Some(peer) = observed_peer.clone() {
             match existing_active {
                 Some(active) if self.same_peer_identity(&active.peer, &peer) => {
                     QsoTransition::Keep(self.prefer_peer_identity(active.peer, peer))
@@ -2901,15 +2901,56 @@ impl StationTracker {
 
         let peer_after = entry.active_qso.as_ref().map(|active| active.peer.clone());
         let (kind, field1, field2, info) = decode_columns(decode);
-        let display_peer = if message_is_cq(&decode.message) {
+        let peer = if message_is_cq(&decode.message) {
             None
         } else {
-            peer_after.clone().or_else(|| peer_before.clone())
+            observed_peer
+                .clone()
+                .or_else(|| peer_after.clone())
+                .or_else(|| peer_before.clone())
         };
+        let tracker_tag_peer = if message_ends_qso(&decode.message) {
+            peer_before.clone()
+        } else {
+            peer_after.clone()
+        };
+        if let Some(observed) = &observed_peer {
+            if let Some(logged_peer) = &peer {
+                debug_assert!(
+                    self.same_peer_identity(observed, logged_peer),
+                    "explicit field1 peer should match logged peer"
+                );
+                if !self.same_peer_identity(observed, logged_peer) {
+                    tracing::warn!(
+                        sender_call,
+                        text = %decode.text,
+                        observed_peer = %self.peer_display(observed),
+                        logged_peer = %self.peer_display(logged_peer),
+                        "station_tracker_logged_peer_mismatch"
+                    );
+                }
+            }
+            if let Some(tracker_peer) = &tracker_tag_peer {
+                debug_assert!(
+                    self.same_peer_identity(observed, tracker_peer),
+                    "explicit field1 peer should match tracker state"
+                );
+                if !self.same_peer_identity(observed, tracker_peer) {
+                    tracing::warn!(
+                        sender_call,
+                        text = %decode.text,
+                        observed_peer = %self.peer_display(observed),
+                        tracker_peer = %self.peer_display(tracker_peer),
+                        message_ends_qso = message_ends_qso(&decode.message),
+                        "station_tracker_state_mismatch"
+                    );
+                }
+            }
+        }
         self.logs.push_back(LoggedDecode {
             received_at,
             sender_call,
-            display_peer,
+            peer,
             peer_before,
             peer_after,
             related_calls: message_related_calls(&decode.message),
@@ -3063,8 +3104,8 @@ impl StationTracker {
             .map(|entry| WebStationLog {
                 timestamp: format_time(entry.received_at),
                 sender_call: entry.sender_call.clone(),
-                display_peer: entry
-                    .display_peer
+                peer: entry
+                    .peer
                     .as_ref()
                     .map(|peer| self.peer_display(peer)),
                 peer_before: entry
@@ -3444,6 +3485,7 @@ mod tests {
             logs[1].related_calls,
             vec!["B".to_string(), "C".to_string()]
         );
+        assert_eq!(logs[1].peer.as_deref(), Some("C"));
         assert_eq!(logs[1].peer_before.as_deref(), Some("A"));
         assert_eq!(logs[1].peer_after.as_deref(), Some("C"));
         assert!(!logs[1].related_calls.iter().any(|call| call == "A"));
@@ -3460,7 +3502,7 @@ mod tests {
         let logs = tracker.web_logs();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[1].peer_before.as_deref(), Some("A"));
+        assert_eq!(logs[1].peer, None);
         assert_eq!(logs[1].peer_after, None);
-        assert_eq!(logs[1].display_peer, None);
     }
 }
