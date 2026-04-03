@@ -1,5 +1,5 @@
 use std::f32::consts::TAU;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 const DEFAULT_CAPTURE_CHANNELS: usize = 2;
 const DEFAULT_FRAMES_PER_READ: usize = 1_024;
 const DEFAULT_RING_SECONDS: usize = 120;
+const DEFAULT_PLAYBACK_FRAMES_PER_WRITE: usize = 1_024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -333,46 +334,15 @@ pub fn play_tone(
     amplitude: f32,
 ) -> Result<()> {
     let channel_count = channels.max(1);
-    let mut child = Command::new("aplay")
-        .arg("-D")
-        .arg(&device.spec)
-        .arg("-q")
-        .arg("-t")
-        .arg("raw")
-        .arg("-f")
-        .arg("S16_LE")
-        .arg("-r")
-        .arg(sample_rate_hz.to_string())
-        .arg("-c")
-        .arg(channel_count.to_string())
-        .stdin(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::CaptureInit("aplay stdin unavailable".to_string()))?;
     let frame_count =
         ((duration.as_secs_f64() * sample_rate_hz as f64).round() as usize).max(sample_rate_hz as usize / 10);
-    let gain = amplitude.clamp(0.0, 1.0) * i16::MAX as f32;
-    let mut bytes = Vec::with_capacity(frame_count * channel_count * std::mem::size_of::<i16>());
+    let gain = amplitude.clamp(0.0, 1.0);
+    let mut samples = Vec::with_capacity(frame_count);
     for index in 0..frame_count {
         let phase = TAU * frequency_hz * index as f32 / sample_rate_hz as f32;
-        let sample = (phase.sin() * gain).round() as i16;
-        for _ in 0..channel_count {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
+        samples.push(phase.sin() * gain);
     }
-    stdin.write_all(&bytes)?;
-    drop(stdin);
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::CaptureInit(format!(
-            "aplay exited with status {status}"
-        )))
-    }
+    play_mono_samples(device, sample_rate_hz, channel_count, &samples)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -394,17 +364,7 @@ pub fn play_mono_samples(
     channels: usize,
     samples: &[f32],
 ) -> Result<()> {
-    let channel_count = channels.max(1);
-    let mut bytes =
-        Vec::with_capacity(samples.len() * channel_count * std::mem::size_of::<i16>());
-    for &sample in samples {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let pcm = (clamped * i16::MAX as f32).round() as i16;
-        for _ in 0..channel_count {
-            bytes.extend_from_slice(&pcm.to_le_bytes());
-        }
-    }
-    play_pcm_bytes(device, sample_rate_hz, channel_count, &bytes)
+    play_mono_samples_until(device, sample_rate_hz, channels, samples, None)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -418,41 +378,116 @@ pub fn play_mono_samples(
 }
 
 #[cfg(target_os = "linux")]
-fn play_pcm_bytes(
+pub fn play_mono_samples_until(
     device: &AudioDevice,
     sample_rate_hz: u32,
     channels: usize,
-    bytes: &[u8],
+    samples: &[f32],
+    cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    let mut child = Command::new("aplay")
-        .arg("-D")
-        .arg(&device.spec)
-        .arg("-q")
-        .arg("-t")
-        .arg("raw")
-        .arg("-f")
-        .arg("S16_LE")
-        .arg("-r")
-        .arg(sample_rate_hz.to_string())
-        .arg("-c")
-        .arg(channels.to_string())
-        .stdin(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::CaptureInit("aplay stdin unavailable".to_string()))?;
-    stdin.write_all(bytes)?;
-    drop(stdin);
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::CaptureInit(format!(
-            "aplay exited with status {status}"
-        )))
+    let channel_count = channels.max(1);
+    let interleaved = interleave_mono_samples_i16(samples, channel_count);
+    play_interleaved_samples_i16_until(
+        device,
+        sample_rate_hz,
+        channel_count,
+        &interleaved,
+        cancel,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn play_mono_samples_until(
+    _device: &AudioDevice,
+    _sample_rate_hz: u32,
+    _channels: usize,
+    _samples: &[f32],
+    _cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    Err(Error::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+pub fn play_interleaved_samples_i16_until(
+    device: &AudioDevice,
+    sample_rate_hz: u32,
+    channels: usize,
+    samples: &[i16],
+    cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    use alsa::ValueOr;
+    use alsa::pcm::{Access, Format, HwParams, PCM, State};
+
+    if samples.is_empty() {
+        return Ok(());
     }
+
+    let pcm = PCM::new(&device.spec, alsa::Direction::Playback, false)?;
+    let hwp = HwParams::any(&pcm)?;
+    hwp.set_channels(channels as u32)?;
+    hwp.set_rate(sample_rate_hz, ValueOr::Nearest)?;
+    hwp.set_format(Format::s16())?;
+    hwp.set_access(Access::RWInterleaved)?;
+    pcm.hw_params(&hwp)?;
+    pcm.prepare()?;
+
+    let io = pcm.io_i16()?;
+    let mut offset = 0usize;
+    while offset < samples.len() {
+        if cancel.map(|flag| flag.load(Ordering::Relaxed)).unwrap_or(false) {
+            pcm.drop()?;
+            return Ok(());
+        }
+        let remaining_frames = (samples.len() - offset) / channels;
+        let frames_to_write = remaining_frames.min(DEFAULT_PLAYBACK_FRAMES_PER_WRITE);
+        let end = offset + frames_to_write * channels;
+        match io.writei(&samples[offset..end]) {
+            Ok(written_frames) => {
+                if written_frames == 0 {
+                    continue;
+                }
+                offset += written_frames * channels;
+            }
+            Err(error) => {
+                if pcm.state() == State::XRun {
+                    pcm.prepare()?;
+                    continue;
+                }
+                return Err(Error::Alsa(error));
+            }
+        }
+    }
+
+    if cancel.map(|flag| flag.load(Ordering::Relaxed)).unwrap_or(false) {
+        pcm.drop()?;
+        return Ok(());
+    }
+    pcm.drain()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn play_interleaved_samples_i16_until(
+    _device: &AudioDevice,
+    _sample_rate_hz: u32,
+    _channels: usize,
+    _samples: &[i16],
+    _cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    Err(Error::UnsupportedPlatform)
+}
+
+fn interleave_mono_samples_i16(samples: &[f32], channels: usize) -> Vec<i16> {
+    let channel_count = channels.max(1);
+    let mut interleaved = Vec::with_capacity(samples.len() * channel_count);
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let pcm = (clamped * i16::MAX as f32).round() as i16;
+        for _ in 0..channel_count {
+            interleaved.push(pcm);
+        }
+    }
+    interleaved
 }
 
 #[cfg(target_os = "linux")]

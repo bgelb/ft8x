@@ -5,11 +5,9 @@ use ft8_decoder::{
     WaveformOptions, synthesize_tx_message,
 };
 use rigctl::K3s;
-use rigctl::audio::AudioDevice;
+use rigctl::audio::{AudioDevice, play_mono_samples_until};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::io::Write as _;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -1162,7 +1160,6 @@ pub(crate) trait TxBackend: Send {
 pub struct RigTxBackend {
     rig: Arc<Mutex<Option<K3s>>>,
     output_device: AudioDevice,
-    playback_channels: usize,
     active: bool,
     cancel: Option<Arc<AtomicBool>>,
     event_rx: Option<mpsc::Receiver<TxEvent>>,
@@ -1172,12 +1169,10 @@ impl RigTxBackend {
     pub fn new(
         rig: Arc<Mutex<Option<K3s>>>,
         output_device: AudioDevice,
-        playback_channels: usize,
     ) -> Self {
         Self {
             rig,
             output_device,
-            playback_channels,
             active: false,
             cancel: None,
             event_rx: None,
@@ -1200,14 +1195,21 @@ impl TxBackend for RigTxBackend {
             },
         )
         .map_err(|error| error.to_string())?;
-        let bytes = encode_pcm_bytes(&synthesized.audio.samples, self.playback_channels);
         let (event_tx, event_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let rig = Arc::clone(&self.rig);
         let cancel_thread = Arc::clone(&cancel);
         let output_device = self.output_device.clone();
         thread::spawn(move || {
-            run_tx_thread(rig, output_device, request, bytes, cancel_thread, event_tx);
+            run_tx_thread(
+                rig,
+                output_device,
+                request,
+                synthesized.audio.sample_rate_hz,
+                synthesized.audio.samples,
+                cancel_thread,
+                event_tx,
+            );
         });
         self.active = true;
         self.cancel = Some(cancel);
@@ -1638,7 +1640,8 @@ fn run_tx_thread(
     rig: Arc<Mutex<Option<K3s>>>,
     output_device: AudioDevice,
     request: TxRequest,
-    bytes: Vec<u8>,
+    sample_rate_hz: u32,
+    samples: Vec<f32>,
     cancel: Arc<AtomicBool>,
     event_tx: mpsc::Sender<TxEvent>,
 ) {
@@ -1685,107 +1688,40 @@ fn run_tx_thread(
         message_text: request.message_text.clone(),
     });
 
-    match spawn_aplay(&output_device, request.playback_channels, &bytes) {
-        Ok(mut child) => loop {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
-                force_rx(&rig);
-                let _ = event_tx.send(TxEvent::Aborted {
-                    session_id: request.session_id,
-                    state: request.state,
-                    message_text: request.message_text,
-                    reason: format!("cancelled_in_{}", request.state.as_str()),
-                });
-                return;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    force_rx(&rig);
-                    if status.success() {
-                        let _ = event_tx.send(TxEvent::Completed {
-                            session_id: request.session_id,
-                            state: request.state,
-                            message_text: request.message_text,
-                        });
-                    } else {
-                        let _ = event_tx.send(TxEvent::Error {
-                            session_id: request.session_id,
-                            state: request.state,
-                            message_text: request.message_text,
-                            message: format!("aplay exited with status {status}"),
-                        });
-                    }
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(error) => {
-                    force_rx(&rig);
-                    let _ = event_tx.send(TxEvent::Error {
-                        session_id: request.session_id,
-                        state: request.state,
-                        message_text: request.message_text,
-                        message: format!("aplay wait failed: {error}"),
-                    });
-                    return;
-                }
-            }
-        },
+    match play_mono_samples_until(
+        &output_device,
+        sample_rate_hz,
+        request.playback_channels,
+        &samples,
+        Some(cancel.as_ref()),
+    ) {
+        Ok(()) if cancel.load(Ordering::Relaxed) => {
+            force_rx(&rig);
+            let _ = event_tx.send(TxEvent::Aborted {
+                session_id: request.session_id,
+                state: request.state,
+                message_text: request.message_text,
+                reason: format!("cancelled_in_{}", request.state.as_str()),
+            });
+        }
+        Ok(()) => {
+            force_rx(&rig);
+            let _ = event_tx.send(TxEvent::Completed {
+                session_id: request.session_id,
+                state: request.state,
+                message_text: request.message_text,
+            });
+        }
         Err(error) => {
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Error {
                 session_id: request.session_id,
                 state: request.state,
                 message_text: request.message_text,
-                message: error,
+                message: error.to_string(),
             });
         }
     }
-}
-
-fn spawn_aplay(
-    device: &AudioDevice,
-    channels: usize,
-    bytes: &[u8],
-) -> Result<std::process::Child, String> {
-    let mut child = Command::new("aplay")
-        .arg("-D")
-        .arg(&device.spec)
-        .arg("-q")
-        .arg("-t")
-        .arg("raw")
-        .arg("-f")
-        .arg("S16_LE")
-        .arg("-r")
-        .arg("12000")
-        .arg("-c")
-        .arg(channels.max(1).to_string())
-        .stdin(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("spawn aplay failed: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "aplay stdin unavailable".to_string())?;
-    stdin
-        .write_all(bytes)
-        .map_err(|error| format!("write audio failed: {error}"))?;
-    drop(stdin);
-    Ok(child)
-}
-
-fn encode_pcm_bytes(samples: &[f32], channels: usize) -> Vec<u8> {
-    let channel_count = channels.max(1);
-    let mut bytes = Vec::with_capacity(samples.len() * channel_count * std::mem::size_of::<i16>());
-    for &sample in samples {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let pcm = (clamped * i16::MAX as f32).round() as i16;
-        for _ in 0..channel_count {
-            bytes.extend_from_slice(&pcm.to_le_bytes());
-        }
-    }
-    bytes
 }
 
 fn wait_until(target: SystemTime, cancel: &AtomicBool) -> bool {

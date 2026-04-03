@@ -1486,11 +1486,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     }
     let tx_backend: Box<dyn qso::TxBackend> =
         match detect_k3s_audio_output_device(config.tx.output_device.as_deref()) {
-            Ok(device) => Box::new(RigTxBackend::new(
-                Arc::clone(&rig),
-                device,
-                config.tx.playback_channels,
-            )),
+            Ok(device) => Box::new(RigTxBackend::new(Arc::clone(&rig), device)),
             Err(error) => Box::new(qso::UnavailableTxBackend::new(error.to_string())),
         };
     let mut qso_controller = QsoController::new(config.clone(), tx_backend);
