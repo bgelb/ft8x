@@ -226,7 +226,8 @@ impl QsoController {
         }
         session.rx_slot_consumed_stage = Some(stage);
 
-        let committed_next_tx = is_next_tx_slot_committed(session, slot_start, self.backend.is_active());
+        let committed_next_tx =
+            is_next_tx_slot_committed(session, slot_start, self.backend.is_active());
         if !committed_next_tx {
             Self::clear_pending_transition(session, now);
         }
@@ -563,7 +564,13 @@ impl QsoController {
                             message_text,
                             ..
                         } => {
-                            Self::push_transcript(session, now, "TX:", *state, message_text.clone());
+                            Self::push_transcript(
+                                session,
+                                now,
+                                "TX:",
+                                *state,
+                                message_text.clone(),
+                            );
                         }
                         TxEvent::Completed { state, .. } => {
                             session.in_flight_tx = None;
@@ -866,7 +873,13 @@ impl QsoController {
             return;
         };
         let state = session.state;
-        Self::push_transcript(&mut session, now, "SYS:", state, format!("qso exit: {reason}"));
+        Self::push_transcript(
+            &mut session,
+            now,
+            "SYS:",
+            state,
+            format!("qso exit: {reason}"),
+        );
         Self::log_fsm(
             &session,
             "exit",
@@ -1181,6 +1194,7 @@ pub(crate) trait TxBackend: Send {
 pub struct RigTxBackend {
     rig: Arc<Mutex<Option<K3s>>>,
     output_device: AudioDevice,
+    tx_busy: Arc<AtomicBool>,
     active: bool,
     cancel: Option<Arc<AtomicBool>>,
     event_rx: Option<mpsc::Receiver<TxEvent>>,
@@ -1190,10 +1204,12 @@ impl RigTxBackend {
     pub fn new(
         rig: Arc<Mutex<Option<K3s>>>,
         output_device: AudioDevice,
+        tx_busy: Arc<AtomicBool>,
     ) -> Self {
         Self {
             rig,
             output_device,
+            tx_busy,
             active: false,
             cancel: None,
             event_rx: None,
@@ -1206,6 +1222,13 @@ impl TxBackend for RigTxBackend {
         if self.active {
             return Err("tx backend already active".to_string());
         }
+        if self
+            .tx_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("transmit path busy".to_string());
+        }
         let synthesized = synthesize_tx_message(
             &request.message,
             &WaveformOptions {
@@ -1215,12 +1238,16 @@ impl TxBackend for RigTxBackend {
                 amplitude: request.drive_level,
             },
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            self.tx_busy.store(false, Ordering::Release);
+            error.to_string()
+        })?;
         let (event_tx, event_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let rig = Arc::clone(&self.rig);
         let cancel_thread = Arc::clone(&cancel);
         let output_device = self.output_device.clone();
+        let tx_busy = Arc::clone(&self.tx_busy);
         thread::spawn(move || {
             run_tx_thread(
                 rig,
@@ -1229,6 +1256,7 @@ impl TxBackend for RigTxBackend {
                 synthesized.audio.sample_rate_hz,
                 synthesized.audio.samples,
                 cancel_thread,
+                tx_busy,
                 event_tx,
             );
         });
@@ -1382,7 +1410,9 @@ impl PartnerEvent {
             | Self::NonCallFirstField {
                 structured_json, ..
             }
-            | Self::Freeform { structured_json, .. } => Some(structured_json.clone()),
+            | Self::Freeform {
+                structured_json, ..
+            } => Some(structured_json.clone()),
         }
     }
 
@@ -1593,8 +1623,7 @@ fn classify_single_message(
                     StructuredInfoValue::Reply { word } => {
                         SingleClass::ToUs(ToUsEvent::Reply(*word))
                     }
-                    StructuredInfoValue::Grid { .. }
-                    | StructuredInfoValue::SignalReport { .. } => {
+                    StructuredInfoValue::Grid { .. } | StructuredInfoValue::SignalReport { .. } => {
                         if *acknowledge {
                             SingleClass::ToUs(ToUsEvent::Ack)
                         } else {
@@ -1698,8 +1727,10 @@ fn run_tx_thread(
     sample_rate_hz: u32,
     samples: Vec<f32>,
     cancel: Arc<AtomicBool>,
+    tx_busy: Arc<AtomicBool>,
     event_tx: mpsc::Sender<TxEvent>,
 ) {
+    let _busy_guard = TxBusyGuard::new(tx_busy);
     if wait_until(
         request
             .target_slot
@@ -1779,6 +1810,22 @@ fn run_tx_thread(
     }
 }
 
+struct TxBusyGuard {
+    tx_busy: Arc<AtomicBool>,
+}
+
+impl TxBusyGuard {
+    fn new(tx_busy: Arc<AtomicBool>) -> Self {
+        Self { tx_busy }
+    }
+}
+
+impl Drop for TxBusyGuard {
+    fn drop(&mut self) {
+        self.tx_busy.store(false, Ordering::Release);
+    }
+}
+
 fn wait_until(target: SystemTime, cancel: &AtomicBool) -> bool {
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1851,7 +1898,8 @@ fn is_next_tx_slot_committed(
     if !tx_backend_active {
         return false;
     }
-    let Some(candidate_slot) = next_matching_slot_after(rx_slot_start, session.tx_slot_family) else {
+    let Some(candidate_slot) = next_matching_slot_after(rx_slot_start, session.tx_slot_family)
+    else {
         return false;
     };
     session.last_tx_slot == Some(candidate_slot)
@@ -1953,8 +2001,8 @@ mod tests {
     };
     use ft8_decoder::{
         DecodeOptions, DecodeProfile, DecodedMessage, DecoderSession, StructuredCallField,
-        StructuredCallValue, StructuredInfoField, TxDirectedPayload, TxMessage,
-        WaveformOptions, synthesize_tx_message,
+        StructuredCallValue, StructuredInfoField, TxDirectedPayload, TxMessage, WaveformOptions,
+        synthesize_tx_message,
     };
 
     #[derive(Default)]
@@ -2586,13 +2634,14 @@ mod tests {
             rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
         };
-        let rescheduled = schedule_next_tx_slot(
-            &session,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(15),
-        )
-        .expect("rescheduled");
+        let rescheduled =
+            schedule_next_tx_slot(&session, SystemTime::UNIX_EPOCH + Duration::from_secs(15))
+                .expect("rescheduled");
         assert_eq!(
-            rescheduled.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+            rescheduled
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             60
         );
     }
@@ -2626,7 +2675,9 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_secs(30),
         );
         assert_eq!(
-            controller.snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(30)).state,
+            controller
+                .snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(30))
+                .state,
             "send_rrr"
         );
         controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(45));
@@ -2638,7 +2689,11 @@ mod tests {
         assert!(snapshot.active);
         assert_eq!(snapshot.state, "send_73_once");
         controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
-        assert!(!controller.snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(60)).active);
+        assert!(
+            !controller
+                .snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(60))
+                .active
+        );
     }
 
     #[test]
@@ -2683,10 +2738,12 @@ mod tests {
         let snapshot = controller.snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
         assert!(snapshot.active);
         assert_eq!(snapshot.state, "send_73");
-        assert!(snapshot
-            .transcript
-            .iter()
-            .any(|entry| entry.text.contains("fresh RX superseded queued transition")));
+        assert!(
+            snapshot
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains("fresh RX superseded queued transition"))
+        );
     }
 
     #[test]
@@ -2724,9 +2781,11 @@ mod tests {
         controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(90));
         let snapshot = controller.snapshot(now);
         assert!(!snapshot.active);
-        assert!(snapshot
-            .transcript
-            .iter()
-            .any(|entry| entry.text.contains("late RX after tx launch: exit queued")));
+        assert!(
+            snapshot
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains("late RX after tx launch: exit queued"))
+        );
     }
 }

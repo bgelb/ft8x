@@ -18,8 +18,11 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 use qso::{
     QsoCommand, QsoController, RigTxBackend, StationStartInfo, WebQsoDefaults, WebQsoSnapshot,
 };
-use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
-use rigctl::{Band, K3s, K3sConfig, Mode, detect_k3s_audio_device, detect_k3s_audio_output_device};
+use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream, play_tone};
+use rigctl::{
+    Band, K3s, K3sConfig, Mode, TxMeterMode, detect_k3s_audio_device,
+    detect_k3s_audio_output_device,
+};
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::error;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
 const SLOT_SECONDS: u64 = 15;
@@ -129,9 +133,12 @@ type SharedRig = Arc<Mutex<Option<K3s>>>;
 struct WebAppState {
     snapshot: SharedWebSnapshot,
     qso_control: SharedQsoControl,
+    rig_control: SharedRigControl,
+    tune_available: bool,
 }
 
 type SharedQsoControl = Arc<QsoControlPlane>;
+type SharedRigControl = Arc<RigControlPlane>;
 
 #[derive(Debug, Default)]
 struct QsoControlPlane {
@@ -150,6 +157,31 @@ impl QsoControlPlane {
         let mut guard = self.commands.lock().expect("qso control poisoned");
         guard.drain(..).collect()
     }
+}
+
+#[derive(Debug, Default)]
+struct RigControlPlane {
+    commands: Mutex<VecDeque<RigCommand>>,
+}
+
+impl RigControlPlane {
+    fn enqueue(&self, command: RigCommand) {
+        self.commands
+            .lock()
+            .expect("rig control poisoned")
+            .push_back(command);
+    }
+
+    fn drain(&self) -> Vec<RigCommand> {
+        let mut guard = self.commands.lock().expect("rig control poisoned");
+        guard.drain(..).collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RigCommand {
+    Configure { band: Band, power_w: f32 },
+    Tune10s,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +207,7 @@ struct WebSnapshot {
     rig_power_w: Option<f32>,
     rig_bargraph: Option<u8>,
     rig_is_tx: Option<bool>,
+    rig_tune_active: bool,
     decode_status: String,
     audio_stats: WebAudioStats,
     decode_times: WebDecodeTimes,
@@ -291,6 +324,12 @@ struct WebStationLog {
 struct StartQsoRequest {
     partner_call: String,
     tx_freq_hz: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RigConfigRequest {
+    band: String,
+    power_w: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -794,6 +833,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <div><div class="label">dT</div><div class="value small" id="dtstats"></div></div>
             <div><div class="label">Decodes</div><div class="value small" id="count"></div></div>
           </div>
+          <div class="detail-block">
+            <div class="label">Rig Control</div>
+            <div class="control-row">
+              <div class="control-inline dual">
+                <div class="input-wrap">
+                  <div class="label">Band</div>
+                  <select id="rig-band" class="control-input"></select>
+                </div>
+                <div class="input-wrap">
+                  <div class="label">Power</div>
+                  <select id="rig-power" class="control-input"></select>
+                </div>
+              </div>
+              <div class="control-inline">
+                <button id="rig-tune" class="button warn" type="button">Tune 10s</button>
+              </div>
+              <div class="hint" id="rig-hint">Band and power apply immediately on selection.</div>
+            </div>
+          </div>
         </section>
         <section class="panel waterfall-panel">
           <canvas id="waterfall" width="300" height="180"></canvas>
@@ -894,10 +952,33 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <script>
     const canvas = document.getElementById('waterfall');
     const ctx = canvas.getContext('2d');
+    const BAND_OPTIONS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m', '6m'];
+    const POWER_OPTIONS = ['5', '10', '20', '50', '100'];
     let selectedCall = null;
     let lastSnapshot = null;
     let autoFollowLogs = true;
     let autoFollowQso = true;
+    let pendingRigConfig = null;
+    function initRigBandOptions() {
+      const select = document.getElementById('rig-band');
+      if (select.options.length) return;
+      for (const band of BAND_OPTIONS) {
+        const option = document.createElement('option');
+        option.value = band;
+        option.textContent = band;
+        select.appendChild(option);
+      }
+    }
+    function initRigPowerOptions() {
+      const select = document.getElementById('rig-power');
+      if (select.options.length) return;
+      for (const power of POWER_OPTIONS) {
+        const option = document.createElement('option');
+        option.value = power;
+        option.textContent = `${power} W`;
+        select.appendChild(option);
+      }
+    }
     function fmtSec(value) {
       return value == null ? '-' : `${value.toFixed(2)}s`;
     }
@@ -1017,6 +1098,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/qso/stop', {});
       scheduleRefresh(10);
     }
+    async function applyRigSettings() {
+      const band = document.getElementById('rig-band').value;
+      const power = Number(document.getElementById('rig-power').value);
+      pendingRigConfig = { band, power_w: power };
+      await postJson('/api/rig/config', {
+        band,
+        power_w: power,
+      });
+      scheduleRefresh(10);
+    }
+    async function tuneRigForTenSeconds() {
+      await postJson('/api/rig/tune', {});
+      scheduleRefresh(10);
+    }
     function autoPickQuietSpot() {
       if (!lastSnapshot) return;
       const station = selectedStation(lastSnapshot);
@@ -1024,6 +1119,48 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (!txParity) return;
       document.getElementById('qso-freq').value = quietSpotFrequency(lastSnapshot, txParity).toFixed(0);
       renderQso(lastSnapshot);
+    }
+    function renderRigControls(data) {
+      initRigBandOptions();
+      initRigPowerOptions();
+      const bandInput = document.getElementById('rig-band');
+      const powerInput = document.getElementById('rig-power');
+      const tune = document.getElementById('rig-tune');
+      const hint = document.getElementById('rig-hint');
+      const rigAvailable = data.rig_mode && data.rig_mode !== 'unavailable';
+      const tuneActive = !!data.rig_tune_active;
+      const qsoBusy = !!(data.qso?.active || data.qso?.tx_active);
+      const txBusy = tuneActive || !!data.rig_is_tx;
+      if (
+        pendingRigConfig &&
+        data.rig_band === pendingRigConfig.band &&
+        data.rig_power_w != null &&
+        Math.abs(data.rig_power_w - pendingRigConfig.power_w) < 0.05
+      ) {
+        pendingRigConfig = null;
+      }
+      const effectiveBand = pendingRigConfig?.band ?? data.rig_band;
+      const effectivePower =
+        pendingRigConfig?.power_w ??
+        (data.rig_power_w == null ? null : Math.round(data.rig_power_w).toString());
+      if (rigAvailable && effectiveBand) {
+        bandInput.value = effectiveBand;
+      }
+      if (rigAvailable && effectivePower != null) {
+        powerInput.value = String(effectivePower);
+      }
+      tune.disabled = !rigAvailable || tuneActive || qsoBusy || txBusy;
+      if (!rigAvailable) {
+        hint.textContent = 'Rig control unavailable.';
+      } else if (tuneActive) {
+        hint.textContent = 'Tuning: 1000 Hz tone for 10 seconds. TX will return to RX automatically.';
+      } else if (qsoBusy) {
+        hint.textContent = 'Rig control disabled while QSO transmit is active.';
+      } else if (pendingRigConfig) {
+        hint.textContent = `Applying ${pendingRigConfig.band} at ${pendingRigConfig.power_w.toFixed(0)} W...`;
+      } else {
+        hint.textContent = `Rig is ${bandInput.value || data.rig_band} at ${powerInput.value || '-'} W. Tune sends a 1000 Hz tone for 10 seconds.`;
+      }
     }
     function renderWaterfall(rows) {
       if (!rows || rows.length === 0) {
@@ -1206,6 +1343,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const qso = data.qso || {};
       const txParity = qso.active ? qso.tx_slot_family : inferredTxParity(station);
       const txFreq = qso.selected_tx_freq_hz ?? currentTxFreqValue(data);
+      const rigBusy = !!data.rig_tune_active || data.rig_is_tx === true;
       freqInput.min = String(data.qso_defaults?.tx_freq_min_hz ?? 200);
       freqInput.max = String(data.qso_defaults?.tx_freq_max_hz ?? 3500);
       if (freqInput.value === '' || qso.active) {
@@ -1222,6 +1360,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       snr.textContent = qso.latest_partner_snr_db == null ? '-' : `${qso.latest_partner_snr_db} dB`;
       if (qso.active) {
         hint.textContent = `TX ${qso.selected_tx_freq_hz?.toFixed(0) ?? '-'} Hz, ${qso.tx_slot_family ?? '?'} slots. Escape stops immediately.`;
+      } else if (data.rig_tune_active) {
+        hint.textContent = 'Tune tone active. QSO start is disabled until TX returns to RX.';
       } else if (station) {
         hint.textContent =
           `Latest ${station.callsign}: ${station.last_heard_at}, ${Math.round(station.last_heard_freq_hz)} Hz, ${station.last_heard_snr_db} dB, TX parity ${txParity ?? '?'} .`;
@@ -1248,7 +1388,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         transcript.scrollTop = transcript.scrollHeight;
       }
       const freqOkay = txFreqValid(data, Number(freqInput.value));
-      start.disabled = qso.active || qso.tx_active || !station || !txParity || !freqOkay;
+      start.disabled = qso.active || qso.tx_active || rigBusy || !station || !txParity || !freqOkay;
       stop.disabled = !qso.active && !qso.tx_active;
       autoPick.disabled = !station || !txParity;
     }
@@ -1289,6 +1429,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderBandMap('even-map', data.bandmaps.even);
       renderBandMap('odd-map', data.bandmaps.odd);
       renderDecodes(data.decodes);
+      renderRigControls(data);
       renderDetail(data);
       renderQso(data);
       document.querySelectorAll('[data-call]').forEach((node) => {
@@ -1303,6 +1444,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
     }
     refresh().catch(console.error);
+    initRigBandOptions();
+    initRigPowerOptions();
     document.getElementById('detail-logs').addEventListener('scroll', (event) => {
       const node = event.currentTarget;
       const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
@@ -1318,6 +1461,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
     });
     document.getElementById('qso-stop').addEventListener('click', () => {
       stopQso().catch((error) => console.error(error));
+    });
+    document.getElementById('rig-tune').addEventListener('click', () => {
+      tuneRigForTenSeconds().catch((error) => console.error(error));
+    });
+    document.getElementById('rig-band').addEventListener('change', () => {
+      applyRigSettings().catch((error) => {
+        pendingRigConfig = null;
+        console.error(error);
+      });
+    });
+    document.getElementById('rig-power').addEventListener('change', () => {
+      applyRigSettings().catch((error) => {
+        pendingRigConfig = null;
+        console.error(error);
+      });
     });
     document.getElementById('qso-autopick').addEventListener('click', autoPickQuietSpot);
     document.getElementById('qso-freq').addEventListener('input', () => {
@@ -1361,6 +1519,8 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route("/api/state", get(api_state_handler))
                 .route("/api/qso/start", post(api_qso_start_handler))
                 .route("/api/qso/stop", post(api_qso_stop_handler))
+                .route("/api/rig/config", post(api_rig_config_handler))
+                .route("/api/rig/tune", post(api_rig_tune_handler))
                 .with_state(state);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -1398,12 +1558,16 @@ async fn api_qso_start_handler(
         .lock()
         .expect("web snapshot poisoned")
         .clone();
-    if snapshot.qso.active || snapshot.qso.tx_active {
+    if snapshot.qso.active
+        || snapshot.qso.tx_active
+        || snapshot.rig_tune_active
+        || snapshot.rig_is_tx == Some(true)
+    {
         return (
             StatusCode::CONFLICT,
             Json(ApiStatus {
                 ok: false,
-                message: "qso or tx already active".to_string(),
+                message: "qso or rig tx already active".to_string(),
             }),
         );
     }
@@ -1429,6 +1593,118 @@ async fn api_qso_stop_handler(State(state): State<WebAppState>) -> (StatusCode, 
         Json(ApiStatus {
             ok: true,
             message: "qso stop queued".to_string(),
+        }),
+    )
+}
+
+async fn api_rig_config_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<RigConfigRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    let snapshot = state
+        .snapshot
+        .lock()
+        .expect("web snapshot poisoned")
+        .clone();
+    if snapshot.rig_mode == "unavailable" {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiStatus {
+                ok: false,
+                message: "rig unavailable".to_string(),
+            }),
+        );
+    }
+    if snapshot.qso.active
+        || snapshot.qso.tx_active
+        || snapshot.rig_tune_active
+        || snapshot.rig_is_tx == Some(true)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiStatus {
+                ok: false,
+                message: "rig busy".to_string(),
+            }),
+        );
+    }
+    let band = match request.band.parse::<Band>() {
+        Ok(band) => band,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiStatus {
+                    ok: false,
+                    message: error,
+                }),
+            );
+        }
+    };
+    if !(0.1..=110.0).contains(&request.power_w) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "power must be between 0.1 and 110.0 W".to_string(),
+            }),
+        );
+    }
+    state.rig_control.enqueue(RigCommand::Configure {
+        band,
+        power_w: request.power_w,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "rig config queued".to_string(),
+        }),
+    )
+}
+
+async fn api_rig_tune_handler(State(state): State<WebAppState>) -> (StatusCode, Json<ApiStatus>) {
+    if !state.tune_available {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiStatus {
+                ok: false,
+                message: "audio output unavailable".to_string(),
+            }),
+        );
+    }
+    let snapshot = state
+        .snapshot
+        .lock()
+        .expect("web snapshot poisoned")
+        .clone();
+    if snapshot.rig_mode == "unavailable" {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiStatus {
+                ok: false,
+                message: "rig unavailable".to_string(),
+            }),
+        );
+    }
+    if snapshot.qso.active
+        || snapshot.qso.tx_active
+        || snapshot.rig_tune_active
+        || snapshot.rig_is_tx == Some(true)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiStatus {
+                ok: false,
+                message: "rig busy".to_string(),
+            }),
+        );
+    }
+    state.rig_control.enqueue(RigCommand::Tune10s);
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "tune queued".to_string(),
         }),
     )
 }
@@ -1484,11 +1760,17 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             let _ = rig_inner.set_configured_power_w(power_w);
         }
     }
-    let tx_backend: Box<dyn qso::TxBackend> =
-        match detect_k3s_audio_output_device(config.tx.output_device.as_deref()) {
-            Ok(device) => Box::new(RigTxBackend::new(Arc::clone(&rig), device)),
-            Err(error) => Box::new(qso::UnavailableTxBackend::new(error.to_string())),
-        };
+    let tx_busy = Arc::new(AtomicBool::new(false));
+    let tune_active = Arc::new(AtomicBool::new(false));
+    let output_device = detect_k3s_audio_output_device(config.tx.output_device.as_deref());
+    let tx_backend: Box<dyn qso::TxBackend> = match &output_device {
+        Ok(device) => Box::new(RigTxBackend::new(
+            Arc::clone(&rig),
+            device.clone(),
+            Arc::clone(&tx_busy),
+        )),
+        Err(error) => Box::new(qso::UnavailableTxBackend::new(error.to_string())),
+    };
     let mut qso_controller = QsoController::new(config.clone(), tx_backend);
     let web_snapshot = Arc::new(Mutex::new(WebSnapshot {
         qso_defaults: qso_controller.defaults(),
@@ -1496,11 +1778,14 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         ..WebSnapshot::default()
     }));
     let qso_control = Arc::new(QsoControlPlane::default());
+    let rig_control = Arc::new(RigControlPlane::default());
     start_web_server(
         &cli.web_bind,
         WebAppState {
             snapshot: Arc::clone(&web_snapshot),
             qso_control: Arc::clone(&qso_control),
+            rig_control: Arc::clone(&rig_control),
+            tune_available: output_device.is_ok(),
         },
     )?;
     let (job_tx, job_rx) = mpsc::sync_channel::<DecodeJob>(1);
@@ -1599,6 +1884,36 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 QsoCommand::Stop { .. } => None,
             };
             qso_controller.handle_command(command, station_info, now);
+        }
+        for command in rig_control.drain() {
+            match command {
+                RigCommand::Configure { band, power_w } => {
+                    if let Err(error) = apply_rig_config(&rig, band, power_w) {
+                        display.decode_status = format!("Rig config failed: {error}");
+                    } else {
+                        display.rig = read_rig_snapshot_shared(&rig);
+                        last_rig_poll = now;
+                    }
+                }
+                RigCommand::Tune10s => {
+                    if let Ok(device) = &output_device {
+                        if let Err(error) = start_tune_thread(
+                            Arc::clone(&rig),
+                            device.clone(),
+                            config.tx.playback_channels,
+                            config.tx.drive_level,
+                            Arc::clone(&tx_busy),
+                            Arc::clone(&tune_active),
+                        ) {
+                            display.decode_status = format!("Tune failed: {error}");
+                        } else {
+                            display.decode_status = "Tune 10s started".to_string();
+                        }
+                    } else if let Err(error) = &output_device {
+                        display.decode_status = format!("Tune unavailable: {error}");
+                    }
+                }
+            }
         }
 
         while let Ok(event) = event_rx.try_recv() {
@@ -1799,6 +2114,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             &station_tracker,
             &qso_controller.snapshot(SystemTime::now()),
             &qso_controller.defaults(),
+            tune_active.load(Ordering::Relaxed),
         );
         render(&display);
         thread::sleep(Duration::from_millis(50));
@@ -1818,6 +2134,7 @@ fn refresh_web_snapshot(
     station_tracker: &StationTracker,
     qso_snapshot: &WebQsoSnapshot,
     qso_defaults: &WebQsoDefaults,
+    tune_active: bool,
 ) {
     let now = SystemTime::now();
     let current_slot = current_slot_boundary(now);
@@ -1868,6 +2185,7 @@ fn refresh_web_snapshot(
         .and_then(|state| state.configured_power_w);
     guard.rig_bargraph = display.rig.as_ref().and_then(|state| state.bar_graph);
     guard.rig_is_tx = display.rig.as_ref().and_then(|state| state.transmitting);
+    guard.rig_tune_active = tune_active;
     guard.decode_status = display.decode_status.clone();
     guard.audio_stats = WebAudioStats {
         latest_sample: display.capture_latest_sample_time.map(format_slot_time),
@@ -1973,6 +2291,104 @@ fn read_rig_snapshot(rig: &mut Option<K3s>) -> Option<RigSnapshot> {
 fn read_rig_snapshot_shared(rig: &SharedRig) -> Option<RigSnapshot> {
     let mut guard = rig.lock().expect("rig mutex poisoned");
     read_rig_snapshot(&mut guard)
+}
+
+fn apply_rig_config(rig: &SharedRig, band: Band, power_w: f32) -> Result<(), AppError> {
+    let mut guard = rig.lock().expect("rig mutex poisoned");
+    let rig = guard.as_mut().ok_or_else(|| {
+        AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "rig unavailable",
+        ))
+    })?;
+    rig.set_band(band)?;
+    rig.set_mode(Mode::Data)?;
+    rig.set_configured_power_w(power_w)?;
+    Ok(())
+}
+
+fn start_tune_thread(
+    rig: SharedRig,
+    output_device: AudioDevice,
+    playback_channels: usize,
+    drive_level: f32,
+    tx_busy: Arc<AtomicBool>,
+    tune_active: Arc<AtomicBool>,
+) -> Result<(), String> {
+    if tx_busy
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("transmit path busy".to_string());
+    }
+    tune_active.store(true, Ordering::Release);
+    thread::spawn(move || {
+        let _busy_guard = AtomicFlagGuard::new(tx_busy, false);
+        let _tune_guard = AtomicFlagGuard::new(tune_active, false);
+        if let Err(error) = run_tune_thread(rig, output_device, playback_channels, drive_level) {
+            error!(message = %error, "rig_tune_failed");
+        }
+    });
+    Ok(())
+}
+
+fn run_tune_thread(
+    rig: SharedRig,
+    output_device: AudioDevice,
+    playback_channels: usize,
+    drive_level: f32,
+) -> Result<(), String> {
+    let original_meter_mode = {
+        let mut guard = rig.lock().expect("rig mutex poisoned");
+        let rig = guard
+            .as_mut()
+            .ok_or_else(|| "rig unavailable".to_string())?;
+        let original_meter_mode = rig.get_tx_meter_mode().unwrap_or(TxMeterMode::Rf);
+        rig.set_tx_meter_mode(TxMeterMode::Rf)
+            .map_err(|error| error.to_string())?;
+        rig.enter_tx().map_err(|error| error.to_string())?;
+        original_meter_mode
+    };
+
+    let playback_result = play_tone(
+        &output_device,
+        48_000,
+        playback_channels,
+        1_000.0,
+        Duration::from_secs(10),
+        drive_level,
+    );
+
+    let cleanup_result = {
+        let mut guard = rig.lock().expect("rig mutex poisoned");
+        let rig = guard
+            .as_mut()
+            .ok_or_else(|| "rig unavailable".to_string())?;
+        rig.enter_rx().map_err(|error| error.to_string())?;
+        rig.set_tx_meter_mode(original_meter_mode)
+            .map_err(|error| error.to_string())
+    };
+
+    playback_result
+        .map_err(|error| error.to_string())
+        .and(cleanup_result)
+}
+
+struct AtomicFlagGuard {
+    flag: Arc<AtomicBool>,
+    value: bool,
+}
+
+impl AtomicFlagGuard {
+    fn new(flag: Arc<AtomicBool>, value: bool) -> Self {
+        Self { flag, value }
+    }
+}
+
+impl Drop for AtomicFlagGuard {
+    fn drop(&mut self) {
+        self.flag.store(self.value, Ordering::Release);
+    }
 }
 
 fn extract_slot_capture(
@@ -3113,10 +3529,7 @@ impl StationTracker {
             .map(|entry| WebStationLog {
                 timestamp: format_time(entry.received_at),
                 sender_call: entry.sender_call.clone(),
-                peer: entry
-                    .peer
-                    .as_ref()
-                    .map(|peer| self.peer_display(peer)),
+                peer: entry.peer.as_ref().map(|peer| self.peer_display(peer)),
                 peer_before: entry
                     .peer_before
                     .as_ref()
