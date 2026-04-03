@@ -8,6 +8,7 @@ const DEFAULT_CAPTURE_CHANNELS: usize = 2;
 const DEFAULT_FRAMES_PER_READ: usize = 1_024;
 const DEFAULT_RING_SECONDS: usize = 120;
 const DEFAULT_PLAYBACK_FRAMES_PER_WRITE: usize = 1_024;
+const DEFAULT_PLAYBACK_BUFFER_FRAMES: usize = DEFAULT_PLAYBACK_FRAMES_PER_WRITE * 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -419,7 +420,15 @@ pub fn play_interleaved_samples_i16_until(
     hwp.set_rate(sample_rate_hz, ValueOr::Nearest)?;
     hwp.set_format(Format::s16())?;
     hwp.set_access(Access::RWInterleaved)?;
+    let period_frames = DEFAULT_PLAYBACK_FRAMES_PER_WRITE as alsa::pcm::Frames;
+    let buffer_frames = DEFAULT_PLAYBACK_BUFFER_FRAMES as alsa::pcm::Frames;
+    let _ = hwp.set_period_size_near(period_frames, ValueOr::Nearest)?;
+    let _ = hwp.set_buffer_size_near(buffer_frames)?;
     pcm.hw_params(&hwp)?;
+    let swp = pcm.sw_params_current()?;
+    swp.set_start_threshold(1)?;
+    swp.set_avail_min(period_frames)?;
+    pcm.sw_params(&swp)?;
     pcm.prepare()?;
 
     let io = pcm.io_i16()?;
@@ -453,7 +462,12 @@ pub fn play_interleaved_samples_i16_until(
         pcm.drop()?;
         return Ok(());
     }
-    pcm.drain()?;
+    if let Err(error) = pcm.drain() {
+        if pcm.state() != State::XRun {
+            return Err(Error::Alsa(error));
+        }
+        pcm.prepare()?;
+    }
     Ok(())
 }
 
