@@ -54,6 +54,7 @@ pub struct NoFwdThreshold {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
     pub fsm_log_path: String,
+    pub app_log_path: String,
 }
 
 impl AppConfig {

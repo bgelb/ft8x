@@ -38,6 +38,14 @@ pub enum QsoCommand {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct QsoOutcome {
+    pub partner_call: String,
+    pub exit_reason: String,
+    pub finished_at: SystemTime,
+    pub sent_terminal_73: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotFamily {
@@ -150,6 +158,7 @@ pub struct QsoController {
     next_session_id: u64,
     session: Option<ActiveSession>,
     last_snapshot: WebQsoSnapshot,
+    pending_outcomes: VecDeque<QsoOutcome>,
 }
 
 impl QsoController {
@@ -164,6 +173,7 @@ impl QsoController {
             next_session_id: 1,
             session: None,
             last_snapshot,
+            pending_outcomes: VecDeque::new(),
         }
     }
 
@@ -714,6 +724,9 @@ impl QsoController {
         match self.backend.start(request) {
             Ok(()) => {
                 session.last_tx_slot = Some(target_slot);
+                if matches!(session.state, QsoState::Send73 | QsoState::Send73Once) {
+                    session.sent_terminal_73 = true;
+                }
                 session.in_flight_tx = Some(InFlightTx {
                     target_slot,
                     state: session.state,
@@ -783,6 +796,10 @@ impl QsoController {
         self.finish_session("shutdown", now);
     }
 
+    pub fn drain_outcomes(&mut self) -> Vec<QsoOutcome> {
+        self.pending_outcomes.drain(..).collect()
+    }
+
     fn handle_start(
         &mut self,
         partner_call: String,
@@ -835,6 +852,7 @@ impl QsoController {
             current_rx_slot: None,
             rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
+            sent_terminal_73: false,
         };
         self.next_session_id += 1;
         let start_line = format!(
@@ -904,6 +922,12 @@ impl QsoController {
             last_rx_event: session.last_rx_event.clone(),
             transcript: session.transcript.into_iter().collect(),
         };
+        self.pending_outcomes.push_back(QsoOutcome {
+            partner_call: session.partner_call,
+            exit_reason: reason.to_string(),
+            finished_at: now,
+            sent_terminal_73: session.sent_terminal_73,
+        });
     }
 
     fn push_transcript(
@@ -1102,6 +1126,7 @@ struct ActiveSession {
     current_rx_slot: Option<SystemTime>,
     rx_slot_consumed_stage: Option<DecodeStage>,
     transcript: VecDeque<WebQsoTranscriptEntry>,
+    sent_terminal_73: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2069,11 +2094,11 @@ mod tests {
                 timeout_seconds: 600,
                 send_grid: RetryThresholds {
                     no_fwd: 3,
-                    no_msg: 10,
+                    no_msg: 3,
                 },
                 send_sig: RetryThresholds {
                     no_fwd: 3,
-                    no_msg: 10,
+                    no_msg: 3,
                 },
                 send_sig_ack: RetryThresholds {
                     no_fwd: 5,
@@ -2091,6 +2116,7 @@ mod tests {
             },
             logging: LoggingConfig {
                 fsm_log_path: "logs/test.jsonl".to_string(),
+                app_log_path: "logs/test.log".to_string(),
             },
         }
     }
@@ -2633,6 +2659,7 @@ mod tests {
             current_rx_slot: None,
             rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
+            sent_terminal_73: false,
         };
         let rescheduled =
             schedule_next_tx_slot(&session, SystemTime::UNIX_EPOCH + Duration::from_secs(15))

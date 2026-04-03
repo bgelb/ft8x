@@ -16,7 +16,8 @@ use ft8_decoder::{
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qso::{
-    QsoCommand, QsoController, RigTxBackend, StationStartInfo, WebQsoDefaults, WebQsoSnapshot,
+    QsoCommand, QsoController, QsoOutcome, RigTxBackend, StationStartInfo, WebQsoDefaults,
+    WebQsoSnapshot,
 };
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream, play_tone};
 use rigctl::{
@@ -35,8 +36,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::error;
+use tracing::{error, info, warn};
+use tracing_subscriber::Registry;
 use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
 
 const SLOT_SECONDS: u64 = 15;
 const DECODER_SAMPLE_RATE_HZ: u32 = 12_000;
@@ -51,6 +54,9 @@ const BANDMAP_ROWS: usize = 4;
 const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
 const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
+const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
+const QUEUE_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
+const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const CONFIG_DEFAULT: &str = "config/ft8rx.json";
 
 #[derive(Debug, Parser)]
@@ -134,11 +140,13 @@ struct WebAppState {
     snapshot: SharedWebSnapshot,
     qso_control: SharedQsoControl,
     rig_control: SharedRigControl,
+    queue_control: SharedQueueControl,
     tune_available: bool,
 }
 
 type SharedQsoControl = Arc<QsoControlPlane>;
 type SharedRigControl = Arc<RigControlPlane>;
+type SharedQueueControl = Arc<QueueControlPlane>;
 
 #[derive(Debug, Default)]
 struct QsoControlPlane {
@@ -178,10 +186,37 @@ impl RigControlPlane {
     }
 }
 
+#[derive(Debug, Default)]
+struct QueueControlPlane {
+    commands: Mutex<VecDeque<QueueCommand>>,
+}
+
+impl QueueControlPlane {
+    fn enqueue(&self, command: QueueCommand) {
+        self.commands
+            .lock()
+            .expect("queue control poisoned")
+            .push_back(command);
+    }
+
+    fn drain(&self) -> Vec<QueueCommand> {
+        let mut guard = self.commands.lock().expect("queue control poisoned");
+        guard.drain(..).collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum RigCommand {
     Configure { band: Band, power_w: f32 },
     Tune10s,
+}
+
+#[derive(Debug, Clone)]
+enum QueueCommand {
+    Add { callsign: String },
+    Remove { callsign: String },
+    SetAuto { enabled: bool },
+    SetTxFreq { tx_freq_hz: f32 },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -221,6 +256,7 @@ struct WebSnapshot {
     station_logs: Vec<WebStationLog>,
     qso: WebQsoSnapshot,
     qso_defaults: WebQsoDefaults,
+    queue: WebQueueSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -321,21 +357,50 @@ struct WebStationLog {
 }
 
 #[derive(Debug, Deserialize)]
-struct StartQsoRequest {
-    partner_call: String,
-    tx_freq_hz: f32,
-}
-
-#[derive(Debug, Deserialize)]
 struct RigConfigRequest {
     band: String,
     power_w: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueCallRequest {
+    callsign: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueAutoRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueTxFreqRequest {
+    tx_freq_hz: f32,
 }
 
 #[derive(Debug, Serialize)]
 struct ApiStatus {
     ok: bool,
     message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct WebQueueSnapshot {
+    auto_enabled: bool,
+    tx_freq_hz: f32,
+    scheduler_status: String,
+    entries: Vec<WebQueueEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebQueueEntry {
+    callsign: String,
+    queued_at: String,
+    ok_to_schedule_after: String,
+    last_heard_at: Option<String>,
+    last_heard_message: String,
+    last_heard_slot_family: Option<String>,
+    ready: bool,
+    status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -349,9 +414,11 @@ struct StationTracker {
 #[derive(Debug, Clone)]
 struct StationState {
     last_heard_at: SystemTime,
+    last_heard_slot_index: u64,
     last_heard_freq_hz: f32,
     last_heard_snr_db: i32,
     last_heard_slot_family: qso::SlotFamily,
+    last_message_kind: StationLastMessageKind,
     active_qso: Option<ActiveQso>,
     last_qso_ended_at: Option<SystemTime>,
     qso_history: Vec<CompletedQso>,
@@ -395,6 +462,61 @@ struct LoggedDecode {
     text: String,
 }
 
+#[derive(Debug, Clone)]
+struct WorkQueueState {
+    auto_enabled: bool,
+    tx_freq_hz: f32,
+    entries: VecDeque<WorkQueueEntry>,
+    recent_worked: BTreeMap<String, SystemTime>,
+    scheduler_status: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkQueueEntry {
+    callsign: String,
+    queued_at: SystemTime,
+    ok_to_schedule_after: SystemTime,
+    last_observed_at: SystemTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StationLastMessageKind {
+    Cq,
+    Rr73,
+    SeventyThree,
+    Other,
+}
+
+impl StationLastMessageKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cq => "cq",
+            Self::Rr73 => "rr73",
+            Self::SeventyThree => "73",
+            Self::Other => "other",
+        }
+    }
+
+    fn is_ready_last_message(self) -> bool {
+        matches!(self, Self::Cq | Self::Rr73 | Self::SeventyThree)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueueEntryStatus {
+    last_heard_at: Option<SystemTime>,
+    last_heard_message: StationLastMessageKind,
+    last_heard_slot_family: Option<qso::SlotFamily>,
+    ready: bool,
+    status: String,
+}
+
+#[derive(Debug, Clone)]
+struct QueueDispatch {
+    callsign: String,
+    tx_freq_hz: f32,
+}
+
 impl Default for StationTracker {
     fn default() -> Self {
         Self {
@@ -402,6 +524,314 @@ impl Default for StationTracker {
             logs: VecDeque::new(),
             hash12_resolutions: BTreeMap::new(),
             hash22_resolutions: BTreeMap::new(),
+        }
+    }
+}
+
+impl WorkQueueState {
+    fn new(tx_freq_hz: f32, recent_worked: BTreeMap<String, SystemTime>) -> Self {
+        Self {
+            auto_enabled: false,
+            tx_freq_hz,
+            entries: VecDeque::new(),
+            recent_worked,
+            scheduler_status: "auto disabled".to_string(),
+        }
+    }
+
+    fn add_station(
+        &mut self,
+        callsign: &str,
+        last_observed_at: SystemTime,
+        now: SystemTime,
+    ) -> Result<(), String> {
+        self.prune_recent_worked(now);
+        if self.was_worked_recently(callsign, now) {
+            info!(callsign, "queue_add_rejected_recently_worked");
+            return Err("station worked in last 24h".to_string());
+        }
+        if self.entries.iter().any(|entry| entry.callsign == callsign) {
+            info!(callsign, "queue_add_ignored_duplicate");
+            return Ok(());
+        }
+        self.entries.push_back(WorkQueueEntry {
+            callsign: callsign.to_string(),
+            queued_at: now,
+            ok_to_schedule_after: now,
+            last_observed_at,
+        });
+        info!(callsign, queued_at = %format_time(now), "queue_add_accepted");
+        Ok(())
+    }
+
+    fn remove_station(&mut self, callsign: &str, reason: &str) -> bool {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.callsign == callsign)
+        {
+            self.entries.remove(index);
+            info!(callsign, reason, "queue_remove");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_auto_enabled(&mut self, enabled: bool) {
+        self.auto_enabled = enabled;
+        self.scheduler_status = if enabled {
+            "auto enabled".to_string()
+        } else {
+            "auto disabled".to_string()
+        };
+        info!(enabled, "queue_auto_changed");
+    }
+
+    fn set_tx_freq_hz(&mut self, tx_freq_hz: f32) {
+        self.tx_freq_hz = tx_freq_hz;
+        info!(tx_freq_hz, "queue_tx_freq_changed");
+    }
+
+    fn prune_recent_worked(&mut self, now: SystemTime) {
+        self.recent_worked.retain(|callsign, worked_at| {
+            let keep =
+                now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION;
+            if !keep {
+                info!(callsign, worked_at = %format_time(*worked_at), "recent_worked_expired");
+            }
+            keep
+        });
+    }
+
+    fn mark_worked(&mut self, callsign: &str, worked_at: SystemTime) {
+        self.recent_worked.insert(callsign.to_string(), worked_at);
+        info!(callsign, worked_at = %format_time(worked_at), "recent_worked_updated");
+    }
+
+    fn was_worked_recently(&self, callsign: &str, now: SystemTime) -> bool {
+        self.recent_worked.get(callsign).is_some_and(|worked_at| {
+            now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
+        })
+    }
+
+    fn handle_qso_outcome(&mut self, outcome: &QsoOutcome, tracker: &StationTracker) {
+        if outcome.sent_terminal_73 {
+            self.mark_worked(&outcome.partner_call, outcome.finished_at);
+            self.remove_station(&outcome.partner_call, "already_worked");
+        }
+        match outcome.exit_reason.as_str() {
+            "send_grid_no_msg_limit" | "send_sig_no_msg_limit" => {
+                self.remove_station(&outcome.partner_call, "requeue_replace");
+                let last_observed_at = tracker
+                    .start_info(&outcome.partner_call)
+                    .map(|info| info.last_heard_at)
+                    .unwrap_or(outcome.finished_at);
+                self.entries.push_back(WorkQueueEntry {
+                    callsign: outcome.partner_call.clone(),
+                    queued_at: outcome.finished_at,
+                    ok_to_schedule_after: outcome.finished_at + QUEUE_RETRY_DELAY,
+                    last_observed_at,
+                });
+                info!(
+                    callsign = outcome.partner_call,
+                    ok_to_schedule_after = %format_time(outcome.finished_at + QUEUE_RETRY_DELAY),
+                    exit_reason = outcome.exit_reason,
+                    "queue_requeue_after_no_msg"
+                );
+            }
+            _ => {
+                info!(
+                    callsign = outcome.partner_call,
+                    exit_reason = outcome.exit_reason,
+                    "queue_drop_after_qso_exit"
+                );
+            }
+        }
+    }
+
+    fn scheduler_pick(
+        &mut self,
+        now: SystemTime,
+        tracker: &StationTracker,
+        qso_busy: bool,
+        tune_active: bool,
+    ) -> Option<QueueDispatch> {
+        self.prune_recent_worked(now);
+        self.refresh_entry_observed_times(tracker);
+        self.prune_queue(now, tracker);
+        if !self.auto_enabled {
+            self.scheduler_status = "auto disabled".to_string();
+            return None;
+        }
+        if qso_busy {
+            self.scheduler_status = "waiting: qso active".to_string();
+            return None;
+        }
+        if tune_active {
+            self.scheduler_status = "waiting: rig tune active".to_string();
+            return None;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| self.entry_status(entry, tracker, now).ready)
+        {
+            let entry = self.entries.remove(index).expect("queue index valid");
+            self.scheduler_status = format!("dispatching {}", entry.callsign);
+            info!(
+                callsign = entry.callsign,
+                tx_freq_hz = self.tx_freq_hz,
+                queued_at = %format_time(entry.queued_at),
+                "queue_dispatch"
+            );
+            Some(QueueDispatch {
+                callsign: entry.callsign,
+                tx_freq_hz: self.tx_freq_hz,
+            })
+        } else {
+            self.scheduler_status = if self.entries.is_empty() {
+                "queue empty".to_string()
+            } else {
+                "no ready queued stations".to_string()
+            };
+            None
+        }
+    }
+
+    fn web_snapshot(&self, tracker: &StationTracker, now: SystemTime) -> WebQueueSnapshot {
+        WebQueueSnapshot {
+            auto_enabled: self.auto_enabled,
+            tx_freq_hz: self.tx_freq_hz,
+            scheduler_status: self.scheduler_status.clone(),
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| {
+                    let status = self.entry_status(entry, tracker, now);
+                    WebQueueEntry {
+                        callsign: entry.callsign.clone(),
+                        queued_at: format_time(entry.queued_at),
+                        ok_to_schedule_after: format_time(entry.ok_to_schedule_after),
+                        last_heard_at: status.last_heard_at.map(format_time),
+                        last_heard_message: status.last_heard_message.as_str().to_string(),
+                        last_heard_slot_family: status
+                            .last_heard_slot_family
+                            .map(|family| family.as_str().to_string()),
+                        ready: status.ready,
+                        status: status.status,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn refresh_entry_observed_times(&mut self, tracker: &StationTracker) {
+        for entry in &mut self.entries {
+            if let Some(info) = tracker.start_info(&entry.callsign) {
+                if info.last_heard_at > entry.last_observed_at {
+                    entry.last_observed_at = info.last_heard_at;
+                }
+            }
+        }
+    }
+
+    fn prune_queue(&mut self, now: SystemTime, _tracker: &StationTracker) {
+        let recent_worked = self.recent_worked.clone();
+        self.entries.retain(|entry| {
+            let worked_recently = recent_worked.get(&entry.callsign).is_some_and(|worked_at| {
+                now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
+            });
+            if worked_recently {
+                info!(callsign = entry.callsign, "queue_remove_already_worked");
+                return false;
+            }
+            if now
+                .duration_since(entry.last_observed_at)
+                .unwrap_or_default()
+                > QUEUE_HEARD_RETENTION
+            {
+                info!(
+                    callsign = entry.callsign,
+                    last_observed_at = %format_time(entry.last_observed_at),
+                    "queue_remove_stale_unheard"
+                );
+                return false;
+            }
+            true
+        });
+    }
+
+    fn entry_status(
+        &self,
+        entry: &WorkQueueEntry,
+        tracker: &StationTracker,
+        now: SystemTime,
+    ) -> QueueEntryStatus {
+        if self.was_worked_recently(&entry.callsign, now) {
+            return QueueEntryStatus {
+                last_heard_at: Some(entry.last_observed_at),
+                last_heard_message: StationLastMessageKind::Other,
+                last_heard_slot_family: None,
+                ready: false,
+                status: "already worked in last 24h".to_string(),
+            };
+        }
+        if now < entry.ok_to_schedule_after {
+            let wait = entry
+                .ok_to_schedule_after
+                .duration_since(now)
+                .unwrap_or_default()
+                .as_secs();
+            return QueueEntryStatus {
+                last_heard_at: Some(entry.last_observed_at),
+                last_heard_message: StationLastMessageKind::Other,
+                last_heard_slot_family: None,
+                ready: false,
+                status: format!("retry blocked for {wait}s"),
+            };
+        }
+        let Some(station) = tracker.stations.get(&entry.callsign) else {
+            return QueueEntryStatus {
+                last_heard_at: Some(entry.last_observed_at),
+                last_heard_message: StationLastMessageKind::Other,
+                last_heard_slot_family: None,
+                ready: false,
+                status: "not currently visible".to_string(),
+            };
+        };
+        let last_heard_at = Some(station.last_heard_at);
+        let last_heard_message = station.last_message_kind;
+        let last_heard_slot_family = Some(station.last_heard_slot_family);
+        let latest_same_family_slot =
+            latest_slot_index_for_family(now, station.last_heard_slot_family);
+        if latest_same_family_slot.saturating_sub(station.last_heard_slot_index) > 2 {
+            return QueueEntryStatus {
+                last_heard_at,
+                last_heard_message,
+                last_heard_slot_family,
+                ready: false,
+                status: "not heard in last two parity slots".to_string(),
+            };
+        }
+        if !station.last_message_kind.is_ready_last_message() {
+            return QueueEntryStatus {
+                last_heard_at,
+                last_heard_message,
+                last_heard_slot_family,
+                ready: false,
+                status: format!(
+                    "last heard message {} is not schedulable",
+                    station.last_message_kind.as_str()
+                ),
+            };
+        }
+        QueueEntryStatus {
+            last_heard_at,
+            last_heard_message,
+            last_heard_slot_family,
+            ready: true,
+            status: "ready".to_string(),
         }
     }
 }
@@ -524,8 +954,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .top-layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr) minmax(320px, 0.9fr);
+      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr);
       gap: 18px;
+      align-items: start;
+    }
+    .second-row {
+      display: grid;
+      grid-template-columns: minmax(320px, 0.95fr) minmax(320px, 1.05fr);
+      gap: 18px;
+      margin-bottom: 18px;
       align-items: start;
     }
     .top-main {
@@ -647,6 +1084,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 100%;
     }
     .qso-panel {
+      min-height: 100%;
+    }
+    .queue-panel {
       min-height: 100%;
     }
     .detail-block {
@@ -812,9 +1252,49 @@ const INDEX_HTML: &str = r#"<!doctype html>
       font-size: 12px;
       line-height: 1.4;
     }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--ink);
+      font-size: 13px;
+    }
+    .queue-list {
+      margin-top: 8px;
+      display: grid;
+      gap: 6px;
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .queue-item {
+      border: 1px solid rgba(143, 176, 192, 0.1);
+      border-radius: 8px;
+      padding: 8px;
+      background: rgba(19, 40, 56, 0.45);
+      display: grid;
+      gap: 6px;
+    }
+    .queue-topline {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    .queue-call {
+      font-weight: 600;
+      color: var(--focus-station);
+    }
+    .queue-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+    }
     @media (max-width: 1100px) {
       .status-grid { grid-template-columns: 1fr; }
       .top-layout { grid-template-columns: 1fr; }
+      .second-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -864,6 +1344,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <section class="panel detail-panel">
         <div class="label">Station Detail</div>
         <div class="value" id="detail-call">No station selected</div>
+        <div class="control-row">
+          <button id="detail-add-queue" class="button" type="button">Add To Queue</button>
+          <div class="hint" id="detail-queue-hint">Select a station in the monitor pane to add it to the work queue.</div>
+        </div>
         <div class="detail-block">
           <div class="label">Current State</div>
           <div class="detail-lines" id="detail-state">Click a callsign in the bandmap or decode table.</div>
@@ -887,9 +1371,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
           </div>
         </div>
       </section>
+    </div>
+    <div class="second-row">
+      <section class="panel queue-panel">
+        <div class="label">Stations To Work</div>
+        <div class="value" id="queue-count">0 queued</div>
+        <div class="detail-block">
+          <div class="label">Scheduler</div>
+          <div class="detail-lines" id="queue-status">auto disabled</div>
+        </div>
+        <div class="detail-block">
+          <div class="label">Queue</div>
+          <div class="queue-list" id="queue-list"></div>
+        </div>
+      </section>
       <section class="panel qso-panel">
         <div class="label">QSO</div>
-        <div class="value" id="qso-call">No station selected</div>
+        <div class="value" id="qso-call">Idle</div>
         <div class="control-row">
           <div class="control-inline">
             <div class="input-wrap">
@@ -899,10 +1397,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <button id="qso-autopick" class="button secondary" type="button">Auto-Pick Quiet Spot</button>
           </div>
           <div class="control-inline dual">
-            <button id="qso-start" class="button" type="button">Start QSO</button>
+            <label class="toggle-row"><input id="qso-auto" type="checkbox"> Auto QSO From Queue</label>
             <button id="qso-stop" class="button warn" type="button">Stop</button>
           </div>
-          <div class="hint" id="qso-hint">Select a station in the monitor pane to enable manual QSO control.</div>
+          <div class="hint" id="qso-hint">Auto QSO starts the oldest ready station from the work queue.</div>
         </div>
         <div class="qso-summary">
           <div><div class="label">State</div><div class="qso-status-line" id="qso-state">idle</div></div>
@@ -1027,6 +1525,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (Number.isFinite(current) && input.value !== '') {
         return current;
       }
+      if (data?.qso?.active && data?.qso?.selected_tx_freq_hz != null) {
+        return data.qso.selected_tx_freq_hz;
+      }
+      if (data?.queue?.tx_freq_hz != null) {
+        return data.queue.tx_freq_hz;
+      }
       if (data?.qso?.selected_tx_freq_hz != null) {
         return data.qso.selected_tx_freq_hz;
       }
@@ -1084,14 +1588,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       return response.json();
     }
-    async function startQso() {
-      if (!lastSnapshot || !selectedCall) return;
-      const txFreqHz = currentTxFreqValue(lastSnapshot);
-      if (!txFreqValid(lastSnapshot, txFreqHz)) return;
-      await postJson('/api/qso/start', {
-        partner_call: selectedCall,
-        tx_freq_hz: txFreqHz,
-      });
+    async function addSelectedToQueue() {
+      if (!selectedCall) return;
+      await postJson('/api/queue/add', { callsign: selectedCall });
       scheduleRefresh(10);
     }
     async function stopQso() {
@@ -1112,13 +1611,30 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/rig/tune', {});
       scheduleRefresh(10);
     }
-    function autoPickQuietSpot() {
+    async function updateQueueAuto(enabled) {
+      await postJson('/api/queue/auto', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueTxFreq(txFreqHz) {
+      await postJson('/api/queue/tx-freq', { tx_freq_hz: txFreqHz });
+      scheduleRefresh(10);
+    }
+    async function removeQueuedCall(callsign) {
+      await postJson('/api/queue/remove', { callsign });
+      scheduleRefresh(10);
+    }
+    async function autoPickQuietSpot() {
       if (!lastSnapshot) return;
-      const station = selectedStation(lastSnapshot);
+      const queue = lastSnapshot.queue || {};
+      const selected = selectedStation(lastSnapshot);
+      const candidateCall = selected?.callsign || (queue.entries || []).find((entry) => entry.ready)?.callsign || null;
+      const station = candidateCall ? stationMap(lastSnapshot).get(candidateCall) : null;
       const txParity = inferredTxParity(station);
       if (!txParity) return;
-      document.getElementById('qso-freq').value = quietSpotFrequency(lastSnapshot, txParity).toFixed(0);
+      const picked = quietSpotFrequency(lastSnapshot, txParity).toFixed(0);
+      document.getElementById('qso-freq').value = picked;
       renderQso(lastSnapshot);
+      await updateQueueTxFreq(Number(picked));
     }
     function renderRigControls(data) {
       initRigBandOptions();
@@ -1272,15 +1788,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const state = document.getElementById('detail-state');
       const history = document.getElementById('detail-history');
       const logs = document.getElementById('detail-logs');
+      const addButton = document.getElementById('detail-add-queue');
+      const addHint = document.getElementById('detail-queue-hint');
+      const queuedCalls = new Set((data.queue?.entries || []).map((entry) => entry.callsign));
       const stations = new Map((data.stations || []).map((entry) => [entry.callsign, entry]));
       if (!selectedCall || !stations.has(selectedCall)) {
         title.textContent = selectedCall ? `${selectedCall} not active in last 60m` : 'No station selected';
         state.textContent = selectedCall ? '' : 'Click a callsign in the bandmap or decode table.';
         history.textContent = '';
         logs.innerHTML = '';
+        addButton.disabled = true;
+        addHint.textContent = 'Select a station in the monitor pane to add it to the work queue.';
         return;
       }
       const station = stations.get(selectedCall);
+      addButton.disabled = queuedCalls.has(station.callsign);
+      addHint.textContent = queuedCalls.has(station.callsign)
+        ? `${station.callsign} is already in the queue.`
+        : `Add ${station.callsign} to the work queue.`;
       title.textContent = station.callsign;
       const current = station.is_in_qso
         ? `In QSO since ${station.in_qso_since ?? '-'} with ${station.qso_with ?? '?'}`
@@ -1335,23 +1860,27 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const parity = document.getElementById('qso-parity');
       const snr = document.getElementById('qso-snr');
       const transcript = document.getElementById('qso-transcript');
-      const start = document.getElementById('qso-start');
+      const autoToggle = document.getElementById('qso-auto');
       const stop = document.getElementById('qso-stop');
       const autoPick = document.getElementById('qso-autopick');
       const freqInput = document.getElementById('qso-freq');
+      const queue = data.queue || {};
       const station = selectedStation(data);
       const qso = data.qso || {};
-      const txParity = qso.active ? qso.tx_slot_family : inferredTxParity(station);
-      const txFreq = qso.selected_tx_freq_hz ?? currentTxFreqValue(data);
+      const readyQueueEntry = (queue.entries || []).find((entry) => entry.ready);
+      const candidateStation = station || (readyQueueEntry ? stationMap(data).get(readyQueueEntry.callsign) : null);
+      const txParity = qso.active ? qso.tx_slot_family : inferredTxParity(candidateStation);
+      const txFreq = qso.active ? qso.selected_tx_freq_hz : currentTxFreqValue(data);
       const rigBusy = !!data.rig_tune_active || data.rig_is_tx === true;
       freqInput.min = String(data.qso_defaults?.tx_freq_min_hz ?? 200);
       freqInput.max = String(data.qso_defaults?.tx_freq_max_hz ?? 3500);
-      if (freqInput.value === '' || qso.active) {
+      if (freqInput.value === '' || Number(freqInput.value) !== Number(txFreq) || qso.active) {
         freqInput.value = Number(txFreq).toFixed(0);
       }
+      autoToggle.checked = !!queue.auto_enabled;
       call.textContent = qso.active
         ? `Active with ${qso.partner_call}`
-        : (selectedCall ? `Ready: ${selectedCall}` : 'No station selected');
+        : (readyQueueEntry ? `Idle, next ready ${readyQueueEntry.callsign}` : 'Idle');
       state.textContent = qso.state || 'idle';
       timeout.textContent = qso.timeout_remaining_seconds == null ? '-' : `${qso.timeout_remaining_seconds}s`;
       counters.textContent = `no_msg=${qso.no_msg_count ?? 0}  no_fwd=${qso.no_fwd_count ?? 0}`;
@@ -1361,12 +1890,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (qso.active) {
         hint.textContent = `TX ${qso.selected_tx_freq_hz?.toFixed(0) ?? '-'} Hz, ${qso.tx_slot_family ?? '?'} slots. Escape stops immediately.`;
       } else if (data.rig_tune_active) {
-        hint.textContent = 'Tune tone active. QSO start is disabled until TX returns to RX.';
-      } else if (station) {
+        hint.textContent = 'Tune tone active. Queue dispatch is paused until TX returns to RX.';
+      } else if (candidateStation) {
         hint.textContent =
-          `Latest ${station.callsign}: ${station.last_heard_at}, ${Math.round(station.last_heard_freq_hz)} Hz, ${station.last_heard_snr_db} dB, TX parity ${txParity ?? '?'} .`;
+          `Latest ${candidateStation.callsign}: ${candidateStation.last_heard_at}, ${Math.round(candidateStation.last_heard_freq_hz)} Hz, ${candidateStation.last_heard_snr_db} dB, TX parity ${txParity ?? '?'} .`;
       } else {
-        hint.textContent = 'Select a station in the monitor pane to enable manual QSO control.';
+        hint.textContent = queue.scheduler_status || 'Auto QSO waits for a ready station in the queue.';
       }
       transcript.innerHTML = '';
       const rows = qso.transcript || [];
@@ -1388,9 +1917,36 @@ const INDEX_HTML: &str = r#"<!doctype html>
         transcript.scrollTop = transcript.scrollHeight;
       }
       const freqOkay = txFreqValid(data, Number(freqInput.value));
-      start.disabled = qso.active || qso.tx_active || rigBusy || !station || !txParity || !freqOkay;
       stop.disabled = !qso.active && !qso.tx_active;
-      autoPick.disabled = !station || !txParity;
+      autoToggle.disabled = qso.active || qso.tx_active || rigBusy;
+      freqInput.disabled = qso.active || qso.tx_active;
+      autoPick.disabled = !candidateStation || !txParity || qso.active || qso.tx_active;
+    }
+    function renderQueue(data) {
+      const queue = data.queue || {};
+      const count = document.getElementById('queue-count');
+      const status = document.getElementById('queue-status');
+      const list = document.getElementById('queue-list');
+      count.textContent = `${(queue.entries || []).length} queued`;
+      status.textContent = queue.scheduler_status || 'auto disabled';
+      list.innerHTML = '';
+      if (!(queue.entries || []).length) {
+        list.innerHTML = '<div class="detail-empty">No queued stations.</div>';
+        return;
+      }
+      for (const entry of queue.entries) {
+        const row = document.createElement('div');
+        row.className = 'queue-item';
+        row.innerHTML = `
+          <div class="queue-topline">
+            <div class="queue-call">${escapeHtml(entry.callsign)}</div>
+            <button class="button secondary" type="button" data-queue-remove="${escapeHtml(entry.callsign)}">Remove</button>
+          </div>
+          <div class="queue-meta">queued ${escapeHtml(entry.queued_at)}\nok after ${escapeHtml(entry.ok_to_schedule_after)}</div>
+          <div class="queue-meta">heard ${escapeHtml(entry.last_heard_at ?? '-')}  msg=${escapeHtml(entry.last_heard_message)}  parity=${escapeHtml(entry.last_heard_slot_family ?? '-')}</div>
+          <div class="queue-meta">${escapeHtml(entry.ready ? 'ready' : entry.status)}</div>`;
+        list.appendChild(row);
+      }
     }
     let refreshInFlight = { value: false };
     let refreshTimer = { value: null };
@@ -1432,10 +1988,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderRigControls(data);
       renderDetail(data);
       renderQso(data);
+      renderQueue(data);
       document.querySelectorAll('[data-call]').forEach((node) => {
         node.addEventListener('click', (event) => {
           event.preventDefault();
           pickCall(node.dataset.call);
+        });
+      });
+      document.querySelectorAll('[data-queue-remove]').forEach((node) => {
+        node.addEventListener('click', (event) => {
+          event.preventDefault();
+          removeQueuedCall(node.dataset.queueRemove).catch((error) => console.error(error));
         });
       });
       } finally {
@@ -1456,11 +2019,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
       autoFollowQso = remaining < 12;
     });
-    document.getElementById('qso-start').addEventListener('click', () => {
-      startQso().catch((error) => console.error(error));
-    });
     document.getElementById('qso-stop').addEventListener('click', () => {
       stopQso().catch((error) => console.error(error));
+    });
+    document.getElementById('detail-add-queue').addEventListener('click', () => {
+      addSelectedToQueue().catch((error) => console.error(error));
+    });
+    document.getElementById('qso-auto').addEventListener('change', (event) => {
+      updateQueueAuto(event.currentTarget.checked).catch((error) => console.error(error));
     });
     document.getElementById('rig-tune').addEventListener('click', () => {
       tuneRigForTenSeconds().catch((error) => console.error(error));
@@ -1477,9 +2043,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
         console.error(error);
       });
     });
-    document.getElementById('qso-autopick').addEventListener('click', autoPickQuietSpot);
+    document.getElementById('qso-autopick').addEventListener('click', () => {
+      autoPickQuietSpot().catch((error) => console.error(error));
+    });
     document.getElementById('qso-freq').addEventListener('input', () => {
       if (lastSnapshot) renderQso(lastSnapshot);
+    });
+    document.getElementById('qso-freq').addEventListener('change', (event) => {
+      const value = Number(event.currentTarget.value);
+      if (!lastSnapshot || !txFreqValid(lastSnapshot, value)) {
+        if (lastSnapshot) renderQso(lastSnapshot);
+        return;
+      }
+      updateQueueTxFreq(value).catch((error) => console.error(error));
     });
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && lastSnapshot?.qso && (lastSnapshot.qso.active || lastSnapshot.qso.tx_active)) {
@@ -1517,10 +2093,13 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
             let app = Router::new()
                 .route("/", get(index_handler))
                 .route("/api/state", get(api_state_handler))
-                .route("/api/qso/start", post(api_qso_start_handler))
                 .route("/api/qso/stop", post(api_qso_stop_handler))
                 .route("/api/rig/config", post(api_rig_config_handler))
                 .route("/api/rig/tune", post(api_rig_tune_handler))
+                .route("/api/queue/add", post(api_queue_add_handler))
+                .route("/api/queue/remove", post(api_queue_remove_handler))
+                .route("/api/queue/auto", post(api_queue_auto_handler))
+                .route("/api/queue/tx-freq", post(api_queue_tx_freq_handler))
                 .with_state(state);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -1549,41 +2128,6 @@ async fn api_state_handler(State(state): State<WebAppState>) -> Json<WebSnapshot
     )
 }
 
-async fn api_qso_start_handler(
-    State(state): State<WebAppState>,
-    Json(request): Json<StartQsoRequest>,
-) -> (StatusCode, Json<ApiStatus>) {
-    let snapshot = state
-        .snapshot
-        .lock()
-        .expect("web snapshot poisoned")
-        .clone();
-    if snapshot.qso.active
-        || snapshot.qso.tx_active
-        || snapshot.rig_tune_active
-        || snapshot.rig_is_tx == Some(true)
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiStatus {
-                ok: false,
-                message: "qso or rig tx already active".to_string(),
-            }),
-        );
-    }
-    state.qso_control.enqueue(QsoCommand::Start {
-        partner_call: request.partner_call.trim().to_uppercase(),
-        tx_freq_hz: request.tx_freq_hz,
-    });
-    (
-        StatusCode::ACCEPTED,
-        Json(ApiStatus {
-            ok: true,
-            message: "qso start queued".to_string(),
-        }),
-    )
-}
-
 async fn api_qso_stop_handler(State(state): State<WebAppState>) -> (StatusCode, Json<ApiStatus>) {
     state.qso_control.enqueue(QsoCommand::Stop {
         reason: "web_stop".to_string(),
@@ -1593,6 +2137,104 @@ async fn api_qso_stop_handler(State(state): State<WebAppState>) -> (StatusCode, 
         Json(ApiStatus {
             ok: true,
             message: "qso stop queued".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_add_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueCallRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    let callsign = request.callsign.trim().to_uppercase();
+    if callsign.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "callsign required".to_string(),
+            }),
+        );
+    }
+    state.queue_control.enqueue(QueueCommand::Add { callsign });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue add queued".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_remove_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueCallRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    let callsign = request.callsign.trim().to_uppercase();
+    if callsign.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "callsign required".to_string(),
+            }),
+        );
+    }
+    state
+        .queue_control
+        .enqueue(QueueCommand::Remove { callsign });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue remove queued".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_auto_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueAutoRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state.queue_control.enqueue(QueueCommand::SetAuto {
+        enabled: request.enabled,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue auto updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_tx_freq_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueTxFreqRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    let snapshot = state
+        .snapshot
+        .lock()
+        .expect("web snapshot poisoned")
+        .clone();
+    let min = snapshot.qso_defaults.tx_freq_min_hz;
+    let max = snapshot.qso_defaults.tx_freq_max_hz;
+    if !request.tx_freq_hz.is_finite() || request.tx_freq_hz < min || request.tx_freq_hz > max {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: format!("tx freq must be between {min:.0} and {max:.0} Hz"),
+            }),
+        );
+    }
+    state.queue_control.enqueue(QueueCommand::SetTxFreq {
+        tx_freq_hz: request.tx_freq_hz,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue tx freq updated".to_string(),
         }),
     )
 }
@@ -1733,20 +2375,90 @@ impl std::io::Write for SharedFileGuard<'_> {
 }
 
 fn init_tracing(config: &AppConfig) -> Result<(), AppError> {
-    let path = PathBuf::from(&config.logging.fsm_log_path);
-    if let Some(parent) = path.parent() {
+    let json_path = PathBuf::from(&config.logging.fsm_log_path);
+    if let Some(parent) = json_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    let writer = SharedFileWriter(Arc::new(Mutex::new(file)));
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer)
+    let text_path = PathBuf::from(&config.logging.app_log_path);
+    if let Some(parent) = text_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(json_path)?;
+    let text_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(text_path)?;
+    let json_writer = SharedFileWriter(Arc::new(Mutex::new(json_file)));
+    let text_writer = SharedFileWriter(Arc::new(Mutex::new(text_file)));
+    let json_layer = tracing_subscriber::fmt::layer()
+        .with_writer(json_writer)
         .json()
         .with_current_span(false)
-        .with_target(false)
-        .finish();
+        .with_target(false);
+    let text_layer = tracing_subscriber::fmt::layer()
+        .with_writer(text_writer)
+        .with_ansi(false)
+        .with_target(false);
+    let subscriber = Registry::default().with(json_layer).with(text_layer);
     let _ = tracing::subscriber::set_global_default(subscriber);
     Ok(())
+}
+
+fn load_recent_worked_cache(path: &str, now: SystemTime) -> BTreeMap<String, SystemTime> {
+    let path = Path::new(path);
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        info!(path = %path.display(), "recent_worked_cache_start_empty");
+        return BTreeMap::new();
+    };
+    let mut cache = BTreeMap::new();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(fields) = value.get("fields").and_then(|fields| fields.as_object()) else {
+            continue;
+        };
+        if fields.get("message").and_then(|value| value.as_str()) != Some("qso_fsm") {
+            continue;
+        }
+        if fields.get("event").and_then(|value| value.as_str()) != Some("tx_launch") {
+            continue;
+        }
+        let Some(state_before) = fields.get("state_before").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !matches!(state_before, "send_73" | "send_73_once") {
+            continue;
+        }
+        let Some(callsign) = fields
+            .get("partner_call")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(timestamp_str) = value.get("timestamp").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp_str) else {
+            continue;
+        };
+        let worked_at: SystemTime = parsed.with_timezone(&Utc).into();
+        if now.duration_since(worked_at).unwrap_or_default() > RECENT_WORKED_RETENTION {
+            continue;
+        }
+        match cache.get(&callsign).copied() {
+            Some(existing) if existing >= worked_at => {}
+            _ => {
+                cache.insert(callsign, worked_at);
+            }
+        }
+    }
+    info!(count = cache.len(), "recent_worked_cache_loaded");
+    cache
 }
 
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
@@ -1772,19 +2484,25 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         Err(error) => Box::new(qso::UnavailableTxBackend::new(error.to_string())),
     };
     let mut qso_controller = QsoController::new(config.clone(), tx_backend);
+    let recent_worked = load_recent_worked_cache(&config.logging.fsm_log_path, SystemTime::now());
+    let mut work_queue =
+        WorkQueueState::new(qso_controller.defaults().tx_freq_default_hz, recent_worked);
     let web_snapshot = Arc::new(Mutex::new(WebSnapshot {
         qso_defaults: qso_controller.defaults(),
         qso: qso_controller.snapshot(SystemTime::now()),
+        queue: work_queue.web_snapshot(&StationTracker::default(), SystemTime::now()),
         ..WebSnapshot::default()
     }));
     let qso_control = Arc::new(QsoControlPlane::default());
     let rig_control = Arc::new(RigControlPlane::default());
+    let queue_control = Arc::new(QueueControlPlane::default());
     start_web_server(
         &cli.web_bind,
         WebAppState {
             snapshot: Arc::clone(&web_snapshot),
             qso_control: Arc::clone(&qso_control),
             rig_control: Arc::clone(&rig_control),
+            queue_control: Arc::clone(&queue_control),
             tune_available: output_device.is_ok(),
         },
     )?;
@@ -1884,6 +2602,32 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 QsoCommand::Stop { .. } => None,
             };
             qso_controller.handle_command(command, station_info, now);
+        }
+        for command in queue_control.drain() {
+            match command {
+                QueueCommand::Add { callsign } => {
+                    if let Some(info) = station_tracker.start_info(&callsign) {
+                        if let Err(message) =
+                            work_queue.add_station(&callsign, info.last_heard_at, now)
+                        {
+                            warn!(callsign, message, "queue_add_failed");
+                        }
+                    } else {
+                        warn!(callsign, "queue_add_rejected_station_unavailable");
+                    }
+                }
+                QueueCommand::Remove { callsign } => {
+                    work_queue.remove_station(&callsign, "manual_remove");
+                }
+                QueueCommand::SetAuto { enabled } => work_queue.set_auto_enabled(enabled),
+                QueueCommand::SetTxFreq { tx_freq_hz } => {
+                    if config.validate_tx_freq_hz(tx_freq_hz) {
+                        work_queue.set_tx_freq_hz(tx_freq_hz);
+                    } else {
+                        warn!(tx_freq_hz, "queue_tx_freq_invalid");
+                    }
+                }
+            }
         }
         for command in rig_control.drain() {
             match command {
@@ -2083,6 +2827,26 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         }
 
         qso_controller.tick(SystemTime::now());
+        for outcome in qso_controller.drain_outcomes() {
+            work_queue.handle_qso_outcome(&outcome, &station_tracker);
+        }
+        let qso_runtime_snapshot = qso_controller.snapshot(SystemTime::now());
+        if let Some(dispatch) = work_queue.scheduler_pick(
+            SystemTime::now(),
+            &station_tracker,
+            qso_runtime_snapshot.active || qso_runtime_snapshot.tx_active,
+            tune_active.load(Ordering::Relaxed) || tx_busy.load(Ordering::Relaxed),
+        ) {
+            let station_info = station_tracker.start_info(&dispatch.callsign);
+            qso_controller.handle_command(
+                QsoCommand::Start {
+                    partner_call: dispatch.callsign,
+                    tx_freq_hz: dispatch.tx_freq_hz,
+                },
+                station_info,
+                SystemTime::now(),
+            );
+        }
 
         if should_refresh_waterfall(
             now,
@@ -2114,6 +2878,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             &station_tracker,
             &qso_controller.snapshot(SystemTime::now()),
             &qso_controller.defaults(),
+            &work_queue.web_snapshot(&station_tracker, SystemTime::now()),
             tune_active.load(Ordering::Relaxed),
         );
         render(&display);
@@ -2134,6 +2899,7 @@ fn refresh_web_snapshot(
     station_tracker: &StationTracker,
     qso_snapshot: &WebQsoSnapshot,
     qso_defaults: &WebQsoDefaults,
+    queue_snapshot: &WebQueueSnapshot,
     tune_active: bool,
 ) {
     let now = SystemTime::now();
@@ -2230,6 +2996,7 @@ fn refresh_web_snapshot(
     guard.station_logs = station_tracker.web_logs();
     guard.qso = qso_snapshot.clone();
     guard.qso_defaults = qso_defaults.clone();
+    guard.queue = queue_snapshot.clone();
 }
 
 fn run_oneshot(cli: Cli) -> Result<(), AppError> {
@@ -2792,6 +3559,14 @@ fn slot_index(time: SystemTime) -> u64 {
         / SLOT_SECONDS
 }
 
+fn latest_slot_index_for_family(now: SystemTime, family: qso::SlotFamily) -> u64 {
+    let current = slot_index(current_slot_boundary(now));
+    match (family, is_even_slot_family(current_slot_boundary(now))) {
+        (qso::SlotFamily::Even, true) | (qso::SlotFamily::Odd, false) => current,
+        _ => current.saturating_sub(1),
+    }
+}
+
 fn is_even_slot_family(time: SystemTime) -> bool {
     let second = time
         .duration_since(UNIX_EPOCH)
@@ -3271,17 +4046,21 @@ impl StationTracker {
             .entry(sender_call.clone())
             .or_insert_with(|| StationState {
                 last_heard_at: received_at,
+                last_heard_slot_index: slot_index(received_at),
                 last_heard_freq_hz: decode.freq_hz,
                 last_heard_snr_db: decode.snr_db,
                 last_heard_slot_family: qso::slot_family(received_at),
+                last_message_kind: station_message_kind(&decode.message),
                 active_qso: None,
                 last_qso_ended_at: None,
                 qso_history: Vec::new(),
             });
         entry.last_heard_at = received_at;
+        entry.last_heard_slot_index = slot_index(received_at);
         entry.last_heard_freq_hz = decode.freq_hz;
         entry.last_heard_snr_db = decode.snr_db;
         entry.last_heard_slot_family = qso::slot_family(received_at);
+        entry.last_message_kind = station_message_kind(&decode.message);
 
         match transition {
             QsoTransition::None => {}
@@ -3615,6 +4394,34 @@ fn message_is_cq(message: &StructuredMessage) -> bool {
     }
 }
 
+fn station_message_kind(message: &StructuredMessage) -> StationLastMessageKind {
+    if message_is_cq(message) {
+        return StationLastMessageKind::Cq;
+    }
+    match message {
+        StructuredMessage::Standard { info, .. } => match &info.value {
+            StructuredInfoValue::Grid { locator } if locator.eq_ignore_ascii_case("RR73") => {
+                StationLastMessageKind::Rr73
+            }
+            StructuredInfoValue::Reply {
+                word: ft8_decoder::ReplyWord::Rr73,
+            } => StationLastMessageKind::Rr73,
+            StructuredInfoValue::Reply {
+                word: ft8_decoder::ReplyWord::SeventyThree,
+            } => StationLastMessageKind::SeventyThree,
+            _ => StationLastMessageKind::Other,
+        },
+        StructuredMessage::Nonstandard { reply, .. } => match reply {
+            ft8_decoder::ReplyWord::Rr73 => StationLastMessageKind::Rr73,
+            ft8_decoder::ReplyWord::SeventyThree => StationLastMessageKind::SeventyThree,
+            _ => StationLastMessageKind::Other,
+        },
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {
+            StationLastMessageKind::Other
+        }
+    }
+}
+
 fn format_time(time: SystemTime) -> String {
     let utc: DateTime<Utc> = time.into();
     utc.format("%H:%M:%S").to_string()
@@ -3926,5 +4733,60 @@ mod tests {
         assert_eq!(logs[1].peer_before.as_deref(), Some("A"));
         assert_eq!(logs[1].peer, None);
         assert_eq!(logs[1].peer_after, None);
+    }
+
+    #[test]
+    fn queue_pick_uses_oldest_ready_entry() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let mut tracker = StationTracker::default();
+        tracker.ingest_decode(now, &cq_decode("OLDER"));
+        tracker.ingest_decode(now, &cq_decode("NEWER"));
+
+        let mut queue = WorkQueueState::new(900.0, BTreeMap::new());
+        queue.auto_enabled = true;
+        queue.add_station("OLDER", now, now).expect("older queued");
+        queue
+            .add_station(
+                "NEWER",
+                now + Duration::from_secs(1),
+                now + Duration::from_secs(1),
+            )
+            .expect("newer queued");
+
+        let dispatch = queue
+            .scheduler_pick(now + Duration::from_secs(1), &tracker, false, false)
+            .expect("dispatch");
+        assert_eq!(dispatch.callsign, "OLDER");
+    }
+
+    #[test]
+    fn queue_requeue_after_early_no_msg_adds_retry_delay() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let mut tracker = StationTracker::default();
+        tracker.ingest_decode(now, &cq_decode("K1ABC"));
+        let mut queue = WorkQueueState::new(900.0, BTreeMap::new());
+        queue.handle_qso_outcome(
+            &QsoOutcome {
+                partner_call: "K1ABC".to_string(),
+                exit_reason: "send_grid_no_msg_limit".to_string(),
+                finished_at: now,
+                sent_terminal_73: false,
+            },
+            &tracker,
+        );
+        let entry = queue.entries.front().expect("requeued entry");
+        assert_eq!(entry.callsign, "K1ABC");
+        assert_eq!(entry.queued_at, now);
+        assert_eq!(entry.ok_to_schedule_after, now + QUEUE_RETRY_DELAY);
+    }
+
+    #[test]
+    fn queue_drops_recently_worked_station_immediately() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let mut queue = WorkQueueState::new(900.0, BTreeMap::new());
+        queue.mark_worked("K1ABC", now);
+        let added = queue.add_station("K1ABC", now, now);
+        assert!(added.is_err());
+        assert!(queue.entries.is_empty());
     }
 }

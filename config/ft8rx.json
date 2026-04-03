@@ -17,11 +17,11 @@
     "timeout_seconds": 600,
     "send_grid": {
       "no_fwd": 3,
-      "no_msg": 10
+      "no_msg": 3
     },
     "send_sig": {
       "no_fwd": 3,
-      "no_msg": 10
+      "no_msg": 3
     },
     "send_sig_ack": {
       "no_fwd": 5,
@@ -40,6 +40,7 @@
     }
   },
   "logging": {
-    "fsm_log_path": "logs/ft8rx-qso.jsonl"
+    "fsm_log_path": "logs/ft8rx-qso.jsonl",
+    "app_log_path": "logs/ft8rx.log"
   }
 }
