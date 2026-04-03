@@ -584,7 +584,8 @@ fn encode_g15(info: &GridReport) -> Result<u16, EncodeError> {
         }
         GridReport::Blank => Ok(32_400),
         GridReport::Reply(ReplyWord::Rrr) => Ok(32_402),
-        GridReport::Reply(ReplyWord::Rr73) => Ok(32_403),
+        // WSJT-X compatibility: RR73 is sent using the overloaded grid-space codepoint.
+        GridReport::Reply(ReplyWord::Rr73) => Ok(32_373),
         GridReport::Reply(ReplyWord::SeventyThree) => Ok(32_404),
         GridReport::Reply(ReplyWord::Blank) => Ok(32_400),
         GridReport::Signal(report) if (-50..=49).contains(report) => {
@@ -723,6 +724,30 @@ mod tests {
         assert!(matches!(
             info.value,
             StructuredInfoValue::Grid { ref locator } if locator == "MO05"
+        ));
+    }
+
+    #[test]
+    fn rr73_reply_uses_wsjt_compatible_wire_value_and_normalizes_on_decode() {
+        let frame = encode_standard_message(
+            "W5XO",
+            "N1VF",
+            false,
+            &GridReport::Reply(ReplyWord::Rr73),
+        )
+        .expect("encode rr73");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let message = payload.to_message(&HashResolver::default());
+        let StructuredMessage::Standard { info, .. } = message else {
+            panic!("expected standard message");
+        };
+
+        assert_eq!(info.raw, 32_373);
+        assert!(matches!(
+            info.value,
+            StructuredInfoValue::Reply {
+                word: ReplyWord::Rr73
+            }
         ));
     }
 

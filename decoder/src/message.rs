@@ -491,7 +491,7 @@ fn structured_call_field(
 }
 
 fn structured_info_field(raw: u16, info: &GridReport) -> StructuredInfoField {
-    let value = match info {
+    let value = match normalize_grid_report(info) {
         GridReport::Grid(locator) => StructuredInfoValue::Grid {
             locator: locator.clone(),
         },
@@ -582,7 +582,7 @@ fn decode_g15(value: u64) -> GridReport {
         remaining %= 100;
         let c = ((remaining / 10) as u8 + b'0') as char;
         let d = ((remaining % 10) as u8 + b'0') as char;
-        return GridReport::Grid(format!("{a}{b}{c}{d}"));
+        return normalize_grid_report(&GridReport::Grid(format!("{a}{b}{c}{d}"))).clone();
     }
 
     let report = value - MAX_GRID4;
@@ -592,6 +592,16 @@ fn decode_g15(value: u64) -> GridReport {
         3 => GridReport::Reply(ReplyWord::Rr73),
         4 => GridReport::Reply(ReplyWord::SeventyThree),
         _ => GridReport::Signal(report as i16 - 35),
+    }
+}
+
+fn normalize_grid_report(info: &GridReport) -> &GridReport {
+    match info {
+        GridReport::Grid(locator) if locator.eq_ignore_ascii_case("RR73") => {
+            static RR73_REPLY: GridReport = GridReport::Reply(ReplyWord::Rr73);
+            &RR73_REPLY
+        }
+        _ => info,
     }
 }
 

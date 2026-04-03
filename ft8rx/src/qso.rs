@@ -1585,6 +1585,11 @@ fn classify_single_message(
             let target = structured_call_station_name(first);
             if target.as_deref() == Some(our_call) {
                 match &info.value {
+                    StructuredInfoValue::Grid { locator }
+                        if locator.eq_ignore_ascii_case("RR73") =>
+                    {
+                        SingleClass::ToUs(ToUsEvent::Reply(ReplyWord::Rr73))
+                    }
                     StructuredInfoValue::Reply { word } => {
                         SingleClass::ToUs(ToUsEvent::Reply(*word))
                     }
