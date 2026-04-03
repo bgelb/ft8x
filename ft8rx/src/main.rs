@@ -1,28 +1,38 @@
+mod config;
+mod qso;
+
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Html;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
+use config::AppConfig;
 use ft8_decoder::{
     AudioBuffer, CallModifier, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage,
     DecoderSession, DecoderState, StageDecodeReport, StructuredCallField, StructuredCallValue,
     StructuredInfoField, StructuredInfoValue, StructuredMessage,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
+use qso::{
+    QsoCommand, QsoController, RigTxBackend, StationStartInfo, WebQsoDefaults, WebQsoSnapshot,
+};
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream};
-use rigctl::{Band, K3s, K3sConfig, Mode, detect_k3s_audio_device};
+use rigctl::{Band, K3s, K3sConfig, Mode, detect_k3s_audio_device, detect_k3s_audio_output_device};
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing_subscriber::fmt::writer::MakeWriter;
 
 const SLOT_SECONDS: u64 = 15;
 const DECODER_SAMPLE_RATE_HZ: u32 = 12_000;
@@ -37,6 +47,7 @@ const BANDMAP_ROWS: usize = 4;
 const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
 const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
+const CONFIG_DEFAULT: &str = "config/ft8rx.json";
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8rx")]
@@ -45,6 +56,8 @@ struct Cli {
     oneshot: bool,
     #[arg(long, default_value = WEB_BIND_DEFAULT)]
     web_bind: String,
+    #[arg(long, default_value = CONFIG_DEFAULT)]
+    config: PathBuf,
     #[arg(long)]
     save_wav: Option<PathBuf>,
     #[arg(long)]
@@ -65,6 +78,8 @@ enum AppError {
     Wav(#[from] hound::Error),
     #[error("decoder error: {0}")]
     Decoder(String),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("system clock error")]
     Clock,
 }
@@ -108,6 +123,34 @@ struct CompositeDecodeRow {
 }
 
 type SharedWebSnapshot = Arc<Mutex<WebSnapshot>>;
+type SharedRig = Arc<Mutex<Option<K3s>>>;
+
+#[derive(Clone)]
+struct WebAppState {
+    snapshot: SharedWebSnapshot,
+    qso_control: SharedQsoControl,
+}
+
+type SharedQsoControl = Arc<QsoControlPlane>;
+
+#[derive(Debug, Default)]
+struct QsoControlPlane {
+    commands: Mutex<VecDeque<QsoCommand>>,
+}
+
+impl QsoControlPlane {
+    fn enqueue(&self, command: QsoCommand) {
+        self.commands
+            .lock()
+            .expect("qso control poisoned")
+            .push_back(command);
+    }
+
+    fn drain(&self) -> Vec<QsoCommand> {
+        let mut guard = self.commands.lock().expect("qso control poisoned");
+        guard.drain(..).collect()
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct BandMapStore {
@@ -143,6 +186,8 @@ struct WebSnapshot {
     bandmaps: WebBandMaps,
     stations: Vec<WebStationSummary>,
     station_logs: Vec<WebStationLog>,
+    qso: WebQsoSnapshot,
+    qso_defaults: WebQsoDefaults,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -207,6 +252,9 @@ struct WebBandMapCall {
 struct WebStationSummary {
     callsign: String,
     last_heard_at: String,
+    last_heard_freq_hz: f32,
+    last_heard_snr_db: i32,
+    last_heard_slot_family: String,
     is_in_qso: bool,
     in_qso_since: Option<String>,
     qso_with: Option<String>,
@@ -239,6 +287,18 @@ struct WebStationLog {
     text: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct StartQsoRequest {
+    partner_call: String,
+    tx_freq_hz: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiStatus {
+    ok: bool,
+    message: String,
+}
+
 #[derive(Debug, Clone)]
 struct StationTracker {
     stations: BTreeMap<String, StationState>,
@@ -250,6 +310,9 @@ struct StationTracker {
 #[derive(Debug, Clone)]
 struct StationState {
     last_heard_at: SystemTime,
+    last_heard_freq_hz: f32,
+    last_heard_snr_db: i32,
+    last_heard_slot_family: qso::SlotFamily,
     active_qso: Option<ActiveQso>,
     last_qso_ended_at: Option<SystemTime>,
     qso_history: Vec<CompletedQso>,
@@ -353,9 +416,17 @@ impl SlotStageState {
         }
     }
 
-    fn next_due_stage(self, slot_start: SystemTime, latest_sample_time: Option<SystemTime>) -> Option<DecodeStage> {
+    fn next_due_stage(
+        self,
+        slot_start: SystemTime,
+        latest_sample_time: Option<SystemTime>,
+    ) -> Option<DecodeStage> {
         let latest_sample_time = latest_sample_time?;
-        for stage in [DecodeStage::Early41, DecodeStage::Early47, DecodeStage::Full] {
+        for stage in [
+            DecodeStage::Early41,
+            DecodeStage::Early47,
+            DecodeStage::Full,
+        ] {
             if self.is_handled(stage) {
                 continue;
             }
@@ -414,7 +485,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .top-layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.6fr) minmax(320px, 0.9fr);
+      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr) minmax(320px, 0.9fr);
       gap: 18px;
       align-items: start;
     }
@@ -536,6 +607,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .detail-panel {
       min-height: 100%;
     }
+    .qso-panel {
+      min-height: 100%;
+    }
     .detail-block {
       margin-top: 14px;
     }
@@ -604,6 +678,101 @@ const INDEX_HTML: &str = r#"<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .control-row {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .control-inline {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+    .control-inline.dual {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .input-wrap {
+      display: grid;
+      gap: 4px;
+    }
+    .control-input {
+      width: 100%;
+      border: 1px solid rgba(143, 176, 192, 0.18);
+      border-radius: 9px;
+      background: rgba(6, 17, 26, 0.9);
+      color: var(--ink);
+      padding: 10px 11px;
+      font: inherit;
+    }
+    .button {
+      border: 1px solid rgba(143, 176, 192, 0.18);
+      border-radius: 10px;
+      background: linear-gradient(180deg, rgba(31, 111, 145, 0.95), rgba(18, 69, 91, 0.95));
+      color: var(--ink);
+      padding: 10px 12px;
+      font: inherit;
+      cursor: pointer;
+    }
+    .button.secondary {
+      background: linear-gradient(180deg, rgba(43, 55, 65, 0.95), rgba(22, 31, 38, 0.95));
+      color: var(--muted);
+    }
+    .button.warn {
+      background: linear-gradient(180deg, rgba(153, 84, 33, 0.95), rgba(110, 56, 18, 0.95));
+    }
+    .button:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+    .qso-summary {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 12px;
+      margin-top: 12px;
+    }
+    .qso-status-line {
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .qso-transcript {
+      margin-top: 8px;
+      display: grid;
+      gap: 4px;
+      max-height: 300px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .qso-entry {
+      border: 1px solid rgba(143, 176, 192, 0.1);
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: rgba(19, 40, 56, 0.45);
+      display: grid;
+      grid-template-columns: 62px 42px 82px minmax(0, 1fr);
+      gap: 6px;
+      font-size: 12px;
+      line-height: 1.2;
+    }
+    .qso-entry .stamp,
+    .qso-entry .dir,
+    .qso-entry .state {
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .qso-entry .msg {
+      color: var(--ink);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
     @media (max-width: 1100px) {
       .status-grid { grid-template-columns: 1fr; }
       .top-layout { grid-template-columns: 1fr; }
@@ -660,6 +829,36 @@ const INDEX_HTML: &str = r#"<!doctype html>
           </div>
         </div>
       </section>
+      <section class="panel qso-panel">
+        <div class="label">QSO</div>
+        <div class="value" id="qso-call">No station selected</div>
+        <div class="control-row">
+          <div class="control-inline">
+            <div class="input-wrap">
+              <div class="label">TX Freq</div>
+              <input id="qso-freq" class="control-input" type="number" min="200" max="3500" step="1">
+            </div>
+            <button id="qso-autopick" class="button secondary" type="button">Auto-Pick Quiet Spot</button>
+          </div>
+          <div class="control-inline dual">
+            <button id="qso-start" class="button" type="button">Start QSO</button>
+            <button id="qso-stop" class="button warn" type="button">Stop</button>
+          </div>
+          <div class="hint" id="qso-hint">Select a station in the monitor pane to enable manual QSO control.</div>
+        </div>
+        <div class="qso-summary">
+          <div><div class="label">State</div><div class="qso-status-line" id="qso-state">idle</div></div>
+          <div><div class="label">Timeout</div><div class="qso-status-line" id="qso-timeout">-</div></div>
+          <div><div class="label">Counters</div><div class="qso-status-line" id="qso-counters">no_msg=0 no_fwd=0</div></div>
+          <div><div class="label">Latest RX</div><div class="qso-status-line" id="qso-last-rx">-</div></div>
+          <div><div class="label">TX Parity</div><div class="qso-status-line" id="qso-parity">-</div></div>
+          <div><div class="label">Signal</div><div class="qso-status-line" id="qso-snr">-</div></div>
+        </div>
+        <div class="detail-block">
+          <div class="label">Transcript</div>
+          <div class="qso-transcript" id="qso-transcript"></div>
+        </div>
+      </section>
     </div>
     <div class="maps">
       <section class="panel">
@@ -698,13 +897,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     let selectedCall = null;
     let lastSnapshot = null;
     let autoFollowLogs = true;
+    let autoFollowQso = true;
     function fmtSec(value) {
       return value == null ? '-' : `${value.toFixed(2)}s`;
     }
     function pickCall(call) {
       if (!call) return;
       selectedCall = call;
-      if (lastSnapshot) renderDetail(lastSnapshot);
+      if (lastSnapshot) {
+        renderDetail(lastSnapshot);
+        renderQso(lastSnapshot);
+      }
     }
     function renderCallValue(value, call) {
       if (!call) return value;
@@ -725,6 +928,102 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       const cls = text === selected ? 'activity-station' : 'activity-partner';
       return `<span class="${cls}">${escapeHtml(text)}</span>`;
+    }
+    function stationMap(data) {
+      return new Map((data.stations || []).map((entry) => [entry.callsign, entry]));
+    }
+    function selectedStation(data) {
+      if (!selectedCall) return null;
+      return stationMap(data).get(selectedCall) || null;
+    }
+    function inferredTxParity(station) {
+      if (!station || !station.last_heard_slot_family) return null;
+      return station.last_heard_slot_family === 'even' ? 'odd' : 'even';
+    }
+    function currentTxFreqValue(data) {
+      const input = document.getElementById('qso-freq');
+      const current = Number(input.value);
+      if (Number.isFinite(current) && input.value !== '') {
+        return current;
+      }
+      if (data?.qso?.selected_tx_freq_hz != null) {
+        return data.qso.selected_tx_freq_hz;
+      }
+      return data?.qso_defaults?.tx_freq_default_hz ?? 1000;
+    }
+    function txFreqValid(data, value) {
+      const min = data?.qso_defaults?.tx_freq_min_hz ?? 200;
+      const max = data?.qso_defaults?.tx_freq_max_hz ?? 3500;
+      return Number.isFinite(value) && value >= min && value <= max;
+    }
+    function quietSpotFrequency(data, txParity) {
+      const defaults = data.qso_defaults || {};
+      const min = defaults.tx_freq_min_hz ?? 200;
+      const max = defaults.tx_freq_max_hz ?? 3500;
+      const fallback = defaults.tx_freq_default_hz ?? 1000;
+      const grid = txParity === 'even' ? data.bandmaps?.even : data.bandmaps?.odd;
+      if (!grid || !grid.length) return fallback;
+      let best = null;
+      for (let row = 0; row < grid.length; row++) {
+        for (let col = 0; col < grid[row].length; col++) {
+          const startHz = col * 200 + row * 50;
+          const centerHz = startHz + 25;
+          if (centerHz < min || centerHz > max) continue;
+          const entries = grid[row][col] || [];
+          const occupancy = entries.length;
+          const ageScore = entries.reduce((sum, entry) => sum + (entry.age_slots || 0), 0);
+          const candidate = { occupancy, ageScore, centerHz };
+          if (
+            !best ||
+            candidate.occupancy < best.occupancy ||
+            (candidate.occupancy === best.occupancy && candidate.ageScore > best.ageScore) ||
+            (candidate.occupancy === best.occupancy &&
+              candidate.ageScore === best.ageScore &&
+              candidate.centerHz < best.centerHz)
+          ) {
+            best = candidate;
+          }
+        }
+      }
+      return best ? best.centerHz : fallback;
+    }
+    async function postJson(url, body) {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+      });
+      if (!response.ok) {
+        let detail = response.statusText;
+        try {
+          const payload = await response.json();
+          detail = payload.message || detail;
+        } catch (_) {}
+        throw new Error(detail || `request failed: ${response.status}`);
+      }
+      return response.json();
+    }
+    async function startQso() {
+      if (!lastSnapshot || !selectedCall) return;
+      const txFreqHz = currentTxFreqValue(lastSnapshot);
+      if (!txFreqValid(lastSnapshot, txFreqHz)) return;
+      await postJson('/api/qso/start', {
+        partner_call: selectedCall,
+        tx_freq_hz: txFreqHz,
+      });
+      scheduleRefresh(10);
+    }
+    async function stopQso() {
+      await postJson('/api/qso/stop', {});
+      scheduleRefresh(10);
+    }
+    function autoPickQuietSpot() {
+      if (!lastSnapshot) return;
+      const station = selectedStation(lastSnapshot);
+      const txParity = inferredTxParity(station);
+      if (!txParity) return;
+      document.getElementById('qso-freq').value = quietSpotFrequency(lastSnapshot, txParity).toFixed(0);
+      renderQso(lastSnapshot);
     }
     function renderWaterfall(rows) {
       if (!rows || rows.length === 0) {
@@ -889,6 +1188,70 @@ const INDEX_HTML: &str = r#"<!doctype html>
         logs.scrollTop = logs.scrollHeight;
       }
     }
+    function renderQso(data) {
+      const call = document.getElementById('qso-call');
+      const hint = document.getElementById('qso-hint');
+      const state = document.getElementById('qso-state');
+      const timeout = document.getElementById('qso-timeout');
+      const counters = document.getElementById('qso-counters');
+      const lastRx = document.getElementById('qso-last-rx');
+      const parity = document.getElementById('qso-parity');
+      const snr = document.getElementById('qso-snr');
+      const transcript = document.getElementById('qso-transcript');
+      const start = document.getElementById('qso-start');
+      const stop = document.getElementById('qso-stop');
+      const autoPick = document.getElementById('qso-autopick');
+      const freqInput = document.getElementById('qso-freq');
+      const station = selectedStation(data);
+      const qso = data.qso || {};
+      const txParity = qso.active ? qso.tx_slot_family : inferredTxParity(station);
+      const txFreq = qso.selected_tx_freq_hz ?? currentTxFreqValue(data);
+      freqInput.min = String(data.qso_defaults?.tx_freq_min_hz ?? 200);
+      freqInput.max = String(data.qso_defaults?.tx_freq_max_hz ?? 3500);
+      if (freqInput.value === '' || qso.active) {
+        freqInput.value = Number(txFreq).toFixed(0);
+      }
+      call.textContent = qso.active
+        ? `Active with ${qso.partner_call}`
+        : (selectedCall ? `Ready: ${selectedCall}` : 'No station selected');
+      state.textContent = qso.state || 'idle';
+      timeout.textContent = qso.timeout_remaining_seconds == null ? '-' : `${qso.timeout_remaining_seconds}s`;
+      counters.textContent = `no_msg=${qso.no_msg_count ?? 0}  no_fwd=${qso.no_fwd_count ?? 0}`;
+      lastRx.textContent = qso.last_rx_event || '-';
+      parity.textContent = txParity || '-';
+      snr.textContent = qso.latest_partner_snr_db == null ? '-' : `${qso.latest_partner_snr_db} dB`;
+      if (qso.active) {
+        hint.textContent = `TX ${qso.selected_tx_freq_hz?.toFixed(0) ?? '-'} Hz, ${qso.tx_slot_family ?? '?'} slots. Escape stops immediately.`;
+      } else if (station) {
+        hint.textContent =
+          `Latest ${station.callsign}: ${station.last_heard_at}, ${Math.round(station.last_heard_freq_hz)} Hz, ${station.last_heard_snr_db} dB, TX parity ${txParity ?? '?'} .`;
+      } else {
+        hint.textContent = 'Select a station in the monitor pane to enable manual QSO control.';
+      }
+      transcript.innerHTML = '';
+      const rows = qso.transcript || [];
+      if (!rows.length) {
+        transcript.innerHTML = '<div class="detail-empty">No QSO transcript yet.</div>';
+      } else {
+        for (const entry of rows) {
+          const row = document.createElement('div');
+          row.className = 'qso-entry';
+          row.innerHTML = `
+            <div class="stamp">${escapeHtml(entry.timestamp)}</div>
+            <div class="dir">${escapeHtml(entry.direction)}</div>
+            <div class="state">${escapeHtml(entry.state)}</div>
+            <div class="msg">${escapeHtml(entry.text)}</div>`;
+          transcript.appendChild(row);
+        }
+      }
+      if (autoFollowQso) {
+        transcript.scrollTop = transcript.scrollHeight;
+      }
+      const freqOkay = txFreqValid(data, Number(freqInput.value));
+      start.disabled = qso.active || qso.tx_active || !station || !txParity || !freqOkay;
+      stop.disabled = !qso.active && !qso.tx_active;
+      autoPick.disabled = !station || !txParity;
+    }
     let refreshInFlight = { value: false };
     let refreshTimer = { value: null };
     function scheduleRefresh(delayMs) {
@@ -927,6 +1290,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderBandMap('odd-map', data.bandmaps.odd);
       renderDecodes(data.decodes);
       renderDetail(data);
+      renderQso(data);
       document.querySelectorAll('[data-call]').forEach((node) => {
         node.addEventListener('click', (event) => {
           event.preventDefault();
@@ -944,6 +1308,27 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
       autoFollowLogs = remaining < 12;
     });
+    document.getElementById('qso-transcript').addEventListener('scroll', (event) => {
+      const node = event.currentTarget;
+      const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
+      autoFollowQso = remaining < 12;
+    });
+    document.getElementById('qso-start').addEventListener('click', () => {
+      startQso().catch((error) => console.error(error));
+    });
+    document.getElementById('qso-stop').addEventListener('click', () => {
+      stopQso().catch((error) => console.error(error));
+    });
+    document.getElementById('qso-autopick').addEventListener('click', autoPickQuietSpot);
+    document.getElementById('qso-freq').addEventListener('input', () => {
+      if (lastSnapshot) renderQso(lastSnapshot);
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && lastSnapshot?.qso && (lastSnapshot.qso.active || lastSnapshot.qso.tx_active)) {
+        event.preventDefault();
+        stopQso().catch((error) => console.error(error));
+      }
+    });
   </script>
 </body>
 </html>
@@ -958,7 +1343,7 @@ fn main() -> Result<(), AppError> {
     }
 }
 
-fn start_web_server(bind: &str, snapshot: SharedWebSnapshot) -> Result<(), AppError> {
+fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
     let addr: SocketAddr = bind.parse().map_err(|error| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -974,7 +1359,9 @@ fn start_web_server(bind: &str, snapshot: SharedWebSnapshot) -> Result<(), AppEr
             let app = Router::new()
                 .route("/", get(index_handler))
                 .route("/api/state", get(api_state_handler))
-                .with_state(snapshot);
+                .route("/api/qso/start", post(api_qso_start_handler))
+                .route("/api/qso/stop", post(api_qso_stop_handler))
+                .with_state(state);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
                     if let Err(error) = axum::serve(listener, app).await {
@@ -992,16 +1379,134 @@ async fn index_handler() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn api_state_handler(State(snapshot): State<SharedWebSnapshot>) -> Json<WebSnapshot> {
-    Json(snapshot.lock().expect("web snapshot poisoned").clone())
+async fn api_state_handler(State(state): State<WebAppState>) -> Json<WebSnapshot> {
+    Json(
+        state
+            .snapshot
+            .lock()
+            .expect("web snapshot poisoned")
+            .clone(),
+    )
+}
+
+async fn api_qso_start_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<StartQsoRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    let snapshot = state
+        .snapshot
+        .lock()
+        .expect("web snapshot poisoned")
+        .clone();
+    if snapshot.qso.active || snapshot.qso.tx_active {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiStatus {
+                ok: false,
+                message: "qso or tx already active".to_string(),
+            }),
+        );
+    }
+    state.qso_control.enqueue(QsoCommand::Start {
+        partner_call: request.partner_call.trim().to_uppercase(),
+        tx_freq_hz: request.tx_freq_hz,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "qso start queued".to_string(),
+        }),
+    )
+}
+
+async fn api_qso_stop_handler(State(state): State<WebAppState>) -> (StatusCode, Json<ApiStatus>) {
+    state.qso_control.enqueue(QsoCommand::Stop {
+        reason: "web_stop".to_string(),
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "qso stop queued".to_string(),
+        }),
+    )
+}
+
+#[derive(Clone)]
+struct SharedFileWriter(Arc<Mutex<std::fs::File>>);
+
+impl<'a> MakeWriter<'a> for SharedFileWriter {
+    type Writer = SharedFileGuard<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedFileGuard(self.0.lock().expect("log file mutex poisoned"))
+    }
+}
+
+struct SharedFileGuard<'a>(std::sync::MutexGuard<'a, std::fs::File>);
+
+impl std::io::Write for SharedFileGuard<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+fn init_tracing(config: &AppConfig) -> Result<(), AppError> {
+    let path = PathBuf::from(&config.logging.fsm_log_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let writer = SharedFileWriter(Arc::new(Mutex::new(file)));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer)
+        .json()
+        .with_current_span(false)
+        .with_target(false)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    Ok(())
 }
 
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
+    let config = AppConfig::load(&cli.config)?;
+    init_tracing(&config)?;
     let audio = detect_k3s_audio_device(cli.device.as_deref())?;
     let capture = SampleStream::start(audio.clone(), AudioStreamConfig::default())?;
-    let mut rig = K3s::connect(K3sConfig::default()).ok();
-    let web_snapshot = Arc::new(Mutex::new(WebSnapshot::default()));
-    start_web_server(&cli.web_bind, Arc::clone(&web_snapshot))?;
+    let rig: SharedRig = Arc::new(Mutex::new(K3s::connect(K3sConfig::default()).ok()));
+    if let Some(power_w) = config.tx.power_w {
+        if let Some(rig_inner) = rig.lock().expect("rig mutex poisoned").as_mut() {
+            let _ = rig_inner.set_configured_power_w(power_w);
+        }
+    }
+    let tx_backend: Box<dyn qso::TxBackend> =
+        match detect_k3s_audio_output_device(config.tx.output_device.as_deref()) {
+            Ok(device) => Box::new(RigTxBackend::new(
+                Arc::clone(&rig),
+                device,
+                config.tx.playback_channels,
+            )),
+            Err(error) => Box::new(qso::UnavailableTxBackend::new(error.to_string())),
+        };
+    let mut qso_controller = QsoController::new(config.clone(), tx_backend);
+    let web_snapshot = Arc::new(Mutex::new(WebSnapshot {
+        qso_defaults: qso_controller.defaults(),
+        qso: qso_controller.snapshot(SystemTime::now()),
+        ..WebSnapshot::default()
+    }));
+    let qso_control = Arc::new(QsoControlPlane::default());
+    start_web_server(
+        &cli.web_bind,
+        WebAppState {
+            snapshot: Arc::clone(&web_snapshot),
+            qso_control: Arc::clone(&qso_control),
+        },
+    )?;
     let (job_tx, job_rx) = mpsc::sync_channel::<DecodeJob>(1);
     let (event_tx, event_rx) = mpsc::channel::<DecodeEvent>();
     thread::spawn(move || {
@@ -1046,7 +1551,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     .map_err(std::io::Error::other)?;
 
     let mut display = DisplayState {
-        rig: read_rig_snapshot(&mut rig),
+        rig: read_rig_snapshot_shared(&rig),
         audio,
         capture_rms_dbfs: -120.0,
         capture_latest_sample_time: None,
@@ -1088,8 +1593,16 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
         let now = SystemTime::now();
         if now.duration_since(last_rig_poll).unwrap_or_default() >= Duration::from_secs(2) {
-            display.rig = read_rig_snapshot(&mut rig);
+            display.rig = read_rig_snapshot_shared(&rig);
             last_rig_poll = now;
+        }
+
+        for command in qso_control.drain() {
+            let station_info = match &command {
+                QsoCommand::Start { partner_call, .. } => station_tracker.start_info(partner_call),
+                QsoCommand::Stop { .. } => None,
+            };
+            qso_controller.handle_command(command, station_info, now);
         }
 
         while let Ok(event) = event_rx.try_recv() {
@@ -1102,36 +1615,43 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 } => {
                     active_decode = None;
                     match result {
-                        Ok(update) => {
-                            match stage {
-                                DecodeStage::Early41 => {
-                                    display.early41_wall_ms = Some(wall_ms);
-                                    display.early41_decodes = update.report.decodes.clone();
-                                }
-                                DecodeStage::Early47 => {
-                                    display.early47_wall_ms = Some(wall_ms);
-                                    display.early47_tx_margin_ms = Some(
-                                        tx_margin_after_stage_decode_ms(slot_start, stage, wall_ms)?,
-                                    );
-                                    display.early47_decodes = update.report.decodes.clone();
-                                }
-                                DecodeStage::Full => {
-                                    display.last_slot_start = Some(slot_start);
-                                    display.full_wall_ms = Some(wall_ms);
-                                    display.last_decode_wall_ms = Some(wall_ms);
-                                    display.full_decodes = update.report.decodes.clone();
-                                    if dt_frame_history.len() == DT_HISTORY_FRAMES {
-                                        dt_frame_history.pop_front();
-                                    }
-                                    dt_frame_history.push_back(display.full_decodes.clone());
-                                    station_tracker.ingest_frame(slot_start, &display.full_decodes);
-                                    update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
-                                }
+                        Ok(update) => match stage {
+                            DecodeStage::Early41 => {
+                                display.early41_wall_ms = Some(wall_ms);
+                                display.early41_decodes = update.report.decodes.clone();
                             }
-                        }
+                            DecodeStage::Early47 => {
+                                display.early47_wall_ms = Some(wall_ms);
+                                display.early47_tx_margin_ms = Some(
+                                    tx_margin_after_stage_decode_ms(slot_start, stage, wall_ms)?,
+                                );
+                                display.early47_decodes = update.report.decodes.clone();
+                            }
+                            DecodeStage::Full => {
+                                display.last_slot_start = Some(slot_start);
+                                display.full_wall_ms = Some(wall_ms);
+                                display.last_decode_wall_ms = Some(wall_ms);
+                                display.full_decodes = update.report.decodes.clone();
+                                if dt_frame_history.len() == DT_HISTORY_FRAMES {
+                                    dt_frame_history.pop_front();
+                                }
+                                dt_frame_history.push_back(display.full_decodes.clone());
+                                station_tracker.ingest_frame(slot_start, &display.full_decodes);
+                                update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
+                                qso_controller.on_full_decode(
+                                    slot_start,
+                                    &display.full_decodes,
+                                    SystemTime::now(),
+                                );
+                            }
+                        },
                         Err(error) => {
-                            display.decode_status =
-                                format!("Last {} {} failed: {}", stage.as_str(), format_slot_time(slot_start), error);
+                            display.decode_status = format!(
+                                "Last {} {} failed: {}",
+                                stage.as_str(),
+                                format_slot_time(slot_start),
+                                error
+                            );
                             if stage == DecodeStage::Full {
                                 display.last_slot_start = Some(slot_start);
                                 display.full_wall_ms = Some(wall_ms);
@@ -1146,7 +1666,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             }
         }
 
-        while let Some(stage) = next_slot_stages.next_due_stage(next_slot, display.capture_latest_sample_time) {
+        while let Some(stage) =
+            next_slot_stages.next_due_stage(next_slot, display.capture_latest_sample_time)
+        {
             let slot_start = next_slot;
             let capture_end = stage_capture_end(slot_start, stage)?;
             let samples = match extract_stage_capture(&capture, slot_start, stage) {
@@ -1236,6 +1758,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             }
         }
 
+        qso_controller.tick(SystemTime::now());
+
         if should_refresh_waterfall(
             now,
             last_waterfall_update,
@@ -1264,11 +1788,14 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             &bandmaps,
             &dt_frame_history,
             &station_tracker,
+            &qso_controller.snapshot(SystemTime::now()),
+            &qso_controller.defaults(),
         );
         render(&display);
         thread::sleep(Duration::from_millis(50));
     }
 
+    qso_controller.shutdown(SystemTime::now());
     print!("\x1b[?25h");
     Ok(())
 }
@@ -1280,6 +1807,8 @@ fn refresh_web_snapshot(
     bandmaps: &BandMapStore,
     dt_frame_history: &VecDeque<Vec<DecodedMessage>>,
     station_tracker: &StationTracker,
+    qso_snapshot: &WebQsoSnapshot,
+    qso_defaults: &WebQsoDefaults,
 ) {
     let now = SystemTime::now();
     let current_slot = current_slot_boundary(now);
@@ -1324,7 +1853,10 @@ fn refresh_web_snapshot(
         .as_ref()
         .map(|state| state.band.to_string())
         .unwrap_or_else(|| "unavailable".to_string());
-    guard.rig_power_w = display.rig.as_ref().and_then(|state| state.configured_power_w);
+    guard.rig_power_w = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.configured_power_w);
     guard.rig_bargraph = display.rig.as_ref().and_then(|state| state.bar_graph);
     guard.rig_is_tx = display.rig.as_ref().and_then(|state| state.transmitting);
     guard.decode_status = display.decode_status.clone();
@@ -1332,8 +1864,16 @@ fn refresh_web_snapshot(
         latest_sample: display.capture_latest_sample_time.map(format_slot_time),
         selected_channel: display.capture_channel,
         overall_dbfs: display.capture_rms_dbfs,
-        left_dbfs: display.capture_channel_rms_dbfs.first().copied().unwrap_or(-120.0),
-        right_dbfs: display.capture_channel_rms_dbfs.get(1).copied().unwrap_or(-120.0),
+        left_dbfs: display
+            .capture_channel_rms_dbfs
+            .first()
+            .copied()
+            .unwrap_or(-120.0),
+        right_dbfs: display
+            .capture_channel_rms_dbfs
+            .get(1)
+            .copied()
+            .unwrap_or(-120.0),
         recoveries: display.capture_recoveries,
     };
     guard.decode_times = WebDecodeTimes {
@@ -1361,6 +1901,8 @@ fn refresh_web_snapshot(
     };
     guard.stations = station_tracker.web_station_summaries();
     guard.station_logs = station_tracker.web_logs();
+    guard.qso = qso_snapshot.clone();
+    guard.qso_defaults = qso_defaults.clone();
 }
 
 fn run_oneshot(cli: Cli) -> Result<(), AppError> {
@@ -1419,7 +1961,15 @@ fn read_rig_snapshot(rig: &mut Option<K3s>) -> Option<RigSnapshot> {
     })
 }
 
-fn extract_slot_capture(capture: &SampleStream, slot_start: SystemTime) -> Result<Vec<i16>, AppError> {
+fn read_rig_snapshot_shared(rig: &SharedRig) -> Option<RigSnapshot> {
+    let mut guard = rig.lock().expect("rig mutex poisoned");
+    read_rig_snapshot(&mut guard)
+}
+
+fn extract_slot_capture(
+    capture: &SampleStream,
+    slot_start: SystemTime,
+) -> Result<Vec<i16>, AppError> {
     Ok(capture.extract_window(
         slot_start,
         full_slot_sample_count(capture.config().sample_rate_hz),
@@ -1548,9 +2098,7 @@ fn decode_slot_from_samples(
             }
         }
     }
-    Ok(DecodeSummary {
-        final_decodes,
-    })
+    Ok(DecodeSummary { final_decodes })
 }
 
 fn write_mono_wav(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Result<(), AppError> {
@@ -1625,21 +2173,37 @@ fn render(display: &DisplayState) {
     let display_decodes = preferred_stage_decodes(display);
     let dt_stats = summarize_dt(display_decodes);
     let composite_rows = composite_rows(display);
-    let left = display.capture_channel_rms_dbfs.first().copied().unwrap_or(-120.0);
-    let right = display.capture_channel_rms_dbfs.get(1).copied().unwrap_or(-120.0);
+    let left = display
+        .capture_channel_rms_dbfs
+        .first()
+        .copied()
+        .unwrap_or(-120.0);
+    let right = display
+        .capture_channel_rms_dbfs
+        .get(1)
+        .copied()
+        .unwrap_or(-120.0);
     let latest_sample = display
         .capture_latest_sample_time
         .map(format_slot_time)
         .unwrap_or_else(|| "------".to_string());
 
     let mut output = String::new();
-    let _ = writeln!(output, "\x1b[2J\x1b[HFT8RX    {}", now_local.format("%Y-%m-%d %H:%M:%S %Z"));
+    let _ = writeln!(
+        output,
+        "\x1b[2J\x1b[HFT8RX    {}",
+        now_local.format("%Y-%m-%d %H:%M:%S %Z")
+    );
     let _ = writeln!(
         output,
         "Rig      {}  {}  {}  {}  P={}  BG={}",
         rig_frequency, rig_mode, rig_band, rig_direction, rig_power, rig_bargraph
     );
-    let _ = writeln!(output, "Audio    {} ({})", display.audio.name, display.audio.spec);
+    let _ = writeln!(
+        output,
+        "Audio    {} ({})",
+        display.audio.name, display.audio.spec
+    );
     let _ = writeln!(
         output,
         "Chan     latest={} selected={} left={:.1} dBFS right={:.1} dBFS",
@@ -1692,14 +2256,8 @@ fn render(display: &DisplayState) {
         dt_stats.count
     );
     let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Seen    UTC    SNR   dT(s)   Freq(Hz)  Message"
-    );
-    let _ = writeln!(
-        output,
-        "------  -----  ----  ------  --------  -------"
-    );
+    let _ = writeln!(output, "Seen    UTC    SNR   dT(s)   Freq(Hz)  Message");
+    let _ = writeln!(output, "------  -----  ----  ------  --------  -------");
     if composite_rows.is_empty() {
         let _ = writeln!(output, "no decodes yet");
     } else {
@@ -1803,11 +2361,18 @@ fn current_slot_boundary(now: SystemTime) -> SystemTime {
 }
 
 fn slot_index(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / SLOT_SECONDS
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / SLOT_SECONDS
 }
 
 fn is_even_slot_family(time: SystemTime) -> bool {
-    let second = time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() % 60;
+    let second = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 60;
     matches!(second, 0 | 30)
 }
 
@@ -1829,7 +2394,8 @@ fn samples_to_duration(sample_rate_hz: u32, sample_count: usize) -> Duration {
 }
 
 fn stage_sample_count(sample_rate_hz: u32, stage: DecodeStage) -> usize {
-    (((stage.required_samples() as u64 * sample_rate_hz as u64) + (DECODER_SAMPLE_RATE_HZ as u64 / 2))
+    (((stage.required_samples() as u64 * sample_rate_hz as u64)
+        + (DECODER_SAMPLE_RATE_HZ as u64 / 2))
         / DECODER_SAMPLE_RATE_HZ as u64) as usize
 }
 
@@ -1933,17 +2499,21 @@ fn composite_rows(display: &DisplayState) -> Vec<CompositeDecodeRow> {
         );
     }
     for decode in &display.early47_decodes {
-        let entry = rows.entry(decode.text.clone()).or_insert_with(|| CompositeDecodeRow {
-            display: decode.clone(),
-            seen: "mid",
-        });
+        let entry = rows
+            .entry(decode.text.clone())
+            .or_insert_with(|| CompositeDecodeRow {
+                display: decode.clone(),
+                seen: "mid",
+            });
         entry.display = decode.clone();
     }
     for decode in &display.full_decodes {
-        let entry = rows.entry(decode.text.clone()).or_insert_with(|| CompositeDecodeRow {
-            display: decode.clone(),
-            seen: "late",
-        });
+        let entry = rows
+            .entry(decode.text.clone())
+            .or_insert_with(|| CompositeDecodeRow {
+                display: decode.clone(),
+                seen: "late",
+            });
         entry.display = decode.clone();
     }
     let mut rows: Vec<_> = rows.into_values().collect();
@@ -2276,11 +2846,17 @@ impl StationTracker {
             .entry(sender_call.clone())
             .or_insert_with(|| StationState {
                 last_heard_at: received_at,
+                last_heard_freq_hz: decode.freq_hz,
+                last_heard_snr_db: decode.snr_db,
+                last_heard_slot_family: qso::slot_family(received_at),
                 active_qso: None,
                 last_qso_ended_at: None,
                 qso_history: Vec::new(),
             });
         entry.last_heard_at = received_at;
+        entry.last_heard_freq_hz = decode.freq_hz;
+        entry.last_heard_snr_db = decode.snr_db;
+        entry.last_heard_slot_family = qso::slot_family(received_at);
 
         match transition {
             QsoTransition::None => {}
@@ -2323,10 +2899,7 @@ impl StationTracker {
             }
         }
 
-        let peer_after = entry
-            .active_qso
-            .as_ref()
-            .map(|active| active.peer.clone());
+        let peer_after = entry.active_qso.as_ref().map(|active| active.peer.clone());
         let (kind, field1, field2, info) = decode_columns(decode);
         let display_peer = if message_is_cq(&decode.message) {
             None
@@ -2396,7 +2969,10 @@ impl StationTracker {
     }
 
     fn same_peer_identity(&self, left: &PeerRef, right: &PeerRef) -> bool {
-        match (self.resolve_peer(left.clone()), self.resolve_peer(right.clone())) {
+        match (
+            self.resolve_peer(left.clone()),
+            self.resolve_peer(right.clone()),
+        ) {
             (PeerRef::Callsign(left), PeerRef::Callsign(right)) => left == right,
             (PeerRef::Hash12(left), PeerRef::Hash12(right)) => left == right,
             (PeerRef::Hash22(left), PeerRef::Hash22(right)) => left == right,
@@ -2405,7 +2981,10 @@ impl StationTracker {
     }
 
     fn prefer_peer_identity(&self, existing: PeerRef, observed: PeerRef) -> PeerRef {
-        match (self.resolve_peer(existing.clone()), self.resolve_peer(observed.clone())) {
+        match (
+            self.resolve_peer(existing.clone()),
+            self.resolve_peer(observed.clone()),
+        ) {
             (PeerRef::Callsign(_), PeerRef::Callsign(_)) => self.resolve_peer(observed),
             (PeerRef::Callsign(_), _) => self.resolve_peer(existing),
             (_, PeerRef::Callsign(_)) => self.resolve_peer(observed),
@@ -2429,7 +3008,8 @@ impl StationTracker {
             self.logs.pop_front();
         }
         self.stations.retain(|_, state| {
-            let keep = now.duration_since(state.last_heard_at).unwrap_or_default() <= STATION_RETENTION;
+            let keep =
+                now.duration_since(state.last_heard_at).unwrap_or_default() <= STATION_RETENTION;
             if keep {
                 state.qso_history.retain(|qso| {
                     now.duration_since(qso.ended_at).unwrap_or_default() <= STATION_RETENTION
@@ -2445,6 +3025,9 @@ impl StationTracker {
             .map(|(callsign, state)| WebStationSummary {
                 callsign: callsign.clone(),
                 last_heard_at: format_time(state.last_heard_at),
+                last_heard_freq_hz: state.last_heard_freq_hz,
+                last_heard_snr_db: state.last_heard_snr_db,
+                last_heard_slot_family: state.last_heard_slot_family.as_str().to_string(),
                 is_in_qso: state.active_qso.is_some(),
                 in_qso_since: state.active_qso.as_ref().map(|qso| format_time(qso.since)),
                 qso_with: state
@@ -2465,15 +3048,33 @@ impl StationTracker {
             .collect()
     }
 
+    fn start_info(&self, callsign: &str) -> Option<StationStartInfo> {
+        self.stations.get(callsign).map(|state| StationStartInfo {
+            callsign: callsign.to_string(),
+            last_heard_at: state.last_heard_at,
+            last_heard_slot_family: state.last_heard_slot_family,
+            last_snr_db: state.last_heard_snr_db,
+        })
+    }
+
     fn web_logs(&self) -> Vec<WebStationLog> {
         self.logs
             .iter()
             .map(|entry| WebStationLog {
                 timestamp: format_time(entry.received_at),
                 sender_call: entry.sender_call.clone(),
-                display_peer: entry.display_peer.as_ref().map(|peer| self.peer_display(peer)),
-                peer_before: entry.peer_before.as_ref().map(|peer| self.peer_display(peer)),
-                peer_after: entry.peer_after.as_ref().map(|peer| self.peer_display(peer)),
+                display_peer: entry
+                    .display_peer
+                    .as_ref()
+                    .map(|peer| self.peer_display(peer)),
+                peer_before: entry
+                    .peer_before
+                    .as_ref()
+                    .map(|peer| self.peer_display(peer)),
+                peer_after: entry
+                    .peer_after
+                    .as_ref()
+                    .map(|peer| self.peer_display(peer)),
                 related_calls: entry.related_calls.clone(),
                 snr_db: entry.snr_db,
                 dt_seconds: entry.dt_seconds,
@@ -2488,11 +3089,18 @@ impl StationTracker {
     }
 }
 
-fn qso_peer_from_first_field(message: &StructuredMessage, tracker: &StationTracker) -> Option<PeerRef> {
+fn qso_peer_from_first_field(
+    message: &StructuredMessage,
+    tracker: &StationTracker,
+) -> Option<PeerRef> {
     match message {
         StructuredMessage::Standard { first, .. } => match &first.value {
-            StructuredCallValue::StandardCall { callsign } => Some(PeerRef::Callsign(callsign.clone())),
-            StructuredCallValue::Hash22 { hash, .. } => Some(tracker.resolve_peer(PeerRef::Hash22(*hash))),
+            StructuredCallValue::StandardCall { callsign } => {
+                Some(PeerRef::Callsign(callsign.clone()))
+            }
+            StructuredCallValue::Hash22 { hash, .. } => {
+                Some(tracker.resolve_peer(PeerRef::Hash22(*hash)))
+            }
             StructuredCallValue::Token { .. } => None,
         },
         StructuredMessage::Nonstandard {
@@ -2554,8 +3162,8 @@ fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> V
         return samples.to_vec();
     }
 
-    let output_len =
-        ((samples.len() as u64 * dst_rate_hz as u64) + (src_rate_hz as u64 / 2)) / src_rate_hz as u64;
+    let output_len = ((samples.len() as u64 * dst_rate_hz as u64) + (src_rate_hz as u64 / 2))
+        / src_rate_hz as u64;
     let mut output = Vec::with_capacity(output_len as usize);
     let scale = src_rate_hz as f64 / dst_rate_hz as f64;
     for index in 0..output_len as usize {
@@ -2574,13 +3182,18 @@ fn should_refresh_waterfall(
     latest_sample_time: Option<SystemTime>,
     last_sample_time: SystemTime,
 ) -> bool {
-    if now.duration_since(last_update).unwrap_or_default() < Duration::from_millis(WATERFALL_UPDATE_MS) {
+    if now.duration_since(last_update).unwrap_or_default()
+        < Duration::from_millis(WATERFALL_UPDATE_MS)
+    {
         return false;
     }
     latest_sample_time.is_some_and(|latest| latest > last_sample_time)
 }
 
-fn compute_latest_waterfall_row(capture: &SampleStream, latest_sample_time: SystemTime) -> Result<Vec<u8>, AppError> {
+fn compute_latest_waterfall_row(
+    capture: &SampleStream,
+    latest_sample_time: SystemTime,
+) -> Result<Vec<u8>, AppError> {
     let sample_rate_hz = capture.config().sample_rate_hz;
     let start = latest_sample_time
         .checked_sub(samples_to_duration(sample_rate_hz, WATERFALL_SAMPLES))
@@ -2594,7 +3207,8 @@ fn compute_waterfall_row(samples: &[i16], sample_rate_hz: u32) -> Vec<u8> {
     let fft = planner.plan_fft_forward(WATERFALL_SAMPLES);
     let mut buffer = vec![Complex32::new(0.0, 0.0); WATERFALL_SAMPLES];
     for (index, slot) in buffer.iter_mut().enumerate() {
-        let window = 0.5 - 0.5 * ((2.0 * std::f32::consts::PI * index as f32) / WATERFALL_SAMPLES as f32).cos();
+        let window = 0.5
+            - 0.5 * ((2.0 * std::f32::consts::PI * index as f32) / WATERFALL_SAMPLES as f32).cos();
         let sample = samples.get(index).copied().unwrap_or_default() as f32 / i16::MAX as f32;
         *slot = Complex32::new(sample * window, 0.0);
     }
@@ -2675,7 +3289,9 @@ fn update_bandmaps(store: &mut BandMapStore, slot_start: SystemTime, decodes: &[
 }
 
 fn prune_bandmap(map: &mut BTreeMap<String, BandMapEntry>, current_slot_index: u64) {
-    map.retain(|_, entry| current_slot_index.saturating_sub(entry.last_seen_slot_index) < BANDMAP_MAX_AGE_SLOTS);
+    map.retain(|_, entry| {
+        current_slot_index.saturating_sub(entry.last_seen_slot_index) < BANDMAP_MAX_AGE_SLOTS
+    });
 }
 
 fn bandmap_calls_from_decode(decode: &DecodedMessage) -> Vec<(String, Option<String>)> {
@@ -2690,8 +3306,7 @@ fn build_bandmap_grid(
     map: &BTreeMap<String, BandMapEntry>,
     current_slot_index: u64,
 ) -> Vec<Vec<Vec<WebBandMapCall>>> {
-    let mut cells =
-        vec![vec![Vec::<(f32, WebBandMapCall)>::new(); BANDMAP_COLUMNS]; BANDMAP_ROWS];
+    let mut cells = vec![vec![Vec::<(f32, WebBandMapCall)>::new(); BANDMAP_COLUMNS]; BANDMAP_ROWS];
     for entry in map.values() {
         let age_slots = current_slot_index.saturating_sub(entry.last_seen_slot_index);
         if age_slots >= BANDMAP_MAX_AGE_SLOTS {
@@ -2730,7 +3345,6 @@ fn build_bandmap_grid(
         })
         .collect()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2822,8 +3436,14 @@ mod tests {
 
         let logs = tracker.web_logs();
         assert_eq!(logs.len(), 2);
-        assert_eq!(logs[0].related_calls, vec!["A".to_string(), "B".to_string()]);
-        assert_eq!(logs[1].related_calls, vec!["B".to_string(), "C".to_string()]);
+        assert_eq!(
+            logs[0].related_calls,
+            vec!["A".to_string(), "B".to_string()]
+        );
+        assert_eq!(
+            logs[1].related_calls,
+            vec!["B".to_string(), "C".to_string()]
+        );
         assert_eq!(logs[1].peer_before.as_deref(), Some("A"));
         assert_eq!(logs[1].peer_after.as_deref(), Some("C"));
         assert!(!logs[1].related_calls.iter().any(|call| call == "A"));

@@ -1,0 +1,45 @@
+{
+  "station": {
+    "our_call": "N1VF",
+    "our_grid": "CM97"
+  },
+  "tx": {
+    "base_freq_hz": 1000.0,
+    "drive_level": 0.12,
+    "playback_channels": 2,
+    "output_device": null,
+    "power_w": null,
+    "tx_freq_min_hz": 200.0,
+    "tx_freq_max_hz": 3500.0
+  },
+  "fsm": {
+    "rr73_enabled": true,
+    "timeout_seconds": 600,
+    "send_grid": {
+      "no_fwd": 3,
+      "no_msg": 10
+    },
+    "send_sig": {
+      "no_fwd": 3,
+      "no_msg": 10
+    },
+    "send_sig_ack": {
+      "no_fwd": 5,
+      "no_msg": 2
+    },
+    "send_rr73": {
+      "no_fwd": 3
+    },
+    "send_rrr": {
+      "no_fwd": 5,
+      "no_msg": 2
+    },
+    "send_73": {
+      "no_fwd": 3,
+      "no_msg": 2
+    }
+  },
+  "logging": {
+    "fsm_log_path": "logs/ft8rx-qso.jsonl"
+  }
+}
