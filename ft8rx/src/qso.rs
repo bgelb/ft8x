@@ -237,6 +237,10 @@ impl QsoController {
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Ack,
                     ..
+                }
+                | PartnerEvent::ToUs {
+                    event: ToUsEvent::ReportLike,
+                    ..
                 } => next_state = QsoState::SendSigAck,
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Reply(_),
@@ -959,6 +963,7 @@ impl PartnerEvent {
             Self::None => "none".to_string(),
             Self::ToUs { event, .. } => match event {
                 ToUsEvent::Ack => "to_us_ack".to_string(),
+                ToUsEvent::ReportLike => "to_us_report_like".to_string(),
                 ToUsEvent::Reply(reply) => {
                     format!("to_us_reply_{}", reply_text(*reply).to_ascii_lowercase())
                 }
@@ -1003,6 +1008,7 @@ impl PartnerEvent {
 #[derive(Debug, Clone, Copy)]
 enum ToUsEvent {
     Ack,
+    ReportLike,
     Reply(ReplyWord),
     Other,
 }
@@ -1169,8 +1175,14 @@ fn classify_single_message(
                         SingleClass::ToUs(ToUsEvent::Reply(*word))
                     }
                     StructuredInfoValue::Grid { .. }
-                    | StructuredInfoValue::SignalReport { .. }
-                    | StructuredInfoValue::Blank => {
+                    | StructuredInfoValue::SignalReport { .. } => {
+                        if *acknowledge {
+                            SingleClass::ToUs(ToUsEvent::Ack)
+                        } else {
+                            SingleClass::ToUs(ToUsEvent::ReportLike)
+                        }
+                    }
+                    StructuredInfoValue::Blank => {
                         if *acknowledge {
                             SingleClass::ToUs(ToUsEvent::Ack)
                         } else {
@@ -1228,30 +1240,33 @@ fn to_us_priority(event: ToUsEvent, state: QsoState) -> u8 {
         QsoState::SendGrid => match event {
             ToUsEvent::Reply(_) => 4,
             ToUsEvent::Ack => 3,
+            ToUsEvent::ReportLike => 3,
             ToUsEvent::Other => 1,
         },
         QsoState::SendSig => match event {
             ToUsEvent::Reply(ReplyWord::SeventyThree) => 5,
             ToUsEvent::Ack => 4,
             ToUsEvent::Reply(_) => 4,
+            ToUsEvent::ReportLike => 1,
             ToUsEvent::Other => 1,
         },
         QsoState::SendSigAck => match event {
             ToUsEvent::Reply(_) => 4,
             ToUsEvent::Ack => 4,
+            ToUsEvent::ReportLike => 1,
             ToUsEvent::Other => 1,
         },
         QsoState::SendRR73 => match event {
             ToUsEvent::Reply(ReplyWord::SeventyThree) => 4,
-            ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::Other => 1,
+            ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::ReportLike | ToUsEvent::Other => 1,
         },
         QsoState::SendRRR => match event {
             ToUsEvent::Reply(ReplyWord::SeventyThree) => 4,
-            ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::Other => 1,
+            ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::ReportLike | ToUsEvent::Other => 1,
         },
         QsoState::Send73 => match event {
             ToUsEvent::Reply(ReplyWord::SeventyThree) => 4,
-            ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::Other => 1,
+            ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::ReportLike | ToUsEvent::Other => 1,
         },
         QsoState::Send73Once | QsoState::Idle => 1,
     }
@@ -1636,6 +1651,7 @@ mod tests {
         let acknowledge = matches!(event, ToUsEvent::Ack);
         let info = match event {
             ToUsEvent::Ack | ToUsEvent::Other => ft8_decoder::StructuredInfoValue::Blank,
+            ToUsEvent::ReportLike => ft8_decoder::StructuredInfoValue::SignalReport { db: -8 },
             ToUsEvent::Reply(word) => ft8_decoder::StructuredInfoValue::Reply { word },
         };
         DecodedMessage {
@@ -1750,6 +1766,62 @@ mod tests {
         controller.on_full_decode(
             now + Duration::from_secs(15),
             &[directed_decode("K1ABC", "N1VF", ToUsEvent::Ack)],
+            now + Duration::from_secs(15),
+        );
+        assert_eq!(controller.snapshot(now).state, "send_sig_ack");
+    }
+
+    #[test]
+    fn send_grid_plain_signal_report_transitions_to_sig_ack() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+            },
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+            }),
+            now,
+        );
+        controller.on_full_decode(
+            now + Duration::from_secs(15),
+            &[DecodedMessage {
+                utc: "00:00:00".to_string(),
+                snr_db: -8,
+                dt_seconds: 0.1,
+                freq_hz: 1000.0,
+                text: "N1VF K1ABC -08".to_string(),
+                candidate_score: 0.0,
+                ldpc_iterations: 0,
+                message: StructuredMessage::Standard {
+                    i3: 1,
+                    first: StructuredCallField {
+                        raw: 0,
+                        value: StructuredCallValue::StandardCall {
+                            callsign: "N1VF".to_string(),
+                        },
+                        modifier: None,
+                    },
+                    second: StructuredCallField {
+                        raw: 0,
+                        value: StructuredCallValue::StandardCall {
+                            callsign: "K1ABC".to_string(),
+                        },
+                        modifier: None,
+                    },
+                    acknowledge: false,
+                    info: StructuredInfoField {
+                        raw: 0,
+                        value: ft8_decoder::StructuredInfoValue::SignalReport { db: -8 },
+                    },
+                },
+            }],
             now + Duration::from_secs(15),
         );
         assert_eq!(controller.snapshot(now).state, "send_sig_ack");
