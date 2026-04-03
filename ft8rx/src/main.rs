@@ -1619,6 +1619,12 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             DecodeStage::Early41 => {
                                 display.early41_wall_ms = Some(wall_ms);
                                 display.early41_decodes = update.report.decodes.clone();
+                                qso_controller.on_decode_stage(
+                                    slot_start,
+                                    stage,
+                                    &display.early41_decodes,
+                                    SystemTime::now(),
+                                );
                             }
                             DecodeStage::Early47 => {
                                 display.early47_wall_ms = Some(wall_ms);
@@ -1626,6 +1632,12 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     tx_margin_after_stage_decode_ms(slot_start, stage, wall_ms)?,
                                 );
                                 display.early47_decodes = update.report.decodes.clone();
+                                qso_controller.on_decode_stage(
+                                    slot_start,
+                                    stage,
+                                    &display.early47_decodes,
+                                    SystemTime::now(),
+                                );
                             }
                             DecodeStage::Full => {
                                 display.last_slot_start = Some(slot_start);
@@ -1638,8 +1650,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 dt_frame_history.push_back(display.full_decodes.clone());
                                 station_tracker.ingest_frame(slot_start, &display.full_decodes);
                                 update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
-                                qso_controller.on_full_decode(
+                                qso_controller.on_decode_stage(
                                     slot_start,
+                                    stage,
                                     &display.full_decodes,
                                     SystemTime::now(),
                                 );

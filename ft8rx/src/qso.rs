@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use chrono::{DateTime, Utc};
 use ft8_decoder::{
-    ReplyWord, StructuredInfoValue, StructuredMessage, TxDirectedPayload, TxMessage,
+    DecodeStage, ReplyWord, StructuredInfoValue, StructuredMessage, TxDirectedPayload, TxMessage,
     WaveformOptions, synthesize_tx_message,
 };
 use rigctl::K3s;
@@ -198,16 +198,23 @@ impl QsoController {
         decodes: &[ft8_decoder::DecodedMessage],
         now: SystemTime,
     ) {
+        self.on_decode_stage(slot_start, DecodeStage::Full, decodes, now);
+    }
+
+    pub fn on_decode_stage(
+        &mut self,
+        slot_start: SystemTime,
+        stage: DecodeStage,
+        decodes: &[ft8_decoder::DecodedMessage],
+        now: SystemTime,
+    ) {
         let Some(session) = &mut self.session else {
             return;
         };
         if slot_family(slot_start) == session.tx_slot_family {
             return;
         }
-        let committed_next_tx = is_next_tx_slot_committed(session, slot_start, self.backend.is_active());
-        if !committed_next_tx {
-            Self::clear_pending_transition(session, now);
-        }
+        Self::roll_rx_stage_tracking(session, slot_start);
 
         let event = classify_partner_event(
             decodes,
@@ -215,6 +222,16 @@ impl QsoController {
             &self.config.station.our_call,
             session.state,
         );
+        let should_consume = Self::should_consume_stage_event(session, stage, &event);
+        if !should_consume {
+            return;
+        }
+        session.rx_slot_consumed_stage = Some(stage);
+
+        let committed_next_tx = is_next_tx_slot_committed(session, slot_start, self.backend.is_active());
+        if !committed_next_tx {
+            Self::clear_pending_transition(session, now);
+        }
         if let Some(snr_db) = event.snr_db() {
             session.latest_partner_snr_db = snr_db;
         }
@@ -222,7 +239,11 @@ impl QsoController {
         Self::push_transcript(session, now, "RX:", session.state, event.transcript_text());
         Self::log_fsm(
             session,
-            "rx_slot",
+            match stage {
+                DecodeStage::Early41 => "rx_slot_early41",
+                DecodeStage::Early47 => "rx_slot_early47",
+                DecodeStage::Full => "rx_slot_full",
+            },
             session.state,
             session.state,
             event.summary(),
@@ -800,6 +821,8 @@ impl QsoController {
             no_msg_count: 0,
             no_fwd_count: 0,
             last_rx_event: None,
+            current_rx_slot: None,
+            rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
         };
         self.next_session_id += 1;
@@ -1004,6 +1027,27 @@ impl QsoController {
             now,
         );
     }
+
+    fn roll_rx_stage_tracking(session: &mut ActiveSession, slot_start: SystemTime) {
+        if session.current_rx_slot != Some(slot_start) {
+            session.current_rx_slot = Some(slot_start);
+            session.rx_slot_consumed_stage = None;
+        }
+    }
+
+    fn should_consume_stage_event(
+        session: &ActiveSession,
+        stage: DecodeStage,
+        event: &PartnerEvent,
+    ) -> bool {
+        if session.rx_slot_consumed_stage.is_some() {
+            return false;
+        }
+        if event.has_partner_message() {
+            return true;
+        }
+        matches!(stage, DecodeStage::Full)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1023,6 +1067,8 @@ struct ActiveSession {
     no_msg_count: u32,
     no_fwd_count: u32,
     last_rx_event: Option<String>,
+    current_rx_slot: Option<SystemTime>,
+    rx_slot_consumed_stage: Option<DecodeStage>,
     transcript: VecDeque<WebQsoTranscriptEntry>,
 }
 
@@ -1249,6 +1295,10 @@ enum PartnerEvent {
 }
 
 impl PartnerEvent {
+    fn has_partner_message(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
     fn summary(&self) -> String {
         match self {
             Self::None => "none".to_string(),
@@ -2209,6 +2259,96 @@ mod tests {
     }
 
     #[test]
+    fn early_partner_decode_is_consumed_before_full() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+            },
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+            }),
+            now,
+        );
+        controller.on_decode_stage(
+            rx_slot_start,
+            DecodeStage::Early41,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::ReportLike)],
+            rx_slot_start + Duration::from_secs(11),
+        );
+        assert_eq!(controller.snapshot(now).state, "send_sig_ack");
+        controller.on_decode_stage(
+            rx_slot_start,
+            DecodeStage::Full,
+            &[directed_decode(
+                "K1ABC",
+                "N1VF",
+                ToUsEvent::Reply(ReplyWord::Rrr),
+            )],
+            rx_slot_start + Duration::from_secs(15),
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_sig_ack");
+        assert_eq!(snapshot.no_msg_count, 0);
+        assert_eq!(snapshot.no_fwd_count, 0);
+    }
+
+    #[test]
+    fn full_stage_waits_until_both_early_stages_miss_partner() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+            },
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+            }),
+            now,
+        );
+        controller.on_decode_stage(
+            rx_slot_start,
+            DecodeStage::Early41,
+            &[cq_decode("ZZ9")],
+            rx_slot_start + Duration::from_secs(11),
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_grid");
+        assert_eq!(snapshot.no_msg_count, 0);
+        controller.on_decode_stage(
+            rx_slot_start,
+            DecodeStage::Early47,
+            &[cq_decode("ZZ9")],
+            rx_slot_start + Duration::from_secs(12),
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_grid");
+        assert_eq!(snapshot.no_msg_count, 0);
+        controller.on_decode_stage(
+            rx_slot_start,
+            DecodeStage::Full,
+            &[],
+            rx_slot_start + Duration::from_secs(15),
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_grid");
+        assert_eq!(snapshot.no_msg_count, 1);
+    }
+
+    #[test]
     fn send_rr73_exits_on_cq() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
@@ -2341,6 +2481,8 @@ mod tests {
             no_msg_count: 0,
             no_fwd_count: 0,
             last_rx_event: None,
+            current_rx_slot: None,
+            rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
         };
         let rescheduled = schedule_next_tx_slot(
