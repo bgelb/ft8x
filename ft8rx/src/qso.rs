@@ -204,6 +204,7 @@ impl QsoController {
         if slot_family(slot_start) == session.tx_slot_family {
             return;
         }
+        let committed_next_tx = is_next_tx_slot_committed(session, slot_start, self.backend.is_active());
 
         let event = classify_partner_event(
             decodes,
@@ -215,7 +216,7 @@ impl QsoController {
             session.latest_partner_snr_db = snr_db;
         }
         session.last_rx_event = Some(event.summary());
-        Self::push_transcript(session, now, "RX:", event.transcript_text());
+        Self::push_transcript(session, now, "RX:", session.state, event.transcript_text());
         Self::log_fsm(
             session,
             "rx_slot",
@@ -382,6 +383,33 @@ impl QsoController {
         }
 
         if let Some(reason) = exit_reason {
+            if let Some(session) = &mut self.session {
+                if committed_next_tx {
+                    session.pending_exit_reason = Some(reason.to_string());
+                    Self::log_late_tx_switch_wanted(session, now, previous_state, None, Some(reason));
+                    Self::push_transcript(
+                        session,
+                        now,
+                        "SYS:",
+                        session.state,
+                        format!("late RX after tx launch: exit queued after current tx ({reason})"),
+                    );
+                    Self::log_fsm(
+                        session,
+                        "late_rx_exit_queued",
+                        previous_state,
+                        previous_state,
+                        session
+                            .last_rx_event
+                            .clone()
+                            .unwrap_or_else(|| "none".to_string()),
+                        event.message_text(),
+                        None,
+                        now,
+                    );
+                    return;
+                }
+            }
             self.finish_session(reason, now);
             return;
         }
@@ -395,6 +423,7 @@ impl QsoController {
                     session,
                     now,
                     "SYS:",
+                    next_state,
                     format!(
                         "state {} -> {}",
                         previous_state.as_str(),
@@ -414,7 +443,55 @@ impl QsoController {
                     None,
                     now,
                 );
+                if committed_next_tx {
+                    Self::log_late_tx_switch_wanted(
+                        session,
+                        now,
+                        previous_state,
+                        Some(render_tx_message(&self.config, session)),
+                        None,
+                    );
+                    Self::push_transcript(
+                        session,
+                        now,
+                        "SYS:",
+                        next_state,
+                        format!(
+                            "late RX after tx launch: current tx remains {} until complete",
+                            previous_state.as_str()
+                        ),
+                    );
+                    Self::log_fsm(
+                        session,
+                        "late_rx_transition_after_tx_launch",
+                        previous_state,
+                        next_state,
+                        session
+                            .last_rx_event
+                            .clone()
+                            .unwrap_or_else(|| "none".to_string()),
+                        event.message_text(),
+                        None,
+                        now,
+                    );
+                }
             } else {
+                if committed_next_tx {
+                    let desired_tx = render_tx_message(&self.config, session);
+                    let current_tx = session
+                        .in_flight_tx
+                        .as_ref()
+                        .map(|tx| tx.message_text.as_str());
+                    if current_tx != Some(desired_tx.as_str()) {
+                        Self::log_late_tx_switch_wanted(
+                            session,
+                            now,
+                            previous_state,
+                            Some(desired_tx),
+                            None,
+                        );
+                    }
+                }
                 Self::log_fsm(
                     session,
                     "stay",
@@ -439,37 +516,49 @@ impl QsoController {
             if let Some(session) = &mut self.session {
                 if session.session_id == event.session_id() {
                     match &event {
-                        TxEvent::Started { message_text, .. } => {
-                            Self::push_transcript(session, now, "TX:", message_text.clone());
+                        TxEvent::Started {
+                            state,
+                            message_text,
+                            ..
+                        } => {
+                            Self::push_transcript(session, now, "TX:", *state, message_text.clone());
                         }
-                        TxEvent::Completed { message_text, .. } => {
+                        TxEvent::Completed { state, .. } => {
+                            session.in_flight_tx = None;
                             Self::push_transcript(
                                 session,
                                 now,
                                 "SYS:",
-                                format!("tx complete: {message_text}"),
+                                *state,
+                                "tx complete".to_string(),
                             );
-                            if session.state == QsoState::Send73Once {
-                                exit_after = Some("send_73_once_complete");
+                            if let Some(reason) = session.pending_exit_reason.take() {
+                                exit_after = Some(reason);
+                            } else if session.state == QsoState::Send73Once {
+                                exit_after = Some("send_73_once_complete".to_string());
                             }
                         }
-                        TxEvent::Aborted { reason, .. } => {
+                        TxEvent::Aborted { state, reason, .. } => {
+                            session.in_flight_tx = None;
                             Self::push_transcript(
                                 session,
                                 now,
                                 "SYS:",
+                                *state,
                                 format!("tx aborted: {reason}"),
                             );
-                            exit_after = Some("tx_aborted");
+                            exit_after = Some("tx_aborted".to_string());
                         }
-                        TxEvent::Error { message, .. } => {
+                        TxEvent::Error { state, message, .. } => {
+                            session.in_flight_tx = None;
                             Self::push_transcript(
                                 session,
                                 now,
                                 "SYS:",
+                                *state,
                                 format!("tx error: {message}"),
                             );
-                            exit_after = Some("tx_error");
+                            exit_after = Some("tx_error".to_string());
                         }
                     }
                     Self::log_fsm(
@@ -488,7 +577,7 @@ impl QsoController {
                 }
             }
             if let Some(reason) = exit_after {
-                self.finish_session(reason, now);
+                self.finish_session(&reason, now);
             }
         }
 
@@ -521,6 +610,11 @@ impl QsoController {
         match self.backend.start(request) {
             Ok(()) => {
                 session.last_tx_slot = Some(target_slot);
+                session.in_flight_tx = Some(InFlightTx {
+                    target_slot,
+                    state: session.state,
+                    message_text: message_text.clone(),
+                });
                 session.next_tx_slot = None;
                 Self::log_fsm(
                     session,
@@ -537,7 +631,13 @@ impl QsoController {
                 );
             }
             Err(error) => {
-                Self::push_transcript(session, now, "SYS:", format!("tx launch failed: {error}"));
+                Self::push_transcript(
+                    session,
+                    now,
+                    "SYS:",
+                    session.state,
+                    format!("tx launch failed: {error}"),
+                );
                 self.backend.abort();
                 self.finish_session("tx_launch_failed", now);
             }
@@ -620,6 +720,8 @@ impl QsoController {
             deadline_at: now + Duration::from_secs(self.config.fsm.timeout_seconds),
             next_tx_slot: Some(next_tx_slot),
             last_tx_slot: None,
+            in_flight_tx: None,
+            pending_exit_reason: None,
             no_msg_count: 0,
             no_fwd_count: 0,
             last_rx_event: None,
@@ -634,7 +736,8 @@ impl QsoController {
             session.latest_partner_snr_db,
             format_timestamp(station_info.last_heard_at),
         );
-        Self::push_transcript(&mut session, now, "SYS:", start_line);
+        let state = session.state;
+        Self::push_transcript(&mut session, now, "SYS:", state, start_line);
         Self::log_fsm(
             &session,
             "start",
@@ -660,7 +763,8 @@ impl QsoController {
         let Some(mut session) = self.session.take() else {
             return;
         };
-        Self::push_transcript(&mut session, now, "SYS:", format!("qso exit: {reason}"));
+        let state = session.state;
+        Self::push_transcript(&mut session, now, "SYS:", state, format!("qso exit: {reason}"));
         Self::log_fsm(
             &session,
             "exit",
@@ -691,12 +795,13 @@ impl QsoController {
         session: &mut ActiveSession,
         now: SystemTime,
         direction: &str,
+        state: QsoState,
         text: String,
     ) {
         session.transcript.push_back(WebQsoTranscriptEntry {
             timestamp: format_timestamp(now),
             direction: direction.to_string(),
-            state: session.state.as_str().to_string(),
+            state: state.as_str().to_string(),
             text,
         });
         while session.transcript.len() > TRANSCRIPT_LIMIT {
@@ -740,6 +845,58 @@ impl QsoController {
             "qso_fsm"
         );
     }
+
+    fn log_late_tx_switch_wanted(
+        session: &mut ActiveSession,
+        now: SystemTime,
+        previous_state: QsoState,
+        desired_tx: Option<String>,
+        exit_reason: Option<&str>,
+    ) {
+        let Some(in_flight) = session.in_flight_tx.clone() else {
+            return;
+        };
+        let detail = if let Some(reason) = exit_reason {
+            format!(
+                "late RX after tx launch: wanted to stop {} and exit ({reason})",
+                in_flight.message_text
+            )
+        } else if let Some(ref desired_tx) = desired_tx {
+            if *desired_tx == in_flight.message_text {
+                return;
+            }
+            format!(
+                "late RX after tx launch: wanted to switch {} -> {}",
+                in_flight.message_text, desired_tx
+            )
+        } else {
+            return;
+        };
+        Self::push_transcript(session, now, "SYS:", session.state, detail.clone());
+        info!(
+            event = "late_tx_switch_wanted",
+            wall_ts = %format_timestamp(now),
+            session_id = session.session_id,
+            partner_call = %session.partner_call,
+            committed_slot = %format_timestamp(in_flight.target_slot),
+            committed_state = %in_flight.state.as_str(),
+            committed_tx_text = %in_flight.message_text,
+            desired_state = %session.state.as_str(),
+            desired_tx_text = desired_tx.unwrap_or_default(),
+            exit_reason = exit_reason.unwrap_or_default(),
+            state_before = %previous_state.as_str(),
+            state_after = %session.state.as_str(),
+            no_msg_count = session.no_msg_count,
+            no_fwd_count = session.no_fwd_count,
+            last_rx_event = %session
+                .last_rx_event
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            started_at = %format_timestamp(session.started_at),
+            deadline_at = %format_timestamp(session.deadline_at),
+            "qso_fsm"
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -754,10 +911,19 @@ struct ActiveSession {
     deadline_at: SystemTime,
     next_tx_slot: Option<SystemTime>,
     last_tx_slot: Option<SystemTime>,
+    in_flight_tx: Option<InFlightTx>,
+    pending_exit_reason: Option<String>,
     no_msg_count: u32,
     no_fwd_count: u32,
     last_rx_event: Option<String>,
     transcript: VecDeque<WebQsoTranscriptEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct InFlightTx {
+    target_slot: SystemTime,
+    state: QsoState,
+    message_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -776,19 +942,23 @@ pub(crate) struct TxRequest {
 pub(crate) enum TxEvent {
     Started {
         session_id: u64,
+        state: QsoState,
         message_text: String,
     },
     Completed {
         session_id: u64,
+        state: QsoState,
         message_text: String,
     },
     Aborted {
         session_id: u64,
+        state: QsoState,
         message_text: String,
         reason: String,
     },
     Error {
         session_id: u64,
+        state: QsoState,
         message_text: String,
         message: String,
     },
@@ -1289,6 +1459,7 @@ fn run_tx_thread(
     ) {
         let _ = event_tx.send(TxEvent::Aborted {
             session_id: request.session_id,
+            state: request.state,
             message_text: request.message_text,
             reason: "cancelled_before_key".to_string(),
         });
@@ -1298,6 +1469,7 @@ fn run_tx_thread(
     if let Err(error) = with_rig(&rig, |rig| rig.enter_tx()) {
         let _ = event_tx.send(TxEvent::Error {
             session_id: request.session_id,
+            state: request.state,
             message_text: request.message_text,
             message: format!("enter_tx failed: {error}"),
         });
@@ -1308,6 +1480,7 @@ fn run_tx_thread(
         force_rx(&rig);
         let _ = event_tx.send(TxEvent::Aborted {
             session_id: request.session_id,
+            state: request.state,
             message_text: request.message_text,
             reason: "cancelled_before_audio".to_string(),
         });
@@ -1316,6 +1489,7 @@ fn run_tx_thread(
 
     let _ = event_tx.send(TxEvent::Started {
         session_id: request.session_id,
+        state: request.state,
         message_text: request.message_text.clone(),
     });
 
@@ -1327,6 +1501,7 @@ fn run_tx_thread(
                 force_rx(&rig);
                 let _ = event_tx.send(TxEvent::Aborted {
                     session_id: request.session_id,
+                    state: request.state,
                     message_text: request.message_text,
                     reason: format!("cancelled_in_{}", request.state.as_str()),
                 });
@@ -1338,11 +1513,13 @@ fn run_tx_thread(
                     if status.success() {
                         let _ = event_tx.send(TxEvent::Completed {
                             session_id: request.session_id,
+                            state: request.state,
                             message_text: request.message_text,
                         });
                     } else {
                         let _ = event_tx.send(TxEvent::Error {
                             session_id: request.session_id,
+                            state: request.state,
                             message_text: request.message_text,
                             message: format!("aplay exited with status {status}"),
                         });
@@ -1354,6 +1531,7 @@ fn run_tx_thread(
                     force_rx(&rig);
                     let _ = event_tx.send(TxEvent::Error {
                         session_id: request.session_id,
+                        state: request.state,
                         message_text: request.message_text,
                         message: format!("aplay wait failed: {error}"),
                     });
@@ -1365,6 +1543,7 @@ fn run_tx_thread(
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Error {
                 session_id: request.session_id,
+                state: request.state,
                 message_text: request.message_text,
                 message: error,
             });
@@ -1481,6 +1660,20 @@ fn schedule_next_tx_slot(session: &ActiveSession, rx_slot_start: SystemTime) -> 
     Some(candidate)
 }
 
+fn is_next_tx_slot_committed(
+    session: &ActiveSession,
+    rx_slot_start: SystemTime,
+    tx_backend_active: bool,
+) -> bool {
+    if !tx_backend_active {
+        return false;
+    }
+    let Some(candidate_slot) = next_matching_slot_after(rx_slot_start, session.tx_slot_family) else {
+        return false;
+    };
+    session.last_tx_slot == Some(candidate_slot)
+}
+
 pub fn slot_family(time: SystemTime) -> SlotFamily {
     if crate::is_even_slot_family(time) {
         SlotFamily::Even
@@ -1582,10 +1775,12 @@ mod tests {
             self.launches.push(request.message_text.clone());
             self.events.push_back(TxEvent::Started {
                 session_id: request.session_id,
+                state: request.state,
                 message_text: request.message_text.clone(),
             });
             self.events.push_back(TxEvent::Completed {
                 session_id: request.session_id,
+                state: request.state,
                 message_text: request.message_text,
             });
             Ok(())
@@ -1907,6 +2102,8 @@ mod tests {
             deadline_at: now + Duration::from_secs(600),
             next_tx_slot: None,
             last_tx_slot: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
+            in_flight_tx: None,
+            pending_exit_reason: None,
             no_msg_count: 0,
             no_fwd_count: 0,
             last_rx_event: None,
@@ -1921,5 +2118,43 @@ mod tests {
             rescheduled.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
             60
         );
+    }
+
+    #[test]
+    fn late_decode_exit_waits_for_committed_tx_completion() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+            },
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+            }),
+            now,
+        );
+        if let Some(session) = controller.session.as_mut() {
+            session.state = QsoState::SendRR73;
+        }
+        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        assert!(controller.snapshot(now).active);
+        controller.on_full_decode(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(45),
+            &[cq_decode("K1ABC")],
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+        );
+        assert!(controller.snapshot(now).active);
+        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        let snapshot = controller.snapshot(now);
+        assert!(!snapshot.active);
+        assert!(snapshot
+            .transcript
+            .iter()
+            .any(|entry| entry.text.contains("late RX after tx launch: exit queued")));
     }
 }
