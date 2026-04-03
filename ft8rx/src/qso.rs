@@ -339,6 +339,7 @@ impl QsoController {
                 }
                 PartnerEvent::ToOther { .. }
                 | PartnerEvent::Cq { .. }
+                | PartnerEvent::NonCallFirstField { .. }
                 | PartnerEvent::Freeform { .. }
                 | PartnerEvent::None => exit_reason = Some("send_rr73_partner_moved_on"),
             },
@@ -353,7 +354,9 @@ impl QsoController {
                         next_state = QsoState::Send73Once;
                     }
                 }
-                PartnerEvent::ToOther { .. } => next_state = QsoState::Send73Once,
+                PartnerEvent::ToOther { .. } | PartnerEvent::NonCallFirstField { .. } => {
+                    next_state = QsoState::Send73Once
+                }
                 _ => {
                     session.no_msg_count += 1;
                     if session.no_msg_count >= self.config.fsm.send_rrr.no_msg {
@@ -374,6 +377,7 @@ impl QsoController {
                 }
                 PartnerEvent::ToOther { .. }
                 | PartnerEvent::Cq { .. }
+                | PartnerEvent::NonCallFirstField { .. }
                 | PartnerEvent::Freeform { .. } => exit_reason = Some("send_73_partner_moved_on"),
                 PartnerEvent::None => {
                     session.no_msg_count += 1;
@@ -1235,6 +1239,10 @@ enum PartnerEvent {
         text: String,
         snr_db: i32,
     },
+    NonCallFirstField {
+        text: String,
+        snr_db: i32,
+    },
     Freeform {
         text: String,
     },
@@ -1254,6 +1262,7 @@ impl PartnerEvent {
             },
             Self::ToOther { .. } => "to_other".to_string(),
             Self::Cq { .. } => "cq".to_string(),
+            Self::NonCallFirstField { .. } => "noncall_first_field".to_string(),
             Self::Freeform { .. } => "freeform".to_string(),
         }
     }
@@ -1264,6 +1273,7 @@ impl PartnerEvent {
             Self::ToUs { text, .. }
             | Self::ToOther { text, .. }
             | Self::Cq { text, .. }
+            | Self::NonCallFirstField { text, .. }
             | Self::Freeform { text } => format!("RX: {text}"),
         }
     }
@@ -1274,15 +1284,17 @@ impl PartnerEvent {
             Self::ToUs { text, .. }
             | Self::ToOther { text, .. }
             | Self::Cq { text, .. }
+            | Self::NonCallFirstField { text, .. }
             | Self::Freeform { text } => Some(text.clone()),
         }
     }
 
     fn snr_db(&self) -> Option<i32> {
         match self {
-            Self::ToUs { snr_db, .. } | Self::ToOther { snr_db, .. } | Self::Cq { snr_db, .. } => {
-                Some(*snr_db)
-            }
+            Self::ToUs { snr_db, .. }
+            | Self::ToOther { snr_db, .. }
+            | Self::Cq { snr_db, .. }
+            | Self::NonCallFirstField { snr_db, .. } => Some(*snr_db),
             Self::None | Self::Freeform { .. } => None,
         }
     }
@@ -1374,6 +1386,7 @@ fn classify_partner_event(
     let mut best_to_us: Option<(u8, PartnerEvent)> = None;
     let mut to_other: Option<PartnerEvent> = None;
     let mut cq: Option<PartnerEvent> = None;
+    let mut noncall_first_field: Option<PartnerEvent> = None;
     let mut freeform: Option<PartnerEvent> = None;
 
     for decode in decodes {
@@ -1409,6 +1422,12 @@ fn classify_partner_event(
                     snr_db: decode.snr_db,
                 });
             }
+            SingleClass::NonCallFirstField => {
+                noncall_first_field.get_or_insert(PartnerEvent::NonCallFirstField {
+                    text: decode.text.clone(),
+                    snr_db: decode.snr_db,
+                });
+            }
             SingleClass::Freeform => {
                 freeform.get_or_insert(PartnerEvent::Freeform {
                     text: decode.text.clone(),
@@ -1424,6 +1443,8 @@ fn classify_partner_event(
         event
     } else if let Some(event) = cq {
         event
+    } else if let Some(event) = noncall_first_field {
+        event
     } else if let Some(event) = freeform {
         event
     } else {
@@ -1435,6 +1456,7 @@ enum SingleClass {
     ToUs(ToUsEvent),
     ToOther,
     Cq,
+    NonCallFirstField,
     Freeform,
     Irrelevant,
 }
@@ -1451,6 +1473,13 @@ fn classify_single_message(
             info,
             ..
         } => {
+            if let ft8_decoder::StructuredCallValue::Token { token } = &first.value {
+                return if token == "CQ" {
+                    SingleClass::Cq
+                } else {
+                    SingleClass::NonCallFirstField
+                };
+            }
             let target = structured_call_station_name(first);
             if target.as_deref() == Some(our_call) {
                 match &info.value {
@@ -2039,6 +2068,40 @@ mod tests {
         }
     }
 
+    fn token_first_decode(token: &str, from: &str) -> DecodedMessage {
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -7,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: format!("{token} {from}"),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message: StructuredMessage::Standard {
+                i3: 1,
+                first: StructuredCallField {
+                    raw: 0,
+                    value: StructuredCallValue::Token {
+                        token: token.to_string(),
+                    },
+                    modifier: None,
+                },
+                second: StructuredCallField {
+                    raw: 0,
+                    value: StructuredCallValue::StandardCall {
+                        callsign: from.to_string(),
+                    },
+                    modifier: None,
+                },
+                acknowledge: false,
+                info: StructuredInfoField {
+                    raw: 0,
+                    value: StructuredInfoValue::Blank,
+                },
+            },
+        }
+    }
+
     #[test]
     fn start_infers_opposite_slot_family() {
         let mut controller =
@@ -2169,6 +2232,64 @@ mod tests {
         controller.on_full_decode(
             now + Duration::from_secs(15),
             &[cq_decode("K1ABC")],
+            now + Duration::from_secs(15),
+        );
+        assert!(!controller.snapshot(now).active);
+    }
+
+    #[test]
+    fn send_73_exits_on_cq() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+            },
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+            }),
+            now,
+        );
+        if let Some(session) = controller.session.as_mut() {
+            session.state = QsoState::Send73;
+        }
+        controller.on_full_decode(
+            now + Duration::from_secs(15),
+            &[cq_decode("K1ABC")],
+            now + Duration::from_secs(15),
+        );
+        assert!(!controller.snapshot(now).active);
+    }
+
+    #[test]
+    fn send_73_exits_on_partner_noncall_first_field() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+            },
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+            }),
+            now,
+        );
+        if let Some(session) = controller.session.as_mut() {
+            session.state = QsoState::Send73;
+        }
+        controller.on_full_decode(
+            now + Duration::from_secs(15),
+            &[token_first_decode("QRZ", "K1ABC")],
             now + Duration::from_secs(15),
         );
         assert!(!controller.snapshot(now).active);
