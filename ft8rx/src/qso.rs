@@ -429,7 +429,7 @@ impl QsoController {
                     now,
                 );
             }
-            session.next_tx_slot = next_matching_slot_after(slot_start, session.tx_slot_family);
+            session.next_tx_slot = schedule_next_tx_slot(session, slot_start);
         }
     }
 
@@ -1471,6 +1471,16 @@ fn next_matching_slot_after(slot_start: SystemTime, family: SlotFamily) -> Optio
     Some(slot)
 }
 
+fn schedule_next_tx_slot(session: &ActiveSession, rx_slot_start: SystemTime) -> Option<SystemTime> {
+    let mut candidate = next_matching_slot_after(rx_slot_start, session.tx_slot_family)?;
+    if let Some(last_tx_slot) = session.last_tx_slot {
+        while candidate <= last_tx_slot {
+            candidate = next_matching_slot_after(candidate, session.tx_slot_family)?;
+        }
+    }
+    Some(candidate)
+}
+
 pub fn slot_family(time: SystemTime) -> SlotFamily {
     if crate::is_even_slot_family(time) {
         SlotFamily::Even
@@ -1881,5 +1891,35 @@ mod tests {
         controller.tick(now + Duration::from_secs(15));
         controller.tick(now + Duration::from_secs(15));
         assert!(!controller.snapshot(now).active);
+    }
+
+    #[test]
+    fn next_tx_slot_skips_current_slot_when_already_transmitting() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let session = ActiveSession {
+            session_id: 1,
+            partner_call: "K1ABC".to_string(),
+            state: QsoState::SendGrid,
+            tx_slot_family: SlotFamily::Even,
+            tx_freq_hz: 1000.0,
+            latest_partner_snr_db: -9,
+            started_at: now,
+            deadline_at: now + Duration::from_secs(600),
+            next_tx_slot: None,
+            last_tx_slot: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
+            no_msg_count: 0,
+            no_fwd_count: 0,
+            last_rx_event: None,
+            transcript: VecDeque::new(),
+        };
+        let rescheduled = schedule_next_tx_slot(
+            &session,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(15),
+        )
+        .expect("rescheduled");
+        assert_eq!(
+            rescheduled.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+            60
+        );
     }
 }
