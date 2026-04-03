@@ -215,7 +215,7 @@ impl QsoController {
             session.latest_partner_snr_db = snr_db;
         }
         session.last_rx_event = Some(event.summary());
-        Self::push_transcript(session, now, "rx", event.transcript_text());
+        Self::push_transcript(session, now, "RX:", event.transcript_text());
         Self::log_fsm(
             session,
             "rx_slot",
@@ -394,7 +394,7 @@ impl QsoController {
                 Self::push_transcript(
                     session,
                     now,
-                    "sys",
+                    "SYS:",
                     format!(
                         "state {} -> {}",
                         previous_state.as_str(),
@@ -440,13 +440,13 @@ impl QsoController {
                 if session.session_id == event.session_id() {
                     match &event {
                         TxEvent::Started { message_text, .. } => {
-                            Self::push_transcript(session, now, "tx", message_text.clone());
+                            Self::push_transcript(session, now, "TX:", message_text.clone());
                         }
                         TxEvent::Completed { message_text, .. } => {
                             Self::push_transcript(
                                 session,
                                 now,
-                                "sys",
+                                "SYS:",
                                 format!("tx complete: {message_text}"),
                             );
                             if session.state == QsoState::Send73Once {
@@ -457,7 +457,7 @@ impl QsoController {
                             Self::push_transcript(
                                 session,
                                 now,
-                                "sys",
+                                "SYS:",
                                 format!("tx aborted: {reason}"),
                             );
                             exit_after = Some("tx_aborted");
@@ -466,7 +466,7 @@ impl QsoController {
                             Self::push_transcript(
                                 session,
                                 now,
-                                "sys",
+                                "SYS:",
                                 format!("tx error: {message}"),
                             );
                             exit_after = Some("tx_error");
@@ -537,7 +537,7 @@ impl QsoController {
                 );
             }
             Err(error) => {
-                Self::push_transcript(session, now, "sys", format!("tx launch failed: {error}"));
+                Self::push_transcript(session, now, "SYS:", format!("tx launch failed: {error}"));
                 self.backend.abort();
                 self.finish_session("tx_launch_failed", now);
             }
@@ -634,7 +634,7 @@ impl QsoController {
             session.latest_partner_snr_db,
             format_timestamp(station_info.last_heard_at),
         );
-        Self::push_transcript(&mut session, now, "sys", start_line);
+        Self::push_transcript(&mut session, now, "SYS:", start_line);
         Self::log_fsm(
             &session,
             "start",
@@ -660,7 +660,7 @@ impl QsoController {
         let Some(mut session) = self.session.take() else {
             return;
         };
-        Self::push_transcript(&mut session, now, "sys", format!("qso exit: {reason}"));
+        Self::push_transcript(&mut session, now, "SYS:", format!("qso exit: {reason}"));
         Self::log_fsm(
             &session,
             "exit",
@@ -981,7 +981,7 @@ impl PartnerEvent {
             Self::ToUs { text, .. }
             | Self::ToOther { text, .. }
             | Self::Cq { text, .. }
-            | Self::Freeform { text } => format!("RX {text}"),
+            | Self::Freeform { text } => format!("RX: {text}"),
         }
     }
 
