@@ -4,12 +4,12 @@ use serde::Serialize;
 
 use crate::crc;
 use crate::protocol::{
-    CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FTX_FREE_TEXT_FIELD,
-    FTX_FREE_TEXT_SUBTYPE_FIELD, FTX_INFO_BITS, FTX_MESSAGE_BITS,
-    FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_STANDARD_SLASH_P,
-    FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT, FTX_STANDARD_LAYOUT,
-    HASH_MULTIPLIER, alphabet27_char, alphabet36_char, alphabet37_char, alphabet38_char,
-    alphabet38_index, alphabet42_char, digit10_char, read_bit_field, read_bit_field_u128,
+    CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FTX_FREE_TEXT_FIELD, FTX_FREE_TEXT_SUBTYPE_FIELD,
+    FTX_INFO_BITS, FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_NONSTANDARD,
+    FTX_MESSAGE_KIND_STANDARD_SLASH_P, FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT,
+    FTX_STANDARD_LAYOUT, HASH_MULTIPLIER, alphabet27_char, alphabet36_char, alphabet37_char,
+    alphabet38_char, alphabet38_index, alphabet42_char, digit10_char, read_bit_field,
+    read_bit_field_u128,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -366,7 +366,8 @@ pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
                 i3,
                 first_raw,
                 first: decode_c28(first_raw as u64),
-                first_modifier: (read_bit_field(message_bits, FTX_STANDARD_LAYOUT.first_suffix) == 1)
+                first_modifier: (read_bit_field(message_bits, FTX_STANDARD_LAYOUT.first_suffix)
+                    == 1)
                     .then_some(modifier.clone()),
                 second_raw,
                 second: decode_c28(second_raw as u64),

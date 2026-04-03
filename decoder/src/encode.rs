@@ -6,9 +6,7 @@ use thiserror::Error;
 
 use crate::crc::crc14_ft8;
 use crate::message::{GridReport, ReplyWord, hash_callsign};
-use crate::modes::ft8::{
-    FT8_GEOMETRY, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES,
-};
+use crate::modes::ft8::{FT8_GEOMETRY, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES};
 use crate::modes::populate_channel_symbols;
 use crate::protocol::{
     CALL_NTOKENS, CALL_STANDARD_BASE, FTX_CODEWORD_BITS, FTX_DATA_SYMBOLS, FTX_INFO_BITS,
@@ -59,7 +57,9 @@ pub enum TxDirectedPayload {
 
 #[derive(Debug, Clone)]
 pub enum TxMessage {
-    Cq { my_call: String },
+    Cq {
+        my_call: String,
+    },
     Directed {
         my_call: String,
         peer_call: String,
@@ -370,7 +370,13 @@ fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, 
         } => {
             let (acknowledge, info) = tx_payload_fields(payload);
             let rendered = render_standard_message(peer_call, my_call, acknowledge, &info);
-            (peer_call.clone(), my_call.clone(), acknowledge, info, rendered)
+            (
+                peer_call.clone(),
+                my_call.clone(),
+                acknowledge,
+                info,
+                rendered,
+            )
         }
     }
 }
@@ -385,7 +391,12 @@ fn tx_payload_fields(payload: &TxDirectedPayload) -> (bool, GridReport) {
     }
 }
 
-fn render_standard_message(first: &str, second: &str, acknowledge: bool, info: &GridReport) -> String {
+fn render_standard_message(
+    first: &str,
+    second: &str,
+    acknowledge: bool,
+    info: &GridReport,
+) -> String {
     let trailing = render_standard_info(acknowledge, info);
     if trailing.is_empty() {
         format!("{} {}", first.trim(), second.trim())
@@ -729,13 +740,9 @@ mod tests {
 
     #[test]
     fn rr73_reply_uses_wsjt_compatible_wire_value_and_normalizes_on_decode() {
-        let frame = encode_standard_message(
-            "W5XO",
-            "N1VF",
-            false,
-            &GridReport::Reply(ReplyWord::Rr73),
-        )
-        .expect("encode rr73");
+        let frame =
+            encode_standard_message("W5XO", "N1VF", false, &GridReport::Reply(ReplyWord::Rr73))
+                .expect("encode rr73");
         let payload = unpack_message(&frame.codeword_bits).expect("payload");
         let message = payload.to_message(&HashResolver::default());
         let StructuredMessage::Standard { info, .. } = message else {

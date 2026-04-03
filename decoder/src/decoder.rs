@@ -10,8 +10,8 @@ use serde::Serialize;
 use crate::encode::{channel_symbols_from_codeword_bits, synthesize_channel_reference};
 use crate::ldpc::ParityMatrix;
 use crate::message::{GridReport, HashResolver, Payload, StructuredMessage, unpack_message};
-use crate::modes::{ModeSpec, all_costas_positions};
 use crate::modes::ft8::FT8_SPEC;
+use crate::modes::{ModeSpec, all_costas_positions};
 use crate::wave::{AudioBuffer, DecoderError, load_wav};
 
 #[cfg(test)]
@@ -602,10 +602,11 @@ fn append_debug_single_pass(
 ) {
     let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
     let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-    let decoded = decode_llr_set(parity, llrs, max_osd, counters).map(|(payload, _, iterations)| {
-        let message = payload.to_message(resolver);
-        (message.to_text(), iterations)
-    });
+    let decoded =
+        decode_llr_set(parity, llrs, max_osd, counters).map(|(payload, _, iterations)| {
+            let message = payload.to_message(resolver);
+            (message.to_text(), iterations)
+        });
     let (truth_hard_errors, truth_weighted_distance) = truth_codeword_bits
         .and_then(|truth| truth_metrics(llrs, truth))
         .unwrap_or((None, None));
@@ -733,7 +734,9 @@ mod tests {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; EARLY_41_SAMPLES],
         };
-        let updates = session.decode_available(&early41, &options).expect("early41 decode");
+        let updates = session
+            .decode_available(&early41, &options)
+            .expect("early41 decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Early41);
 
@@ -741,7 +744,9 @@ mod tests {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; EARLY_47_SAMPLES],
         };
-        let updates = session.decode_available(&early47, &options).expect("early47 decode");
+        let updates = session
+            .decode_available(&early47, &options)
+            .expect("early47 decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Early47);
 
@@ -749,11 +754,15 @@ mod tests {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; LONG_INPUT_SAMPLES],
         };
-        let updates = session.decode_available(&full, &options).expect("full decode");
+        let updates = session
+            .decode_available(&full, &options)
+            .expect("full decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Full);
 
-        let updates = session.decode_available(&full, &options).expect("repeat decode");
+        let updates = session
+            .decode_available(&full, &options)
+            .expect("repeat decode");
         assert!(updates.is_empty());
     }
 
@@ -768,15 +777,18 @@ mod tests {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; LONG_INPUT_SAMPLES],
         };
-        let updates = session.decode_available(&full, &options).expect("quick decode");
+        let updates = session
+            .decode_available(&full, &options)
+            .expect("quick decode");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].stage, DecodeStage::Full);
     }
 
     #[test]
     fn decode_pcm_with_state_resolves_hash22_callsign() {
-        let learned_frame = encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
-            .expect("encode learned");
+        let learned_frame =
+            encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
+                .expect("encode learned");
         let learned_audio = synthesize_rectangular_waveform(
             &learned_frame,
             &WaveformOptions {
@@ -785,8 +797,8 @@ mod tests {
             },
         )
         .expect("learned waveform");
-        let hashed_frame =
-            encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank).expect("encode hashed");
+        let hashed_frame = encode_standard_message("CQ", "HF19NY", false, &GridReport::Blank)
+            .expect("encode hashed");
         let hashed_audio = synthesize_rectangular_waveform(
             &hashed_frame,
             &WaveformOptions {
@@ -801,22 +813,37 @@ mod tests {
             ..DecodeOptions::default()
         };
 
-        let (unresolved, _) = decode_pcm_with_state(&hashed_audio, &options, None).expect("decode unresolved");
-        let unresolved_texts: Vec<_> = unresolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let (unresolved, _) =
+            decode_pcm_with_state(&hashed_audio, &options, None).expect("decode unresolved");
+        let unresolved_texts: Vec<_> = unresolved
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
             unresolved_texts.iter().any(|text| text.contains("<...>")),
             "expected unresolved hash in {unresolved_texts:?}"
         );
 
-        let (learned, state) = decode_pcm_with_state(&learned_audio, &options, None).expect("decode learned");
-        let learned_texts: Vec<_> = learned.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let (learned, state) =
+            decode_pcm_with_state(&learned_audio, &options, None).expect("decode learned");
+        let learned_texts: Vec<_> = learned
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
             learned_texts.iter().any(|text| *text == "CQ HF19NY"),
             "expected plain learned call in {learned_texts:?}"
         );
 
-        let (resolved, _) = decode_pcm_with_state(&hashed_audio, &options, Some(&state)).expect("decode resolved");
-        let resolved_texts: Vec<_> = resolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let (resolved, _) =
+            decode_pcm_with_state(&hashed_audio, &options, Some(&state)).expect("decode resolved");
+        let resolved_texts: Vec<_> = resolved
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
             resolved_texts.iter().any(|text| *text == "CQ HF19NY"),
             "expected resolved call in {resolved_texts:?}"
@@ -912,7 +939,11 @@ mod tests {
             .expect("synthesize");
             assert_eq!(synthesized.rendered_text, case.expected);
             let report = decode_pcm(&synthesized.audio, &options).expect("decode");
-            let decoded: Vec<_> = report.decodes.iter().map(|decode| decode.text.as_str()).collect();
+            let decoded: Vec<_> = report
+                .decodes
+                .iter()
+                .map(|decode| decode.text.as_str())
+                .collect();
             assert!(
                 decoded.contains(&case.expected),
                 "expected {:?} in decoded messages {:?}",
@@ -954,20 +985,33 @@ mod tests {
             ..DecodeOptions::default()
         };
 
-        let (unresolved, _) = decode_pcm_with_state(&synthesized.audio, &options, None).expect("decode unresolved");
-        let unresolved_texts: Vec<_> =
-            unresolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let (unresolved, _) =
+            decode_pcm_with_state(&synthesized.audio, &options, None).expect("decode unresolved");
+        let unresolved_texts: Vec<_> = unresolved
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
-            unresolved_texts.iter().any(|text| text.contains("<...> K1ABC R-07")),
+            unresolved_texts
+                .iter()
+                .any(|text| text.contains("<...> K1ABC R-07")),
             "expected unresolved hashed partner in {unresolved_texts:?}"
         );
 
-        let (_, state) = decode_pcm_with_state(&learned_audio, &options, None).expect("learn learned call");
-        let (resolved, _) =
-            decode_pcm_with_state(&synthesized.audio, &options, Some(&state)).expect("decode resolved");
-        let resolved_texts: Vec<_> = resolved.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let (_, state) =
+            decode_pcm_with_state(&learned_audio, &options, None).expect("learn learned call");
+        let (resolved, _) = decode_pcm_with_state(&synthesized.audio, &options, Some(&state))
+            .expect("decode resolved");
+        let resolved_texts: Vec<_> = resolved
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
-            resolved_texts.iter().any(|text| *text == "HF19NY K1ABC R-07"),
+            resolved_texts
+                .iter()
+                .any(|text| *text == "HF19NY K1ABC R-07"),
             "expected resolved hashed partner in {resolved_texts:?}"
         );
     }
@@ -1001,7 +1045,11 @@ mod tests {
             include_str!("decoder/metrics.rs"),
             include_str!("decoder/session.rs"),
         ] {
-            for fragment in ["dt_seconds + 0.5", "start_seconds - 0.5", "(lag as f32 - 0.5)"] {
+            for fragment in [
+                "dt_seconds + 0.5",
+                "start_seconds - 0.5",
+                "(lag as f32 - 0.5)",
+            ] {
                 assert!(
                     !source.contains(fragment),
                     "shared decoder module still contains raw FT8 timing literal: {fragment}"

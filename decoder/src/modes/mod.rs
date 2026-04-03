@@ -219,7 +219,10 @@ pub fn populate_channel_symbols(
             channel_symbols[block_start + offset] = tone as u8;
         }
     }
-    for (symbol, &position) in data_symbols.iter().zip(geometry.data_symbol_positions.iter()) {
+    for (symbol, &position) in data_symbols
+        .iter()
+        .zip(geometry.data_symbol_positions.iter())
+    {
         if position >= channel_symbols.len() {
             return None;
         }

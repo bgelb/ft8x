@@ -272,7 +272,10 @@ mod tests {
         let mut bits = [0u8; FTX_MESSAGE_BITS];
         write_bit_field(&mut bits, FTX_STANDARD_LAYOUT.first_call, 0x1234_567);
         write_bit_field(&mut bits, FTX_STANDARD_LAYOUT.kind, 0b101);
-        assert_eq!(read_bit_field(&bits, FTX_STANDARD_LAYOUT.first_call), 0x1234_567);
+        assert_eq!(
+            read_bit_field(&bits, FTX_STANDARD_LAYOUT.first_call),
+            0x1234_567
+        );
         assert_eq!(read_bit_field(&bits, FTX_STANDARD_LAYOUT.kind), 0b101);
     }
 
@@ -287,10 +290,7 @@ mod tests {
 
     #[test]
     fn alphabet_helpers_cover_shared_symbol_sets() {
-        for (index, ch) in " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            .chars()
-            .enumerate()
-        {
+        for (index, ch) in " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().enumerate() {
             assert_eq!(alphabet37_char(index), ch);
             assert_eq!(alphabet37_index(ch), Some(index as u32));
         }
@@ -324,7 +324,10 @@ mod tests {
     #[test]
     fn free_text_fields_fit_message_layout() {
         assert_eq!(FTX_FREE_TEXT_FIELD.start, 0);
-        assert_eq!(FTX_FREE_TEXT_SUBTYPE_FIELD.end(), FTX_STANDARD_LAYOUT.kind.start);
+        assert_eq!(
+            FTX_FREE_TEXT_SUBTYPE_FIELD.end(),
+            FTX_STANDARD_LAYOUT.kind.start
+        );
         assert_eq!(FTX_FREE_TEXT_SUBTYPE_FIELD.len, 3);
         assert_eq!(FTX_CODEWORD_HALF_BITS, 87);
         assert_eq!(FTX_DATA_SYMBOLS_PER_HALF, 29);

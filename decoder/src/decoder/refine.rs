@@ -212,9 +212,7 @@ pub(super) fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f3
         for &block_start in geometry.sync_block_starts {
             let symbol_start =
                 start_index + ((block_start + offset) * BASEBAND_SYMBOL_SAMPLES) as isize;
-            if symbol_start < 0
-                || symbol_start as usize + BASEBAND_SYMBOL_SAMPLES > valid_samples
-            {
+            if symbol_start < 0 || symbol_start as usize + BASEBAND_SYMBOL_SAMPLES > valid_samples {
                 continue;
             }
             let segment =
@@ -261,8 +259,7 @@ pub(super) fn baseband_taper() -> &'static [f32] {
         // Legacy raised-cosine taper applied symmetrically after copying the candidate band.
         (0..=taper_len)
             .map(|index| {
-                0.5 * (1.0
-                    + (index as f32 * std::f32::consts::PI / taper_len as f32).cos())
+                0.5 * (1.0 + (index as f32 * std::f32::consts::PI / taper_len as f32).cos())
             })
             .collect()
     })
@@ -399,7 +396,10 @@ mod tests {
             *sample = Complex32::new(123.0, -45.0);
         }
 
-        assert_eq!(extract_symbol_tones(&clean, 0), extract_symbol_tones(&dirty, 0));
+        assert_eq!(
+            extract_symbol_tones(&clean, 0),
+            extract_symbol_tones(&dirty, 0)
+        );
     }
 
     #[test]
