@@ -1169,6 +1169,10 @@ impl TxBackend for RigTxBackend {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
         }
+        force_rx(&self.rig);
+        self.active = false;
+        self.cancel = None;
+        self.event_rx = None;
     }
 
     fn poll_event(&mut self) -> Option<TxEvent> {
