@@ -2705,8 +2705,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const hint = document.getElementById('rig-hint');
       const rigAvailable = data.rig_mode && data.rig_mode !== 'unavailable';
       const tuneActive = !!data.rig_tune_active;
-      const qsoBusy = !!(data.qso?.active || data.qso?.tx_active);
-      const txBusy = tuneActive || !!data.rig_is_tx;
+      const qsoActive = !!data.qso?.active;
+      const txBusy = tuneActive || !!data.qso?.tx_active || !!data.rig_is_tx;
       if (
         pendingRigConfig &&
         data.rig_band === pendingRigConfig.band &&
@@ -2725,13 +2725,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (rigAvailable && effectivePower != null) {
         powerInput.value = String(effectivePower);
       }
-      tune.disabled = !rigAvailable || tuneActive || qsoBusy || txBusy;
+      bandInput.disabled = !rigAvailable || txBusy || qsoActive;
+      powerInput.disabled = !rigAvailable || txBusy;
+      tune.disabled = !rigAvailable || tuneActive || qsoActive || txBusy;
       if (!rigAvailable) {
         hint.textContent = 'Rig control unavailable.';
       } else if (tuneActive) {
         hint.textContent = 'Tuning: 1000 Hz tone for 10 seconds. TX will return to RX automatically.';
-      } else if (qsoBusy) {
-        hint.textContent = 'Rig control disabled while QSO transmit is active.';
+      } else if (txBusy) {
+        hint.textContent = 'Rig control disabled while transmit is active.';
+      } else if (qsoActive) {
+        hint.textContent = 'Power can be changed mid-QSO while not transmitting. Band changes wait until the QSO is idle.';
       } else if (pendingRigConfig) {
         hint.textContent = `Applying ${pendingRigConfig.band} at ${pendingRigConfig.power_w.toFixed(0)} W...`;
       } else {
@@ -3681,16 +3685,15 @@ async fn api_rig_config_handler(
             }),
         );
     }
-    if snapshot.qso.active
-        || snapshot.qso.tx_active
+    let tx_active = snapshot.qso.tx_active
         || snapshot.rig_tune_active
-        || snapshot.rig_is_tx == Some(true)
-    {
+        || snapshot.rig_is_tx == Some(true);
+    if tx_active {
         return (
             StatusCode::CONFLICT,
             Json(ApiStatus {
                 ok: false,
-                message: "rig busy".to_string(),
+                message: "transmit active".to_string(),
             }),
         );
     }
@@ -3712,6 +3715,15 @@ async fn api_rig_config_handler(
             Json(ApiStatus {
                 ok: false,
                 message: "power must be between 0.1 and 110.0 W".to_string(),
+            }),
+        );
+    }
+    if snapshot.qso.active && snapshot.rig_band != band.to_string() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiStatus {
+                ok: false,
+                message: "cannot change band during active qso".to_string(),
             }),
         );
     }
