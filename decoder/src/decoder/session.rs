@@ -111,9 +111,13 @@ impl DecoderSession {
                 self.early47 = Some(search.clone());
                 search
             }
-            DecodeStage::Full => {
-                run_full_search(audio, options, self.early41.as_ref(), self.early47.as_ref(), state)
-            }
+            DecodeStage::Full => run_full_search(
+                audio,
+                options,
+                self.early41.as_ref(),
+                self.early47.as_ref(),
+                state,
+            ),
         };
 
         let report = build_decode_report_with_resolver(audio, options, search.clone(), state);
@@ -568,14 +572,19 @@ pub(super) fn try_refined_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::hash_callsign;
     use crate::message::ReplyWord;
+    use crate::message::hash_callsign;
 
     #[test]
     fn merged_resolver_collects_callsigns_from_successes() {
-        let frame =
-            crate::encode::encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)
-                .expect("encode frame");
+        let frame = crate::encode::encode_nonstandard_message(
+            "K1ABC",
+            "HF19NY",
+            false,
+            ReplyWord::Blank,
+            true,
+        )
+        .expect("encode frame");
         let payload = unpack_message(&frame.codeword_bits)
             .expect("payload")
             .clone();
@@ -595,6 +604,9 @@ mod tests {
             }],
         );
 
-        assert_eq!(resolver.resolve12(hash_callsign("HF19NY", 12) as u16), Some("HF19NY"));
+        assert_eq!(
+            resolver.resolve12(hash_callsign("HF19NY", 12) as u16),
+            Some("HF19NY")
+        );
     }
 }

@@ -129,9 +129,7 @@ pub(super) fn compute_symbol_bit_llrs(full_tones: &[[Complex32; 8]]) -> Vec<f32>
         .geometry
         .data_symbol_positions
         .iter()
-        .map(|&symbol_index| {
-            std::array::from_fn(|tone| full_tones[symbol_index][tone].norm_sqr())
-        })
+        .map(|&symbol_index| std::array::from_fn(|tone| full_tones[symbol_index][tone].norm_sqr()))
         .collect();
     ParityMatrix::symbol_bit_llrs(&data_tones)
         .into_iter()
@@ -261,7 +259,8 @@ mod tests {
         let channel_symbols =
             crate::encode::channel_symbols_from_codeword_bits(&frame.codeword_bits)
                 .expect("channel symbols");
-        let mut full_tones = vec![[Complex32::new(1.0, 0.0); 8]; ACTIVE_MODE.geometry.message_symbols];
+        let mut full_tones =
+            vec![[Complex32::new(1.0, 0.0); 8]; ACTIVE_MODE.geometry.message_symbols];
         for (symbol_index, tone) in channel_symbols.iter().copied().enumerate() {
             full_tones[symbol_index][tone as usize] = Complex32::new(9.0, 0.0);
         }

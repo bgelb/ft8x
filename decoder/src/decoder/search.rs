@@ -3,11 +3,14 @@ use super::*;
 pub(super) fn search_grid(audio: &AudioBuffer, options: &DecodeOptions) -> SearchGrid {
     let spec = &ACTIVE_MODE;
     let geometry = &spec.geometry;
-    let min_bin = (options.min_freq_hz / geometry.tone_spacing_hz).floor().max(0.0) as usize;
-    let max_bin =
-        (options.max_freq_hz / geometry.tone_spacing_hz).ceil() as usize + spec.sync_tone_span_bins();
+    let min_bin = (options.min_freq_hz / geometry.tone_spacing_hz)
+        .floor()
+        .max(0.0) as usize;
+    let max_bin = (options.max_freq_hz / geometry.tone_spacing_hz).ceil() as usize
+        + spec.sync_tone_span_bins();
     SearchGrid {
-        frame_count: (audio.samples.len().saturating_sub(geometry.symbol_samples) / geometry.hop_samples)
+        frame_count: (audio.samples.len().saturating_sub(geometry.symbol_samples)
+            / geometry.hop_samples)
             + 1,
         usable_bins: max_bin.saturating_sub(min_bin) + 1,
         min_bin,
@@ -30,8 +33,8 @@ pub(super) fn build_spectrogram(audio: &AudioBuffer, options: &DecodeOptions) ->
     // Standard Hann window over one symbol before the per-hop FFT.
     let window: Vec<f32> = (0..geometry.symbol_samples)
         .map(|index| {
-            let phase = 2.0 * std::f32::consts::PI * index as f32
-                / (geometry.symbol_samples - 1) as f32;
+            let phase =
+                2.0 * std::f32::consts::PI * index as f32 / (geometry.symbol_samples - 1) as f32;
             0.5 - 0.5 * phase.cos()
         })
         .collect();
@@ -79,8 +82,8 @@ pub(super) fn collect_candidates(
     }
 
     let min_bin = ((options.min_freq_hz / sync_bin_hz).round() as usize).max(1);
-    let max_bin =
-        ((options.max_freq_hz / sync_bin_hz).round() as usize).min(sync_fft_samples / 2 - tuning.sync_guard_bins);
+    let max_bin = ((options.max_freq_hz / sync_bin_hz).round() as usize)
+        .min(sync_fft_samples / 2 - tuning.sync_guard_bins);
     if min_bin >= max_bin {
         return Vec::new();
     }
@@ -171,12 +174,9 @@ pub(super) fn collect_candidates(
             })
             .cloned(),
     );
-    prioritized.extend(
-        raw.into_iter()
-            .filter(|candidate| {
-                (candidate.freq_hz - tuning.nfqso_hz).abs() > tuning.nfqso_priority_window_hz
-            }),
-    );
+    prioritized.extend(raw.into_iter().filter(|candidate| {
+        (candidate.freq_hz - tuning.nfqso_hz).abs() > tuning.nfqso_priority_window_hz
+    }));
 
     let mut selected = Vec::new();
     for candidate in prioritized {

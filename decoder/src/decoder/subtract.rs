@@ -27,9 +27,13 @@ pub(super) fn subtract_candidate_with_dt_refinement(
     let start_sample = ACTIVE_MODE.start_sample_from_dt(success.candidate.dt_seconds);
     let reference = synthesize_channel_reference(&channel_symbols, success.candidate.freq_hz);
     let offset_samples = if refine_dt {
-        let Some(offset_samples) =
-            refined_subtraction_offset(audio, &reference, success.candidate.freq_hz, start_sample, plan)
-        else {
+        let Some(offset_samples) = refined_subtraction_offset(
+            audio,
+            &reference,
+            success.candidate.freq_hz,
+            start_sample,
+            plan,
+        ) else {
             return;
         };
         offset_samples
@@ -109,13 +113,20 @@ pub(super) fn subtraction_residual_band_power(
     let mut residual = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
     let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
-        let residual_window = &mut residual[window.reference_start..window.reference_start + window.len];
-        let envelope_window = &envelope[window.reference_start..window.reference_start + window.len];
-        let reference_window = &reference[window.reference_start..window.reference_start + window.len];
+        let residual_window =
+            &mut residual[window.reference_start..window.reference_start + window.len];
+        let envelope_window =
+            &envelope[window.reference_start..window.reference_start + window.len];
+        let reference_window =
+            &reference[window.reference_start..window.reference_start + window.len];
         let audio_window = &audio.samples[window.signal_start..window.signal_start + window.len];
-        for (residual_slot, ((&sample, &envelope_value), &reference_value)) in residual_window
-            .iter_mut()
-            .zip(audio_window.iter().zip(envelope_window.iter()).zip(reference_window.iter()))
+        for (residual_slot, ((&sample, &envelope_value), &reference_value)) in
+            residual_window.iter_mut().zip(
+                audio_window
+                    .iter()
+                    .zip(envelope_window.iter())
+                    .zip(reference_window.iter()),
+            )
         {
             let corrected = envelope_value * reference_value;
             *residual_slot = Complex32::new(sample - 2.0 * corrected.re, 0.0);
@@ -141,8 +152,10 @@ pub(super) fn filtered_subtraction_envelope(
 ) -> Vec<Complex32> {
     let mut envelope = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
-        let envelope_window = &mut envelope[window.reference_start..window.reference_start + window.len];
-        let reference_window = &reference[window.reference_start..window.reference_start + window.len];
+        let envelope_window =
+            &mut envelope[window.reference_start..window.reference_start + window.len];
+        let reference_window =
+            &reference[window.reference_start..window.reference_start + window.len];
         let audio_window = &audio.samples[window.signal_start..window.signal_start + window.len];
         for (slot, (&reference_value, &audio_sample)) in envelope_window
             .iter_mut()
@@ -174,9 +187,12 @@ pub(super) fn apply_subtraction(
     let frame_len = reference.len();
     let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
     if let Some(window) = overlapping_window(start_sample, frame_len, audio.samples.len()) {
-        let audio_window = &mut audio.samples[window.signal_start..window.signal_start + window.len];
-        let envelope_window = &envelope[window.reference_start..window.reference_start + window.len];
-        let reference_window = &reference[window.reference_start..window.reference_start + window.len];
+        let audio_window =
+            &mut audio.samples[window.signal_start..window.signal_start + window.len];
+        let envelope_window =
+            &envelope[window.reference_start..window.reference_start + window.len];
+        let reference_window =
+            &reference[window.reference_start..window.reference_start + window.len];
         for (local_offset, (audio_sample, (&envelope_value, &reference_value))) in audio_window
             .iter_mut()
             .zip(envelope_window.iter().zip(reference_window.iter()))

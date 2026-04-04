@@ -6,9 +6,7 @@ use thiserror::Error;
 
 use crate::crc::crc14_ft8;
 use crate::message::{GridReport, ReplyWord, hash_callsign};
-use crate::modes::ft8::{
-    FT8_GEOMETRY, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES,
-};
+use crate::modes::ft8::{FT8_GEOMETRY, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES};
 use crate::modes::populate_channel_symbols;
 use crate::protocol::{
     CALL_NTOKENS, CALL_STANDARD_BASE, FTX_CODEWORD_BITS, FTX_DATA_SYMBOLS, FTX_INFO_BITS,
@@ -59,7 +57,10 @@ pub enum TxDirectedPayload {
 
 #[derive(Debug, Clone)]
 pub enum TxMessage {
-    Cq { my_call: String },
+    Cq {
+        my_call: String,
+        my_grid: Option<String>,
+    },
     Directed {
         my_call: String,
         peer_call: String,
@@ -356,12 +357,18 @@ pub fn parse_standard_info(text: &str) -> Result<GridReport, EncodeError> {
 
 fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, String) {
     match message {
-        TxMessage::Cq { my_call } => (
+        TxMessage::Cq { my_call, my_grid } => (
             "CQ".to_string(),
             my_call.clone(),
             false,
-            GridReport::Blank,
-            format!("CQ {}", my_call.trim()),
+            my_grid
+                .as_ref()
+                .map(|grid| GridReport::Grid(grid.trim().to_uppercase()))
+                .unwrap_or(GridReport::Blank),
+            my_grid
+                .as_ref()
+                .map(|grid| format!("CQ {} {}", my_call.trim(), grid.trim().to_uppercase()))
+                .unwrap_or_else(|| format!("CQ {}", my_call.trim())),
         ),
         TxMessage::Directed {
             my_call,
@@ -370,7 +377,13 @@ fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, 
         } => {
             let (acknowledge, info) = tx_payload_fields(payload);
             let rendered = render_standard_message(peer_call, my_call, acknowledge, &info);
-            (peer_call.clone(), my_call.clone(), acknowledge, info, rendered)
+            (
+                peer_call.clone(),
+                my_call.clone(),
+                acknowledge,
+                info,
+                rendered,
+            )
         }
     }
 }
@@ -385,7 +398,12 @@ fn tx_payload_fields(payload: &TxDirectedPayload) -> (bool, GridReport) {
     }
 }
 
-fn render_standard_message(first: &str, second: &str, acknowledge: bool, info: &GridReport) -> String {
+fn render_standard_message(
+    first: &str,
+    second: &str,
+    acknowledge: bool,
+    info: &GridReport,
+) -> String {
     let trailing = render_standard_info(acknowledge, info);
     if trailing.is_empty() {
         format!("{} {}", first.trim(), second.trim())
@@ -584,7 +602,8 @@ fn encode_g15(info: &GridReport) -> Result<u16, EncodeError> {
         }
         GridReport::Blank => Ok(32_400),
         GridReport::Reply(ReplyWord::Rrr) => Ok(32_402),
-        GridReport::Reply(ReplyWord::Rr73) => Ok(32_403),
+        // WSJT-X compatibility: RR73 is sent using the overloaded grid-space codepoint.
+        GridReport::Reply(ReplyWord::Rr73) => Ok(32_373),
         GridReport::Reply(ReplyWord::SeventyThree) => Ok(32_404),
         GridReport::Reply(ReplyWord::Blank) => Ok(32_400),
         GridReport::Signal(report) if (-50..=49).contains(report) => {
@@ -723,6 +742,26 @@ mod tests {
         assert!(matches!(
             info.value,
             StructuredInfoValue::Grid { ref locator } if locator == "MO05"
+        ));
+    }
+
+    #[test]
+    fn rr73_reply_uses_wsjt_compatible_wire_value_and_normalizes_on_decode() {
+        let frame =
+            encode_standard_message("W5XO", "N1VF", false, &GridReport::Reply(ReplyWord::Rr73))
+                .expect("encode rr73");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let message = payload.to_message(&HashResolver::default());
+        let StructuredMessage::Standard { info, .. } = message else {
+            panic!("expected standard message");
+        };
+
+        assert_eq!(info.raw, 32_373);
+        assert!(matches!(
+            info.value,
+            StructuredInfoValue::Reply {
+                word: ReplyWord::Rr73
+            }
         ));
     }
 

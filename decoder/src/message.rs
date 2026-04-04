@@ -4,12 +4,12 @@ use serde::Serialize;
 
 use crate::crc;
 use crate::protocol::{
-    CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FTX_FREE_TEXT_FIELD,
-    FTX_FREE_TEXT_SUBTYPE_FIELD, FTX_INFO_BITS, FTX_MESSAGE_BITS,
-    FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_STANDARD_SLASH_P,
-    FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT, FTX_STANDARD_LAYOUT,
-    HASH_MULTIPLIER, alphabet27_char, alphabet36_char, alphabet37_char, alphabet38_char,
-    alphabet38_index, alphabet42_char, digit10_char, read_bit_field, read_bit_field_u128,
+    CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FTX_FREE_TEXT_FIELD, FTX_FREE_TEXT_SUBTYPE_FIELD,
+    FTX_INFO_BITS, FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_NONSTANDARD,
+    FTX_MESSAGE_KIND_STANDARD_SLASH_P, FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT,
+    FTX_STANDARD_LAYOUT, HASH_MULTIPLIER, alphabet27_char, alphabet36_char, alphabet37_char,
+    alphabet38_char, alphabet38_index, alphabet42_char, digit10_char, read_bit_field,
+    read_bit_field_u128,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -366,7 +366,8 @@ pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
                 i3,
                 first_raw,
                 first: decode_c28(first_raw as u64),
-                first_modifier: (read_bit_field(message_bits, FTX_STANDARD_LAYOUT.first_suffix) == 1)
+                first_modifier: (read_bit_field(message_bits, FTX_STANDARD_LAYOUT.first_suffix)
+                    == 1)
                     .then_some(modifier.clone()),
                 second_raw,
                 second: decode_c28(second_raw as u64),
@@ -491,7 +492,7 @@ fn structured_call_field(
 }
 
 fn structured_info_field(raw: u16, info: &GridReport) -> StructuredInfoField {
-    let value = match info {
+    let value = match normalize_grid_report(info) {
         GridReport::Grid(locator) => StructuredInfoValue::Grid {
             locator: locator.clone(),
         },
@@ -582,7 +583,7 @@ fn decode_g15(value: u64) -> GridReport {
         remaining %= 100;
         let c = ((remaining / 10) as u8 + b'0') as char;
         let d = ((remaining % 10) as u8 + b'0') as char;
-        return GridReport::Grid(format!("{a}{b}{c}{d}"));
+        return normalize_grid_report(&GridReport::Grid(format!("{a}{b}{c}{d}"))).clone();
     }
 
     let report = value - MAX_GRID4;
@@ -592,6 +593,16 @@ fn decode_g15(value: u64) -> GridReport {
         3 => GridReport::Reply(ReplyWord::Rr73),
         4 => GridReport::Reply(ReplyWord::SeventyThree),
         _ => GridReport::Signal(report as i16 - 35),
+    }
+}
+
+fn normalize_grid_report(info: &GridReport) -> &GridReport {
+    match info {
+        GridReport::Grid(locator) if locator.eq_ignore_ascii_case("RR73") => {
+            static RR73_REPLY: GridReport = GridReport::Reply(ReplyWord::Rr73);
+            &RR73_REPLY
+        }
+        _ => info,
     }
 }
 
