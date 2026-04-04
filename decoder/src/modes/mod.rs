@@ -61,7 +61,6 @@ pub struct SearchTuning {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModeSpec {
-    pub name: &'static str,
     pub geometry: FrameGeometry,
     pub tuning: SearchTuning,
 }
@@ -280,7 +279,6 @@ mod tests {
         llr_scale_factor: 2.0,
     };
     const MOCK_SPEC: ModeSpec = ModeSpec {
-        name: "mock",
         geometry: MOCK_GEOMETRY,
         tuning: MOCK_TUNING,
     };

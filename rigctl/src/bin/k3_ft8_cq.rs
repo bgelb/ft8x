@@ -1,5 +1,7 @@
 use clap::Parser;
-use ft8_decoder::{GridReport, WaveformOptions, encode_standard_message, synthesize_rectangular_waveform};
+use ft8_decoder::{
+    GridReport, WaveformOptions, encode_standard_message, synthesize_rectangular_waveform,
+};
 use rigctl::audio::play_mono_samples;
 use rigctl::{K3S_BAUD_RATE, K3s, K3sConfig, TxMeterMode, detect_k3s_audio_output_device};
 use std::path::PathBuf;
@@ -7,7 +9,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Transmit one FT8 CQ at the next slot boundary")]
+#[command(
+    author,
+    version,
+    about = "Transmit one FT8 CQ at the next slot boundary"
+)]
 struct Cli {
     #[arg(long)]
     callsign: String,
@@ -78,7 +84,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pre_key = Duration::from_millis(150);
     let key_time = slot_start.checked_sub(pre_key).unwrap_or(slot_start);
 
-    println!("output_device={} ({})", output_device.name, output_device.spec);
+    println!(
+        "output_device={} ({})",
+        output_device.name, output_device.spec
+    );
     println!(
         "rig={} Hz mode={} band={} configured_power_w={configured_power_w:.1}",
         state.frequency_hz, state.mode, state.band
@@ -98,7 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sleep_until(key_time);
     rig.set_tx_meter_mode(TxMeterMode::Rf)?;
     let mut tx = TxGuard::enter(&mut rig)?;
-    thread::sleep(slot_start.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO));
+    thread::sleep(
+        slot_start
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    );
     println!("transmitting at {}", format_system_time(SystemTime::now()));
     let output_device_for_thread = output_device.clone();
     let sample_rate_hz = tx_wave.sample_rate_hz;
@@ -106,7 +119,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = tx_wave.samples.clone();
     let poll = Duration::from_millis(cli.poll_ms);
     let playback_thread = thread::spawn(move || {
-        play_mono_samples(&output_device_for_thread, sample_rate_hz, channels, &samples)
+        play_mono_samples(
+            &output_device_for_thread,
+            sample_rate_hz,
+            channels,
+            &samples,
+        )
     });
     loop {
         if playback_thread.is_finished() {
@@ -127,7 +145,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         thread::sleep(poll);
     }
-    let playback_result = playback_thread.join().map_err(|_| "playback thread panicked")?;
+    let playback_result = playback_thread
+        .join()
+        .map_err(|_| "playback thread panicked")?;
     playback_result?;
     thread::sleep(Duration::from_millis(100));
     let tx_state = tx.rig().is_transmitting().unwrap_or(false);
@@ -137,7 +157,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     drop(tx);
     rig.set_tx_meter_mode(original_meter_mode)?;
-    println!("returned to RX at {}", format_system_time(SystemTime::now()));
+    println!(
+        "returned to RX at {}",
+        format_system_time(SystemTime::now())
+    );
 
     Ok(())
 }

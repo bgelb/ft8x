@@ -114,7 +114,6 @@ pub const FT8_TUNING: SearchTuning = SearchTuning {
 };
 
 pub const FT8_SPEC: ModeSpec = ModeSpec {
-    name: "ft8",
     geometry: FT8_GEOMETRY,
     tuning: FT8_TUNING,
 };

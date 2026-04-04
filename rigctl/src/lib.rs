@@ -1,8 +1,8 @@
 pub mod audio {
     pub use audiolib::{
-        AudioDevice, AudioStreamConfig, CaptureStats, Error, Result, SampleStream, list_input_devices,
-        list_output_devices, play_interleaved_samples_i16_until, play_mono_samples,
-        play_mono_samples_until, play_tone,
+        AudioDevice, AudioStreamConfig, CaptureStats, Error, Result, SampleStream,
+        list_input_devices, list_output_devices, play_interleaved_samples_i16_until,
+        play_mono_samples, play_mono_samples_until, play_tone,
     };
 }
 
@@ -338,10 +338,13 @@ pub struct K3s {
 
 impl K3s {
     pub fn connect(config: K3sConfig) -> Result<Self> {
-        let mut port = serialport::new(config.port_path.to_string_lossy().into_owned(), config.baud_rate)
-            .timeout(Duration::from_millis(50))
-            .dtr_on_open(config.dtr)
-            .open()?;
+        let mut port = serialport::new(
+            config.port_path.to_string_lossy().into_owned(),
+            config.baud_rate,
+        )
+        .timeout(Duration::from_millis(50))
+        .dtr_on_open(config.dtr)
+        .open()?;
         // On the attached K3S/FTDI interface, asserting RTS mutes receive audio and likely keys
         // a PTT-related control path. Keep both modem-control outputs low by default for RX-only
         // CAT use unless a caller explicitly overrides them in K3sConfig.
@@ -408,7 +411,10 @@ impl K3s {
     }
 
     pub fn get_signal_level(&mut self) -> Result<SignalLevel> {
-        let high_res = self.query("SMH;", &["SMH"]).ok().and_then(|rsp| parse_prefixed_u16("SMH", &rsp).ok());
+        let high_res = self
+            .query("SMH;", &["SMH"])
+            .ok()
+            .and_then(|rsp| parse_prefixed_u16("SMH", &rsp).ok());
         let coarse_rsp = self.query("SM;", &["SM"])?;
         let coarse = parse_prefixed_u16("SM", &coarse_rsp)?;
         let bar_graph = self.get_bar_graph()?;
@@ -533,7 +539,10 @@ impl K3s {
                                 command: command.to_string(),
                             });
                         }
-                        if expected_prefixes.iter().any(|prefix| frame.starts_with(prefix)) {
+                        if expected_prefixes
+                            .iter()
+                            .any(|prefix| frame.starts_with(prefix))
+                        {
                             return Ok(frame);
                         }
                     }
@@ -564,8 +573,9 @@ pub fn detect_k3s_audio_device(override_spec: Option<&str>) -> audio::Result<aud
     let mut best = None;
     for device in devices {
         let desc = device.description.as_deref().unwrap_or_default();
-        let looks_like_codec =
-            device.spec.contains("CARD=CODEC") || device.name.contains("USB Audio CODEC") || desc.contains("USB Audio CODEC");
+        let looks_like_codec = device.spec.contains("CARD=CODEC")
+            || device.name.contains("USB Audio CODEC")
+            || desc.contains("USB Audio CODEC");
         let looks_like_device0 = device.spec.contains("DEV=0");
         let looks_like_pcm = device.spec.starts_with("plughw:") || device.spec.starts_with("hw:");
         if looks_like_codec && looks_like_device0 && looks_like_pcm {
@@ -579,7 +589,9 @@ pub fn detect_k3s_audio_device(override_spec: Option<&str>) -> audio::Result<aud
     best.ok_or_else(|| audio::Error::CaptureInit("K3S audio capture device not found".to_string()))
 }
 
-pub fn detect_k3s_audio_output_device(override_spec: Option<&str>) -> audio::Result<audio::AudioDevice> {
+pub fn detect_k3s_audio_output_device(
+    override_spec: Option<&str>,
+) -> audio::Result<audio::AudioDevice> {
     if let Some(spec) = override_spec {
         return Ok(audio::AudioDevice {
             name: spec.to_string(),
@@ -592,8 +604,9 @@ pub fn detect_k3s_audio_output_device(override_spec: Option<&str>) -> audio::Res
     let mut best = None;
     for device in devices {
         let desc = device.description.as_deref().unwrap_or_default();
-        let looks_like_codec =
-            device.spec.contains("CARD=CODEC") || device.name.contains("USB Audio CODEC") || desc.contains("USB Audio CODEC");
+        let looks_like_codec = device.spec.contains("CARD=CODEC")
+            || device.name.contains("USB Audio CODEC")
+            || desc.contains("USB Audio CODEC");
         let looks_like_device0 = device.spec.contains("DEV=0");
         let looks_like_pcm = device.spec.starts_with("plughw:") || device.spec.starts_with("hw:");
         if looks_like_codec && looks_like_device0 && looks_like_pcm {
@@ -680,15 +693,19 @@ fn parse_power_control(response: &str) -> Result<f32> {
             response: response.to_string(),
         })?;
     let watts = match body.len() {
-        3 => body.parse::<u16>().map(|watts| watts as f32).map_err(|_| Error::UnexpectedResponse {
-            command: "PC;".to_string(),
-            response: response.to_string(),
-        })?,
-        4 => {
-            let value = body[..3].parse::<u16>().map_err(|_| Error::UnexpectedResponse {
+        3 => body.parse::<u16>().map(|watts| watts as f32).map_err(|_| {
+            Error::UnexpectedResponse {
                 command: "PC;".to_string(),
                 response: response.to_string(),
-            })?;
+            }
+        })?,
+        4 => {
+            let value = body[..3]
+                .parse::<u16>()
+                .map_err(|_| Error::UnexpectedResponse {
+                    command: "PC;".to_string(),
+                    response: response.to_string(),
+                })?;
             let range = body.as_bytes()[3];
             match range {
                 b'0' => value as f32 / 10.0,
@@ -731,7 +748,10 @@ mod tests {
 
     #[test]
     fn parses_protocol_fields() {
-        assert_eq!(parse_prefixed_u64("FA", "FA00014074000;").unwrap(), 14_074_000);
+        assert_eq!(
+            parse_prefixed_u64("FA", "FA00014074000;").unwrap(),
+            14_074_000
+        );
         assert_eq!(parse_prefixed_u8("BN", "BN05;").unwrap(), 5);
         assert_eq!(parse_bg("BG00R;").unwrap(), (0, true));
         assert_eq!(parse_power_control("PC050;").unwrap(), 50.0);

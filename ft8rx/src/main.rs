@@ -860,7 +860,8 @@ impl WorkQueueState {
             .entries
             .iter()
             .filter(|entry| {
-                excluded_callsign.is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+                excluded_callsign
+                    .is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
             })
             .filter_map(|entry| self.direct_priority_meta(entry, now))
             .map(|meta| meta.slot_index)
@@ -869,7 +870,8 @@ impl WorkQueueState {
             .entries
             .iter()
             .filter(|entry| {
-                excluded_callsign.is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+                excluded_callsign
+                    .is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
             })
             .filter_map(|entry| self.direct_priority_meta(entry, now))
             .any(|meta| meta.slot_index == most_recent_slot)
@@ -882,7 +884,8 @@ impl WorkQueueState {
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                excluded_callsign.is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+                excluded_callsign
+                    .is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
             })
             .filter_map(|(index, entry)| {
                 let meta = self.direct_priority_meta(entry, now)?;
@@ -6612,10 +6615,9 @@ fn maybe_track_priority_directs(
                 last_text: Some(observation.text.clone()),
                 last_structured_json: Some(observation.structured_json.clone()),
             };
-            if qso_controller.refresh_reserved_compound_next_station(
-                reserved_station,
-                observation.observed_at,
-            ) {
+            if qso_controller
+                .refresh_reserved_compound_next_station(reserved_station, observation.observed_at)
+            {
                 continue;
             }
             if let Err(message) = work_queue.add_direct_observation(observation, slot_start) {
@@ -7342,7 +7344,10 @@ mod tests {
             },
             rx_slot_start + Duration::from_secs(15),
         ));
-        assert_eq!(controller.reserved_compound_next_call().as_deref(), Some("NEW1"));
+        assert_eq!(
+            controller.reserved_compound_next_call().as_deref(),
+            Some("NEW1")
+        );
 
         let decode = DecodedMessage {
             utc: "00:00:00".to_string(),
