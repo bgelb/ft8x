@@ -426,24 +426,35 @@ impl QsoController {
             if let Some(session) = &mut self.session {
                 if committed_next_tx {
                     session.pending_action = Some(PendingAction::Exit(reason.to_string()));
-                    Self::log_late_tx_switch_wanted(
-                        session,
-                        now,
-                        previous_state,
-                        previous_state,
-                        None,
-                        Some(reason),
-                    );
+                    let is_no_partner_case = !event.has_partner_message();
+                    if !is_no_partner_case {
+                        Self::log_late_tx_switch_wanted(
+                            session,
+                            now,
+                            previous_state,
+                            previous_state,
+                            None,
+                            Some(reason),
+                        );
+                    }
                     Self::push_transcript(
                         session,
                         now,
                         "SYS:",
                         session.state,
-                        format!("late RX after tx launch: exit queued after current tx ({reason})"),
+                        if is_no_partner_case {
+                            format!("exit queued after committed tx ({reason})")
+                        } else {
+                            format!("late RX after tx launch: exit queued after current tx ({reason})")
+                        },
                     );
                     Self::log_fsm(
                         session,
-                        "late_rx_exit_queued",
+                        if is_no_partner_case {
+                            "committed_tx_exit_queued"
+                        } else {
+                            "late_rx_exit_queued"
+                        },
                         previous_state,
                         previous_state,
                         session

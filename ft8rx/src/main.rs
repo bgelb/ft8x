@@ -55,7 +55,7 @@ const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
 const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
-const QUEUE_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_QUEUE_RETRY_DELAY: Duration = Duration::from_secs(35);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const CONFIG_DEFAULT: &str = "config/ft8rx.json";
 
@@ -217,6 +217,7 @@ enum QueueCommand {
     Remove { callsign: String },
     SetAuto { enabled: bool },
     SetTxFreq { tx_freq_hz: f32 },
+    SetRetryDelay { retry_delay_seconds: u64 },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -236,6 +237,7 @@ struct BandMapEntry {
 #[derive(Debug, Clone, Default, Serialize)]
 struct WebSnapshot {
     time_utc: String,
+    our_call: String,
     rig_frequency_hz: Option<u64>,
     rig_mode: String,
     rig_band: String,
@@ -254,9 +256,11 @@ struct WebSnapshot {
     bandmaps: WebBandMaps,
     stations: Vec<WebStationSummary>,
     station_logs: Vec<WebStationLog>,
+    direct_calls: Vec<WebDirectCallLog>,
     qso: WebQsoSnapshot,
     qso_defaults: WebQsoDefaults,
     queue: WebQueueSnapshot,
+    qso_history: Vec<WebQsoHistoryEntry>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -356,6 +360,16 @@ struct WebStationLog {
     text: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct WebDirectCallLog {
+    timestamp: String,
+    sender_call: String,
+    snr_db: i32,
+    dt_seconds: f32,
+    freq_hz: f32,
+    text: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct RigConfigRequest {
     band: String,
@@ -377,6 +391,11 @@ struct QueueTxFreqRequest {
     tx_freq_hz: f32,
 }
 
+#[derive(Debug, Deserialize)]
+struct QueueRetryDelayRequest {
+    retry_delay_seconds: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct ApiStatus {
     ok: bool,
@@ -387,6 +406,7 @@ struct ApiStatus {
 struct WebQueueSnapshot {
     auto_enabled: bool,
     tx_freq_hz: f32,
+    retry_delay_seconds: u64,
     scheduler_status: String,
     entries: Vec<WebQueueEntry>,
 }
@@ -401,6 +421,18 @@ struct WebQueueEntry {
     last_heard_slot_family: Option<String>,
     ready: bool,
     status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebQsoHistoryEntry {
+    time: String,
+    age: String,
+    callsign: String,
+    sent_info: String,
+    received_info: String,
+    got_reply: bool,
+    reached_73: bool,
+    exit_reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -466,6 +498,7 @@ struct LoggedDecode {
 struct WorkQueueState {
     auto_enabled: bool,
     tx_freq_hz: f32,
+    retry_delay: Duration,
     entries: VecDeque<WorkQueueEntry>,
     recent_worked: BTreeMap<String, SystemTime>,
     scheduler_status: String,
@@ -517,6 +550,34 @@ struct QueueDispatch {
     tx_freq_hz: f32,
 }
 
+#[derive(Debug, Clone)]
+struct QsoJsonlCache {
+    path: PathBuf,
+    last_modified: Option<SystemTime>,
+    last_len: u64,
+    history: Vec<WebQsoHistoryEntry>,
+    recent_worked: BTreeMap<String, SystemTime>,
+}
+
+#[derive(Debug, Default)]
+struct QsoJsonlSessionSummary {
+    partner_call: String,
+    started_at: Option<SystemTime>,
+    ended_at: Option<SystemTime>,
+    last_seen_at: Option<SystemTime>,
+    got_reply: bool,
+    reached_73: bool,
+    sent_infos: Vec<String>,
+    received_infos: Vec<String>,
+    exit_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct QsoHistoryKey {
+    session_id: u64,
+    ordinal: u64,
+}
+
 impl Default for StationTracker {
     fn default() -> Self {
         Self {
@@ -533,6 +594,7 @@ impl WorkQueueState {
         Self {
             auto_enabled: false,
             tx_freq_hz,
+            retry_delay: DEFAULT_QUEUE_RETRY_DELAY,
             entries: VecDeque::new(),
             recent_worked,
             scheduler_status: "auto disabled".to_string(),
@@ -593,6 +655,22 @@ impl WorkQueueState {
         info!(tx_freq_hz, "queue_tx_freq_changed");
     }
 
+    fn set_retry_delay(&mut self, retry_delay: Duration) {
+        self.retry_delay = retry_delay;
+        info!(retry_delay_seconds = retry_delay.as_secs(), "queue_retry_delay_changed");
+    }
+
+    fn sync_recent_worked(&mut self, recent_worked: BTreeMap<String, SystemTime>) {
+        for (callsign, worked_at) in recent_worked {
+            match self.recent_worked.get(&callsign).copied() {
+                Some(existing) if existing >= worked_at => {}
+                _ => {
+                    self.recent_worked.insert(callsign, worked_at);
+                }
+            }
+        }
+    }
+
     fn prune_recent_worked(&mut self, now: SystemTime) {
         self.recent_worked.retain(|callsign, worked_at| {
             let keep =
@@ -630,12 +708,12 @@ impl WorkQueueState {
                 self.entries.push_back(WorkQueueEntry {
                     callsign: outcome.partner_call.clone(),
                     queued_at: outcome.finished_at,
-                    ok_to_schedule_after: outcome.finished_at + QUEUE_RETRY_DELAY,
+                    ok_to_schedule_after: outcome.finished_at + self.retry_delay,
                     last_observed_at,
                 });
                 info!(
                     callsign = outcome.partner_call,
-                    ok_to_schedule_after = %format_time(outcome.finished_at + QUEUE_RETRY_DELAY),
+                    ok_to_schedule_after = %format_time(outcome.finished_at + self.retry_delay),
                     exit_reason = outcome.exit_reason,
                     "queue_requeue_after_no_msg"
                 );
@@ -703,6 +781,7 @@ impl WorkQueueState {
         WebQueueSnapshot {
             auto_enabled: self.auto_enabled,
             tx_freq_hz: self.tx_freq_hz,
+            retry_delay_seconds: self.retry_delay.as_secs(),
             scheduler_status: self.scheduler_status.clone(),
             entries: self
                 .entries
@@ -836,6 +915,47 @@ impl WorkQueueState {
     }
 }
 
+impl QsoJsonlCache {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            last_modified: None,
+            last_len: 0,
+            history: Vec::new(),
+            recent_worked: BTreeMap::new(),
+        }
+    }
+
+    fn refresh(&mut self, now: SystemTime) {
+        let Ok(metadata) = std::fs::metadata(&self.path) else {
+            self.history.clear();
+            self.recent_worked.clear();
+            self.last_modified = None;
+            self.last_len = 0;
+            return;
+        };
+        let modified = metadata.modified().ok();
+        let len = metadata.len();
+        if self.last_modified == modified && self.last_len == len {
+            return;
+        }
+        let Ok(contents) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+        let scan = scan_qso_jsonl(&contents, now);
+        self.history = scan.history;
+        self.recent_worked = scan.recent_worked;
+        self.last_modified = modified;
+        self.last_len = len;
+    }
+}
+
+#[derive(Debug, Default)]
+struct QsoJsonlScan {
+    history: Vec<WebQsoHistoryEntry>,
+    recent_worked: BTreeMap<String, SystemTime>,
+}
+
 #[derive(Debug)]
 struct DecodeJob {
     slot_start: SystemTime,
@@ -960,7 +1080,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .second-row {
       display: grid;
-      grid-template-columns: minmax(320px, 0.95fr) minmax(320px, 1.05fr);
+      grid-template-columns: repeat(3, minmax(280px, 1fr));
+      gap: 18px;
+      margin-bottom: 18px;
+      align-items: start;
+    }
+    .third-row {
+      display: grid;
+      grid-template-columns: 1fr;
       gap: 18px;
       margin-bottom: 18px;
       align-items: start;
@@ -1039,12 +1166,34 @@ const INDEX_HTML: &str = r#"<!doctype html>
       margin-bottom: 4px;
     }
     .call {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
       font-size: 12px;
       line-height: 1.3;
       color: var(--good);
+    }
+    .call-text {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+    .queue-tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      color: #ffffff;
+      background: rgba(255, 255, 255, 0.08);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      flex: 0 0 auto;
     }
     table {
       width: 100%;
@@ -1087,6 +1236,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 100%;
     }
     .queue-panel {
+      min-height: 100%;
+    }
+    .direct-panel {
+      min-height: 100%;
+    }
+    .log-panel {
       min-height: 100%;
     }
     .detail-block {
@@ -1291,6 +1446,47 @@ const INDEX_HTML: &str = r#"<!doctype html>
       line-height: 1.35;
       white-space: pre-wrap;
     }
+    .history-grid {
+      margin-top: 8px;
+      display: grid;
+      gap: 2px;
+      max-height: 320px;
+      overflow: auto;
+      padding-right: 4px;
+      font-size: 11px;
+      line-height: 1.15;
+    }
+    .history-row {
+      display: grid;
+      grid-template-columns: 152px 78px 72px 34px 28px 88px 88px minmax(0, 1fr);
+      gap: 6px;
+      align-items: baseline;
+      padding: 3px 6px;
+      border: 1px solid rgba(143, 176, 192, 0.08);
+      border-radius: 6px;
+      background: rgba(19, 40, 56, 0.45);
+    }
+    .history-head {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: linear-gradient(180deg, rgba(13, 29, 41, 0.98), rgba(13, 29, 41, 0.92));
+      border: 0;
+      padding: 0 6px 2px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-size: 10px;
+    }
+    .history-cell {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--ink);
+    }
+    .history-cell.muted {
+      color: var(--muted);
+    }
     @media (max-width: 1100px) {
       .status-grid { grid-template-columns: 1fr; }
       .top-layout { grid-template-columns: 1fr; }
@@ -1381,8 +1577,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="detail-lines" id="queue-status">auto disabled</div>
         </div>
         <div class="detail-block">
+          <div class="label">Retry Delay</div>
+          <div class="control-inline">
+            <div class="input-wrap">
+              <input id="queue-retry-delay" class="control-input" type="number" min="1" max="3600" step="1">
+            </div>
+          </div>
+        </div>
+        <div class="detail-block">
           <div class="label">Queue</div>
           <div class="queue-list" id="queue-list"></div>
+        </div>
+      </section>
+      <section class="panel direct-panel">
+        <div class="label">Direct Calls</div>
+        <div class="value" id="direct-count">0 heard</div>
+        <div class="detail-block">
+          <div class="label">Messages To Our Call</div>
+          <div class="activity-list" id="direct-list"></div>
         </div>
       </section>
       <section class="panel qso-panel">
@@ -1413,6 +1625,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="detail-block">
           <div class="label">Transcript</div>
           <div class="qso-transcript" id="qso-transcript"></div>
+        </div>
+      </section>
+    </div>
+    <div class="third-row">
+      <section class="panel log-panel">
+        <div class="label">QSO Log</div>
+        <div class="value" id="qso-history-count">0 sessions</div>
+        <div class="detail-block">
+          <div class="label">Recent QSOs</div>
+          <div class="history-grid" id="qso-history-list"></div>
         </div>
       </section>
     </div>
@@ -1619,6 +1841,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/queue/tx-freq', { tx_freq_hz: txFreqHz });
       scheduleRefresh(10);
     }
+    async function updateQueueRetryDelay(seconds) {
+      await postJson('/api/queue/retry-delay', { retry_delay_seconds: seconds });
+      scheduleRefresh(10);
+    }
     async function removeQueuedCall(callsign) {
       await postJson('/api/queue/remove', { callsign });
       scheduleRefresh(10);
@@ -1726,6 +1952,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     function renderBandMap(rootId, grid) {
       const root = document.getElementById(rootId);
+      const queuedCalls = new Set((lastSnapshot?.queue?.entries || []).map((entry) => entry.callsign));
       root.innerHTML = '';
       for (let row = 0; row < grid.length; row++) {
         for (let col = 0; col < grid[row].length; col++) {
@@ -1744,10 +1971,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
             const lightness = 72 - fade * 34;
             const saturation = 88 - fade * 58;
             line.style.color = `hsl(135 ${saturation}% ${lightness}%)`;
-            line.innerHTML = renderCallValue(
-              entry.detail ? `${entry.callsign} ${entry.detail}` : entry.callsign,
-              entry.callsign
-            );
+            const queueButton = queuedCalls.has(entry.callsign)
+              ? ''
+              : `<span class="queue-tag" data-queue-call="${escapeHtml(entry.callsign)}">Q</span>`;
+            line.innerHTML = `
+              ${queueButton}
+              <span class="call-text">${renderCallValue(
+                entry.detail ? `${entry.callsign} ${entry.detail}` : entry.callsign,
+                entry.callsign
+              )}</span>`;
             cell.appendChild(line);
           }
           root.appendChild(cell);
@@ -1926,9 +2158,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const queue = data.queue || {};
       const count = document.getElementById('queue-count');
       const status = document.getElementById('queue-status');
+      const retryDelay = document.getElementById('queue-retry-delay');
       const list = document.getElementById('queue-list');
       count.textContent = `${(queue.entries || []).length} queued`;
       status.textContent = queue.scheduler_status || 'auto disabled';
+      if (retryDelay.value === '' || Number(retryDelay.value) !== Number(queue.retry_delay_seconds)) {
+        retryDelay.value = String(queue.retry_delay_seconds ?? 35);
+      }
       list.innerHTML = '';
       if (!(queue.entries || []).length) {
         list.innerHTML = '<div class="detail-empty">No queued stations.</div>';
@@ -1945,6 +2181,74 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="queue-meta">queued ${escapeHtml(entry.queued_at)}\nok after ${escapeHtml(entry.ok_to_schedule_after)}</div>
           <div class="queue-meta">heard ${escapeHtml(entry.last_heard_at ?? '-')}  msg=${escapeHtml(entry.last_heard_message)}  parity=${escapeHtml(entry.last_heard_slot_family ?? '-')}</div>
           <div class="queue-meta">${escapeHtml(entry.ready ? 'ready' : entry.status)}</div>`;
+        list.appendChild(row);
+      }
+    }
+    function renderDirectCalls(data) {
+      const direct = data.direct_calls || [];
+      const count = document.getElementById('direct-count');
+      const list = document.getElementById('direct-list');
+      count.textContent = `${direct.length} heard`;
+      list.innerHTML = `
+        <div class="activity-item activity-head">
+          <div class="activity-col">Time</div>
+          <div class="activity-col">To</div>
+          <div class="activity-col">De</div>
+          <div class="activity-col">SNR</div>
+          <div class="activity-col">dT</div>
+          <div class="activity-col">Freq</div>
+          <div class="activity-col">Msg</div>
+        </div>`;
+      if (!direct.length) {
+        list.innerHTML += '<div class="detail-empty">No recent messages to our call.</div>';
+        return;
+      }
+      for (const item of direct) {
+        const row = document.createElement('div');
+        row.className = 'activity-item';
+        row.innerHTML = `
+          <div class="activity-col">${escapeHtml(item.timestamp)}</div>
+          <div class="activity-col">${escapeHtml(data.our_call || 'MYCALL')}</div>
+          <div class="activity-col">${renderParty(item.sender_call, selectedCall)}</div>
+          <div class="activity-col">${item.snr_db}</div>
+          <div class="activity-col">${item.dt_seconds.toFixed(2)}</div>
+          <div class="activity-col">${Math.round(item.freq_hz)}</div>
+          <div class="activity-msg">${escapeHtml(item.text)}</div>`;
+        list.appendChild(row);
+      }
+    }
+    function renderQsoHistory(data) {
+      const history = (data.qso_history || []).filter((entry) => entry.got_reply || entry.reached_73);
+      const count = document.getElementById('qso-history-count');
+      const list = document.getElementById('qso-history-list');
+      count.textContent = `${history.length} sessions`;
+      list.innerHTML = `
+        <div class="history-row history-head">
+          <div>Time</div>
+          <div>Ago</div>
+          <div>Call</div>
+          <div>Rpl</div>
+          <div>73</div>
+          <div>Sent</div>
+          <div>Recv</div>
+          <div>Exit</div>
+        </div>`;
+      if (!history.length) {
+        list.innerHTML += '<div class="detail-empty">No recent QSO history in the JSONL log.</div>';
+        return;
+      }
+      for (const entry of history) {
+        const row = document.createElement('div');
+        row.className = 'history-row';
+        row.innerHTML = `
+          <div class="history-cell muted">${escapeHtml(entry.time)}</div>
+          <div class="history-cell muted">${escapeHtml(entry.age)}</div>
+          <div class="history-cell">${escapeHtml(entry.callsign)}</div>
+          <div class="history-cell muted">${entry.got_reply ? 'Y' : '-'}</div>
+          <div class="history-cell muted">${entry.reached_73 ? 'Y' : '-'}</div>
+          <div class="history-cell">${escapeHtml(entry.sent_info)}</div>
+          <div class="history-cell">${escapeHtml(entry.received_info)}</div>
+          <div class="history-cell muted">${escapeHtml(entry.exit_reason)}</div>`;
         list.appendChild(row);
       }
     }
@@ -1989,10 +2293,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderDetail(data);
       renderQso(data);
       renderQueue(data);
+      renderDirectCalls(data);
+      renderQsoHistory(data);
       document.querySelectorAll('[data-call]').forEach((node) => {
         node.addEventListener('click', (event) => {
           event.preventDefault();
           pickCall(node.dataset.call);
+        });
+      });
+      document.querySelectorAll('[data-queue-call]').forEach((node) => {
+        node.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          postJson('/api/queue/add', { callsign: node.dataset.queueCall }).then(() => scheduleRefresh(10)).catch((error) => console.error(error));
         });
       });
       document.querySelectorAll('[data-queue-remove]').forEach((node) => {
@@ -2057,6 +2370,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       updateQueueTxFreq(value).catch((error) => console.error(error));
     });
+    document.getElementById('queue-retry-delay').addEventListener('change', (event) => {
+      const value = Number(event.currentTarget.value);
+      if (!Number.isFinite(value) || value < 1 || value > 3600) {
+        if (lastSnapshot) renderQueue(lastSnapshot);
+        return;
+      }
+      updateQueueRetryDelay(Math.round(value)).catch((error) => console.error(error));
+    });
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && lastSnapshot?.qso && (lastSnapshot.qso.active || lastSnapshot.qso.tx_active)) {
         event.preventDefault();
@@ -2100,6 +2421,7 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route("/api/queue/remove", post(api_queue_remove_handler))
                 .route("/api/queue/auto", post(api_queue_auto_handler))
                 .route("/api/queue/tx-freq", post(api_queue_tx_freq_handler))
+                .route("/api/queue/retry-delay", post(api_queue_retry_delay_handler))
                 .with_state(state);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -2235,6 +2557,31 @@ async fn api_queue_tx_freq_handler(
         Json(ApiStatus {
             ok: true,
             message: "queue tx freq updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_retry_delay_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueRetryDelayRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    if request.retry_delay_seconds == 0 || request.retry_delay_seconds > 3600 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "retry delay must be between 1 and 3600 seconds".to_string(),
+            }),
+        );
+    }
+    state.queue_control.enqueue(QueueCommand::SetRetryDelay {
+        retry_delay_seconds: request.retry_delay_seconds,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue retry delay updated".to_string(),
         }),
     )
 }
@@ -2407,13 +2754,11 @@ fn init_tracing(config: &AppConfig) -> Result<(), AppError> {
     Ok(())
 }
 
-fn load_recent_worked_cache(path: &str, now: SystemTime) -> BTreeMap<String, SystemTime> {
-    let path = Path::new(path);
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        info!(path = %path.display(), "recent_worked_cache_start_empty");
-        return BTreeMap::new();
-    };
-    let mut cache = BTreeMap::new();
+fn scan_qso_jsonl(contents: &str, now: SystemTime) -> QsoJsonlScan {
+    let mut sessions = BTreeMap::<QsoHistoryKey, QsoJsonlSessionSummary>::new();
+    let mut active_keys = BTreeMap::<u64, QsoHistoryKey>::new();
+    let mut next_ordinal = 1_u64;
+    let mut recent_worked = BTreeMap::<String, SystemTime>::new();
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -2424,20 +2769,10 @@ fn load_recent_worked_cache(path: &str, now: SystemTime) -> BTreeMap<String, Sys
         if fields.get("message").and_then(|value| value.as_str()) != Some("qso_fsm") {
             continue;
         }
-        if fields.get("event").and_then(|value| value.as_str()) != Some("tx_launch") {
-            continue;
-        }
-        let Some(state_before) = fields.get("state_before").and_then(|value| value.as_str()) else {
+        let Some(session_id) = fields.get("session_id").and_then(|value| value.as_u64()) else {
             continue;
         };
-        if !matches!(state_before, "send_73" | "send_73_once") {
-            continue;
-        }
-        let Some(callsign) = fields
-            .get("partner_call")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-        else {
+        let Some(partner_call) = fields.get("partner_call").and_then(|value| value.as_str()) else {
             continue;
         };
         let Some(timestamp_str) = value.get("timestamp").and_then(|value| value.as_str()) else {
@@ -2446,19 +2781,148 @@ fn load_recent_worked_cache(path: &str, now: SystemTime) -> BTreeMap<String, Sys
         let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp_str) else {
             continue;
         };
-        let worked_at: SystemTime = parsed.with_timezone(&Utc).into();
-        if now.duration_since(worked_at).unwrap_or_default() > RECENT_WORKED_RETENTION {
-            continue;
+        let timestamp: SystemTime = parsed.with_timezone(&Utc).into();
+        let event = fields.get("event").and_then(|value| value.as_str()).unwrap_or_default();
+        let state_before = fields
+            .get("state_before")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let state_after = fields
+            .get("state_after")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let last_rx_event = fields
+            .get("last_rx_event")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let rx_text = fields
+            .get("rx_text")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let tx_text = fields
+            .get("tx_text")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let key = if event == "start" {
+            let key = QsoHistoryKey {
+                session_id,
+                ordinal: next_ordinal,
+            };
+            next_ordinal += 1;
+            active_keys.insert(session_id, key);
+            key
+        } else if let Some(existing) = active_keys.get(&session_id).copied() {
+            existing
+        } else {
+            let key = QsoHistoryKey {
+                session_id,
+                ordinal: next_ordinal,
+            };
+            next_ordinal += 1;
+            active_keys.insert(session_id, key);
+            key
+        };
+        let session = sessions.entry(key).or_insert_with(|| QsoJsonlSessionSummary {
+            partner_call: partner_call.to_string(),
+            ..QsoJsonlSessionSummary::default()
+        });
+        if session.partner_call.is_empty() {
+            session.partner_call = partner_call.to_string();
         }
-        match cache.get(&callsign).copied() {
-            Some(existing) if existing >= worked_at => {}
-            _ => {
-                cache.insert(callsign, worked_at);
+        session.last_seen_at = Some(timestamp);
+        if event == "start" && session.started_at.is_none() {
+            session.started_at = Some(timestamp);
+        }
+        if event == "exit" {
+            session.ended_at = Some(timestamp);
+            session.exit_reason = Some(last_rx_event.to_string());
+            active_keys.remove(&session_id);
+        }
+        if last_rx_event.starts_with("to_us_") {
+            session.got_reply = true;
+        }
+        if matches!(state_before, "send_73" | "send_73_once")
+            || matches!(state_after, "send_73" | "send_73_once")
+        {
+            session.reached_73 = true;
+        }
+        if event == "tx_launch" && matches!(state_before, "send_73" | "send_73_once") {
+            session.reached_73 = true;
+            if now.duration_since(timestamp).unwrap_or_default() <= RECENT_WORKED_RETENTION {
+                match recent_worked.get(partner_call).copied() {
+                    Some(existing) if existing >= timestamp => {}
+                    _ => {
+                        recent_worked.insert(partner_call.to_string(), timestamp);
+                    }
+                }
             }
         }
+        if let Some(info) = extract_exchange_info(tx_text) {
+            push_unique_info(&mut session.sent_infos, info);
+        }
+        if let Some(info) = extract_exchange_info(rx_text) {
+            push_unique_info(&mut session.received_infos, info);
+        }
     }
-    info!(count = cache.len(), "recent_worked_cache_loaded");
-    cache
+
+    let mut session_rows = sessions
+        .into_values()
+        .filter_map(|session| {
+            let time = session.ended_at.or(session.last_seen_at).or(session.started_at)?;
+            Some((time, WebQsoHistoryEntry {
+                time: format_datetime(time),
+                age: format_relative_age(now.duration_since(time).unwrap_or_default()),
+                callsign: session.partner_call,
+                sent_info: if session.sent_infos.is_empty() {
+                    "-".to_string()
+                } else {
+                    session.sent_infos.join(", ")
+                },
+                received_info: if session.received_infos.is_empty() {
+                    "-".to_string()
+                } else {
+                    session.received_infos.join(", ")
+                },
+                got_reply: session.got_reply,
+                reached_73: session.reached_73,
+                exit_reason: session
+                    .exit_reason
+                    .unwrap_or_else(|| "in_progress".to_string()),
+            }))
+        })
+        .collect::<Vec<_>>();
+    session_rows.sort_by(|left, right| right.0.cmp(&left.0));
+    session_rows.truncate(64);
+    let history = session_rows.into_iter().map(|(_, entry)| entry).collect::<Vec<_>>();
+    info!(
+        count = history.len(),
+        recent_worked = recent_worked.len(),
+        "recent_worked_cache_loaded"
+    );
+    QsoJsonlScan {
+        history,
+        recent_worked,
+    }
+}
+
+fn extract_exchange_info(text: &str) -> Option<String> {
+    let mut parts = text.split_whitespace();
+    let _first = parts.next()?;
+    let _second = parts.next()?;
+    let info = parts.next()?.trim().to_uppercase();
+    if info.is_empty() {
+        return None;
+    }
+    if matches!(info.as_str(), "73" | "RR73" | "RRR") {
+        return None;
+    }
+    Some(info)
+}
+
+fn push_unique_info(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
@@ -2484,13 +2948,17 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         Err(error) => Box::new(qso::UnavailableTxBackend::new(error.to_string())),
     };
     let mut qso_controller = QsoController::new(config.clone(), tx_backend);
-    let recent_worked = load_recent_worked_cache(&config.logging.fsm_log_path, SystemTime::now());
-    let mut work_queue =
-        WorkQueueState::new(qso_controller.defaults().tx_freq_default_hz, recent_worked);
+    let mut qso_jsonl_cache = QsoJsonlCache::new(PathBuf::from(&config.logging.fsm_log_path));
+    qso_jsonl_cache.refresh(SystemTime::now());
+    let mut work_queue = WorkQueueState::new(
+        qso_controller.defaults().tx_freq_default_hz,
+        qso_jsonl_cache.recent_worked.clone(),
+    );
     let web_snapshot = Arc::new(Mutex::new(WebSnapshot {
         qso_defaults: qso_controller.defaults(),
         qso: qso_controller.snapshot(SystemTime::now()),
         queue: work_queue.web_snapshot(&StationTracker::default(), SystemTime::now()),
+        qso_history: qso_jsonl_cache.history.clone(),
         ..WebSnapshot::default()
     }));
     let qso_control = Arc::new(QsoControlPlane::default());
@@ -2595,6 +3063,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             display.rig = read_rig_snapshot_shared(&rig);
             last_rig_poll = now;
         }
+        qso_jsonl_cache.refresh(now);
+        work_queue.sync_recent_worked(qso_jsonl_cache.recent_worked.clone());
 
         for command in qso_control.drain() {
             let station_info = match &command {
@@ -2627,6 +3097,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         warn!(tx_freq_hz, "queue_tx_freq_invalid");
                     }
                 }
+                QueueCommand::SetRetryDelay {
+                    retry_delay_seconds,
+                } => work_queue.set_retry_delay(Duration::from_secs(retry_delay_seconds)),
             }
         }
         for command in rig_control.drain() {
@@ -2879,6 +3352,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             &qso_controller.snapshot(SystemTime::now()),
             &qso_controller.defaults(),
             &work_queue.web_snapshot(&station_tracker, SystemTime::now()),
+            &qso_jsonl_cache.history,
+            &config.station.our_call,
             tune_active.load(Ordering::Relaxed),
         );
         render(&display);
@@ -2900,6 +3375,8 @@ fn refresh_web_snapshot(
     qso_snapshot: &WebQsoSnapshot,
     qso_defaults: &WebQsoDefaults,
     queue_snapshot: &WebQueueSnapshot,
+    qso_history: &[WebQsoHistoryEntry],
+    our_call: &str,
     tune_active: bool,
 ) {
     let now = SystemTime::now();
@@ -2934,6 +3411,7 @@ fn refresh_web_snapshot(
         let now_utc: DateTime<Utc> = now.into();
         now_utc.format("%Y-%m-%d %H:%M:%S UTC").to_string()
     };
+    guard.our_call = our_call.to_string();
     guard.rig_frequency_hz = display.rig.as_ref().map(|state| state.frequency_hz);
     guard.rig_mode = display
         .rig
@@ -2994,9 +3472,11 @@ fn refresh_web_snapshot(
     };
     guard.stations = station_tracker.web_station_summaries();
     guard.station_logs = station_tracker.web_logs();
+    guard.direct_calls = station_tracker.web_direct_calls(our_call);
     guard.qso = qso_snapshot.clone();
     guard.qso_defaults = qso_defaults.clone();
     guard.queue = queue_snapshot.clone();
+    guard.qso_history = qso_history.to_vec();
 }
 
 fn run_oneshot(cli: Cli) -> Result<(), AppError> {
@@ -4329,6 +4809,21 @@ impl StationTracker {
             })
             .collect()
     }
+
+    fn web_direct_calls(&self, our_call: &str) -> Vec<WebDirectCallLog> {
+        self.logs
+            .iter()
+            .filter(|entry| entry.peer.as_ref().map(|peer| self.peer_display(peer)) == Some(our_call.to_string()))
+            .map(|entry| WebDirectCallLog {
+                timestamp: format_time(entry.received_at),
+                sender_call: entry.sender_call.clone(),
+                snr_db: entry.snr_db,
+                dt_seconds: entry.dt_seconds,
+                freq_hz: entry.freq_hz,
+                text: entry.text.clone(),
+            })
+            .collect()
+    }
 }
 
 fn qso_peer_from_first_field(
@@ -4425,6 +4920,30 @@ fn station_message_kind(message: &StructuredMessage) -> StationLastMessageKind {
 fn format_time(time: SystemTime) -> String {
     let utc: DateTime<Utc> = time.into();
     utc.format("%H:%M:%S").to_string()
+}
+
+fn format_datetime(time: SystemTime) -> String {
+    let utc: DateTime<Utc> = time.into();
+    utc.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn format_relative_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds < 90 {
+        format!("{} secs ago", seconds.max(1))
+    } else if seconds < 90 * 60 {
+        format!("{} mins ago", ((seconds as f64) / 60.0).round() as u64)
+    } else if seconds < 36 * 60 * 60 {
+        format!(
+            "{} hours ago",
+            ((seconds as f64) / 3600.0).round() as u64
+        )
+    } else {
+        format!(
+            "{} days ago",
+            ((seconds as f64) / 86400.0).round() as u64
+        )
+    }
 }
 
 fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {
@@ -4777,7 +5296,7 @@ mod tests {
         let entry = queue.entries.front().expect("requeued entry");
         assert_eq!(entry.callsign, "K1ABC");
         assert_eq!(entry.queued_at, now);
-        assert_eq!(entry.ok_to_schedule_after, now + QUEUE_RETRY_DELAY);
+        assert_eq!(entry.ok_to_schedule_after, now + DEFAULT_QUEUE_RETRY_DELAY);
     }
 
     #[test]
@@ -4788,5 +5307,20 @@ mod tests {
         let added = queue.add_station("K1ABC", now, now);
         assert!(added.is_err());
         assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn qso_jsonl_scan_does_not_merge_reused_session_ids() {
+        let contents = r#"{"timestamp":"2026-04-03T02:26:37Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":2,"partner_call":"W0ONN","state_before":"idle","state_after":"send_grid","last_rx_event":"start","rx_text":"","tx_text":""}}
+{"timestamp":"2026-04-03T02:30:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":2,"partner_call":"W0ONN","state_before":"send_grid","state_after":"idle","last_rx_event":"send_grid_no_msg_limit","rx_text":"","tx_text":""}}
+{"timestamp":"2026-04-04T01:24:12Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":2,"partner_call":"K4SYT","state_before":"idle","state_after":"send_grid","last_rx_event":"start","rx_text":"","tx_text":""}}
+{"timestamp":"2026-04-04T01:26:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":2,"partner_call":"K4SYT","state_before":"send_73","state_after":"send_73","last_rx_event":"to_us_reply_rr73","rx_text":"","tx_text":"K4SYT N1VF 73"}}
+{"timestamp":"2026-04-04T01:27:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":2,"partner_call":"K4SYT","state_before":"send_73","state_after":"idle","last_rx_event":"send_73_no_msg_limit","rx_text":"","tx_text":""}}"#;
+        let scan = scan_qso_jsonl(contents, UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60));
+        assert_eq!(scan.history.len(), 2);
+        assert_eq!(scan.history[0].callsign, "K4SYT");
+        assert_eq!(scan.history[1].callsign, "W0ONN");
+        assert!(scan.history[0].reached_73);
+        assert!(!scan.history[1].reached_73);
     }
 }
