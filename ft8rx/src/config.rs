@@ -35,6 +35,7 @@ pub struct QueueConfig {
     pub ignore_direct_calls_from_recently_worked_default: bool,
     pub cq_enabled_default: bool,
     pub cq_percent_default: u8,
+    pub use_compound_rr73_handoff_default: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
