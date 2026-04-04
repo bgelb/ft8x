@@ -6576,6 +6576,7 @@ fn maybe_track_priority_directs(
 ) {
     if work_queue.auto_add_direct_calls {
         let active_partner = qso_controller.active_partner_call();
+        let reserved_compound_next = qso_controller.reserved_compound_next_call();
         for decode in decodes {
             let Some(observation) =
                 direct_call_observation_from_decode(decode, our_call, slot_start)
@@ -6583,6 +6584,9 @@ fn maybe_track_priority_directs(
                 continue;
             };
             if active_partner.as_deref() == Some(observation.callsign.as_str()) {
+                continue;
+            }
+            if reserved_compound_next.as_deref() == Some(observation.callsign.as_str()) {
                 continue;
             }
             if let Err(message) = work_queue.add_direct_observation(observation, slot_start) {
@@ -6647,6 +6651,15 @@ fn maybe_arm_compound_handoff_from_queue(
     let Some(candidate) = work_queue.peek_compound_handoff_candidate(now) else {
         return;
     };
+    if qso_controller.active_partner_call().as_deref() == Some(candidate.callsign.as_str()) {
+        work_queue.remove_station(&candidate.callsign, "compound_handoff_invalid_self_target");
+        warn!(
+            finished_call = qso_controller.active_partner_call().unwrap_or_default(),
+            next_call = candidate.callsign,
+            "qso_compound_handoff_invalid_self_target"
+        );
+        return;
+    }
     let Some(station_info) = station_info_from_dispatch(tracker, &candidate.kind) else {
         return;
     };
@@ -6909,6 +6922,7 @@ mod tests {
         FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds, StationConfig,
         TxConfig,
     };
+    use crate::qso::{SlotFamily, TxBackend};
 
     fn sample_app_config() -> AppConfig {
         AppConfig {
@@ -7037,6 +7051,25 @@ mod tests {
             candidate_score: 0.0,
             ldpc_iterations: 0,
             message,
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopTxBackend;
+
+    impl TxBackend for NoopTxBackend {
+        fn start(&mut self, _request: qso::TxRequest) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn abort(&mut self) {}
+
+        fn poll_event(&mut self) -> Option<qso::TxEvent> {
+            None
+        }
+
+        fn is_active(&self) -> bool {
+            false
         }
     }
 
@@ -7211,6 +7244,107 @@ mod tests {
                 .peek_compound_handoff_candidate(now + Duration::from_secs(1))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn reserved_compound_next_call_is_not_readded_to_queue() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let mut controller = qso::QsoController::new(config.clone(), Box::new(NoopTxBackend));
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+
+        controller.handle_command(
+            qso::QsoCommand::Start {
+                partner_call: "OLD1".to_string(),
+                tx_freq_hz: 900.0,
+                initial_state: QsoState::SendSig,
+                start_mode: qso::QsoStartMode::Direct,
+                tx_slot_family_override: Some(SlotFamily::Even),
+            },
+            Some(qso::StationStartInfo {
+                callsign: "OLD1".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -5,
+                last_text: None,
+                last_structured_json: None,
+            }),
+            now,
+        );
+        controller.on_full_decode(
+            rx_slot_start,
+            &[DecodedMessage {
+                utc: "00:00:00".to_string(),
+                snr_db: -10,
+                dt_seconds: 0.1,
+                freq_hz: 1000.0,
+                text: StructuredMessage::Standard {
+                    i3: 0,
+                    first: standard_call("N1VF"),
+                    second: standard_call("OLD1"),
+                    acknowledge: true,
+                    info: StructuredInfoField {
+                        raw: 0,
+                        value: StructuredInfoValue::Blank,
+                    },
+                }
+                .to_text(),
+                candidate_score: 0.0,
+                ldpc_iterations: 0,
+                message: StructuredMessage::Standard {
+                    i3: 0,
+                    first: standard_call("N1VF"),
+                    second: standard_call("OLD1"),
+                    acknowledge: true,
+                    info: StructuredInfoField {
+                        raw: 0,
+                        value: StructuredInfoValue::Blank,
+                    },
+                },
+            }],
+            rx_slot_start + Duration::from_secs(15),
+        );
+        assert!(controller.maybe_arm_compound_handoff(
+            rx_slot_start,
+            qso::CompoundHandoffPlan {
+                next_station: qso::StationStartInfo {
+                    callsign: "NEW1".to_string(),
+                    last_heard_at: rx_slot_start,
+                    last_heard_slot_family: SlotFamily::Odd,
+                    last_snr_db: -7,
+                    last_text: Some("N1VF NEW1 FN20".to_string()),
+                    last_structured_json: Some("{}".to_string()),
+                },
+            },
+            rx_slot_start + Duration::from_secs(15),
+        ));
+        assert_eq!(controller.reserved_compound_next_call().as_deref(), Some("NEW1"));
+
+        let decode = DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -7,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: "N1VF NEW1 FN20".to_string(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message: StructuredMessage::Standard {
+                i3: 0,
+                first: standard_call("N1VF"),
+                second: standard_call("NEW1"),
+                acknowledge: false,
+                info: grid_info("FN20"),
+            },
+        };
+        maybe_track_priority_directs(
+            &mut queue,
+            &mut controller,
+            &[decode],
+            "N1VF",
+            rx_slot_start,
+        );
+        assert!(queue.entries.is_empty());
     }
 
     #[test]

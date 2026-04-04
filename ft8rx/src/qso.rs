@@ -928,6 +928,13 @@ impl QsoController {
             .map(|session| session.partner_call.clone())
     }
 
+    pub fn reserved_compound_next_call(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.pending_compound_handoff.as_ref())
+            .map(|handoff| handoff.next_station.callsign.clone())
+    }
+
     pub fn maybe_arm_compound_handoff(
         &mut self,
         slot_start: SystemTime,
@@ -946,6 +953,17 @@ impl QsoController {
                 Some(PendingAction::Transition(QsoState::SendRR73))
             );
         if !rr73_pending || session.pending_compound_handoff.is_some() {
+            return false;
+        }
+        if session
+            .partner_call
+            .eq_ignore_ascii_case(&plan.next_station.callsign)
+        {
+            warn!(
+                finished_call = %session.partner_call,
+                next_call = %plan.next_station.callsign,
+                "qso_compound_handoff_rejected_self_target"
+            );
             return false;
         }
         let report_db = clamp_report_db(plan.next_station.last_snr_db);
@@ -2987,6 +3005,34 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].partner_call, "K1ABC");
         assert!(outcomes[0].sent_terminal_73);
+    }
+
+    #[test]
+    fn compound_rr73_handoff_rejects_self_target() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            start_command("K1ABC", 1225.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        controller.session.as_mut().expect("session").state = QsoState::SendSig;
+        controller.on_full_decode(
+            rx_slot_start,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::Ack)],
+            rx_slot_start + Duration::from_secs(15),
+        );
+        assert_eq!(controller.snapshot(now).state, "send_rr73");
+        assert!(!controller.maybe_arm_compound_handoff(
+            rx_slot_start,
+            CompoundHandoffPlan {
+                next_station: station_start_info("K1ABC", rx_slot_start, SlotFamily::Odd),
+            },
+            rx_slot_start + Duration::from_secs(15),
+        ));
+        assert!(controller.reserved_compound_next_call().is_none());
     }
 
     #[test]
