@@ -361,7 +361,7 @@ impl QsoController {
                 } => {
                     session.no_fwd_count += 1;
                     if session.no_fwd_count >= self.config.fsm.send_grid.no_fwd {
-                        next_state = QsoState::Send73Once;
+                        exit_reason = Some("send_grid_no_fwd_limit");
                     }
                 }
                 _ => {
@@ -397,10 +397,14 @@ impl QsoController {
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Other,
                     ..
+                }
+                | PartnerEvent::ToUs {
+                    event: ToUsEvent::ReportLike,
+                    ..
                 } => {
                     session.no_fwd_count += 1;
                     if session.no_fwd_count >= self.config.fsm.send_sig.no_fwd {
-                        next_state = QsoState::Send73Once;
+                        exit_reason = Some("send_sig_no_fwd_limit");
                     }
                 }
                 _ => {
@@ -425,6 +429,10 @@ impl QsoController {
                 } => next_state = QsoState::Send73,
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Other,
+                    ..
+                }
+                | PartnerEvent::ToUs {
+                    event: ToUsEvent::ReportLike,
                     ..
                 } => {
                     session.no_fwd_count += 1;
@@ -2566,6 +2574,8 @@ mod tests {
                 cq_enabled_default: false,
                 cq_percent_default: 80,
                 use_compound_rr73_handoff_default: true,
+                no_message_retry_delay_seconds_default: 35,
+                no_forward_retry_delay_seconds_default: 300,
             },
             fsm: FsmConfig {
                 rr73_enabled: true,
@@ -3184,6 +3194,68 @@ mod tests {
         let snapshot = controller.snapshot(now);
         assert_eq!(snapshot.state, "send_grid");
         assert_eq!(snapshot.no_msg_count, 1);
+    }
+
+    #[test]
+    fn send_sig_report_like_counts_as_no_fwd() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
+            }),
+            now,
+        );
+        controller.session.as_mut().expect("session").state = QsoState::SendSig;
+        controller.on_decode_stage(
+            rx_slot_start,
+            DecodeStage::Early41,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::ReportLike)],
+            rx_slot_start + Duration::from_secs(11),
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_sig");
+        assert_eq!(snapshot.no_msg_count, 0);
+        assert_eq!(snapshot.no_fwd_count, 1);
+    }
+
+    #[test]
+    fn send_sig_ack_report_like_counts_as_no_fwd() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
+            }),
+            now,
+        );
+        controller.session.as_mut().expect("session").state = QsoState::SendSigAck;
+        controller.on_decode_stage(
+            rx_slot_start,
+            DecodeStage::Early41,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::ReportLike)],
+            rx_slot_start + Duration::from_secs(11),
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_sig_ack");
+        assert_eq!(snapshot.no_msg_count, 0);
+        assert_eq!(snapshot.no_fwd_count, 1);
     }
 
     #[test]

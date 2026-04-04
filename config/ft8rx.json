@@ -17,7 +17,9 @@
     "ignore_direct_calls_from_recently_worked_default": true,
     "cq_enabled_default": false,
     "cq_percent_default": 80,
-    "use_compound_rr73_handoff_default": true
+    "use_compound_rr73_handoff_default": true,
+    "no_message_retry_delay_seconds_default": 35,
+    "no_forward_retry_delay_seconds_default": 300
   },
   "fsm": {
     "rr73_enabled": true,
