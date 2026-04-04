@@ -56,7 +56,8 @@ const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
 const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
-const DEFAULT_QUEUE_RETRY_DELAY: Duration = Duration::from_secs(35);
+const DEFAULT_QUEUE_NO_MSG_RETRY_DELAY: Duration = Duration::from_secs(35);
+const DEFAULT_QUEUE_NO_FWD_RETRY_DELAY: Duration = Duration::from_secs(300);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const CONFIG_DEFAULT: &str = "config/ft8rx.json";
 
@@ -229,6 +230,7 @@ enum QueueCommand {
         tx_freq_hz: f32,
     },
     SetRetryDelay {
+        kind: QueueRetryDelayKind,
         retry_delay_seconds: u64,
     },
     SetAutoAddDirect {
@@ -436,7 +438,23 @@ struct QueueTxFreqRequest {
 
 #[derive(Debug, Deserialize)]
 struct QueueRetryDelayRequest {
+    kind: String,
     retry_delay_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QueueRetryDelayKind {
+    NoMessage,
+    NoForward,
+}
+
+impl QueueRetryDelayKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            QueueRetryDelayKind::NoMessage => "no_message",
+            QueueRetryDelayKind::NoForward => "no_forward",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,7 +479,8 @@ struct WebQueueSnapshot {
     next_cq_parity_flipped: bool,
     even_tx_freq_hz: f32,
     odd_tx_freq_hz: f32,
-    retry_delay_seconds: u64,
+    no_message_retry_delay_seconds: u64,
+    no_forward_retry_delay_seconds: u64,
     scheduler_status: String,
     entries: Vec<WebQueueEntry>,
 }
@@ -569,7 +588,8 @@ struct WorkQueueState {
     next_cq_parity_flipped: bool,
     even_tx_freq_hz: f32,
     odd_tx_freq_hz: f32,
-    retry_delay: Duration,
+    no_message_retry_delay: Duration,
+    no_forward_retry_delay: Duration,
     entries: VecDeque<WorkQueueEntry>,
     recent_worked: BTreeMap<String, SystemTime>,
     scheduler_status: String,
@@ -724,7 +744,12 @@ impl WorkQueueState {
             next_cq_parity_flipped: false,
             even_tx_freq_hz: tx_freq_hz,
             odd_tx_freq_hz: tx_freq_hz,
-            retry_delay: DEFAULT_QUEUE_RETRY_DELAY,
+            no_message_retry_delay: Duration::from_secs(
+                config.queue.no_message_retry_delay_seconds_default,
+            ),
+            no_forward_retry_delay: Duration::from_secs(
+                config.queue.no_forward_retry_delay_seconds_default,
+            ),
             entries: VecDeque::new(),
             recent_worked,
             scheduler_status: "auto disabled".to_string(),
@@ -990,9 +1015,13 @@ impl WorkQueueState {
         }
     }
 
-    fn set_retry_delay(&mut self, retry_delay: Duration) {
-        self.retry_delay = retry_delay;
+    fn set_retry_delay(&mut self, kind: QueueRetryDelayKind, retry_delay: Duration) {
+        match kind {
+            QueueRetryDelayKind::NoMessage => self.no_message_retry_delay = retry_delay,
+            QueueRetryDelayKind::NoForward => self.no_forward_retry_delay = retry_delay,
+        }
         info!(
+            kind = kind.as_str(),
             retry_delay_seconds = retry_delay.as_secs(),
             "queue_retry_delay_changed"
         );
@@ -1046,7 +1075,7 @@ impl WorkQueueState {
                 self.entries.push_back(WorkQueueEntry {
                     callsign: outcome.partner_call.clone(),
                     queued_at: outcome.finished_at,
-                    ok_to_schedule_after: outcome.finished_at + self.retry_delay,
+                    ok_to_schedule_after: outcome.finished_at + self.no_message_retry_delay,
                     last_observed_at,
                     direct_pending: false,
                     direct_count: 0,
@@ -1061,9 +1090,38 @@ impl WorkQueueState {
                 });
                 info!(
                     callsign = outcome.partner_call,
-                    ok_to_schedule_after = %format_time(outcome.finished_at + self.retry_delay),
+                    ok_to_schedule_after = %format_time(outcome.finished_at + self.no_message_retry_delay),
                     exit_reason = outcome.exit_reason,
                     "queue_requeue_after_no_msg"
+                );
+            }
+            "send_grid_no_fwd_limit" | "send_sig_no_fwd_limit" => {
+                self.remove_station(&outcome.partner_call, "requeue_replace");
+                let last_observed_at = tracker
+                    .start_info(&outcome.partner_call)
+                    .map(|info| info.last_heard_at)
+                    .unwrap_or(outcome.finished_at);
+                self.entries.push_back(WorkQueueEntry {
+                    callsign: outcome.partner_call.clone(),
+                    queued_at: outcome.finished_at,
+                    ok_to_schedule_after: outcome.finished_at + self.no_forward_retry_delay,
+                    last_observed_at,
+                    direct_pending: false,
+                    direct_count: 0,
+                    last_direct_at: None,
+                    last_direct_slot_index: None,
+                    last_direct_slot_family: None,
+                    last_direct_snr_db: None,
+                    direct_start_state: None,
+                    direct_compound_eligible: false,
+                    last_direct_text: None,
+                    last_direct_structured_json: None,
+                });
+                info!(
+                    callsign = outcome.partner_call,
+                    ok_to_schedule_after = %format_time(outcome.finished_at + self.no_forward_retry_delay),
+                    exit_reason = outcome.exit_reason,
+                    "queue_requeue_after_no_fwd"
                 );
             }
             _ => {
@@ -1195,7 +1253,8 @@ impl WorkQueueState {
             next_cq_parity_flipped: self.next_cq_parity_flipped,
             even_tx_freq_hz: self.even_tx_freq_hz,
             odd_tx_freq_hz: self.odd_tx_freq_hz,
-            retry_delay_seconds: self.retry_delay.as_secs(),
+            no_message_retry_delay_seconds: self.no_message_retry_delay.as_secs(),
+            no_forward_retry_delay_seconds: self.no_forward_retry_delay.as_secs(),
             scheduler_status: self.scheduler_status.clone(),
             entries,
         }
@@ -2326,8 +2385,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="label">Queue Controls</div>
           <div class="control-inline">
             <div class="input-wrap">
-              <div class="label">Retry Delay</div>
-              <input id="queue-retry-delay" class="control-input" type="number" min="1" max="3600" step="1">
+              <div class="label">No Message Retry Delay</div>
+              <input id="queue-no-message-retry-delay" class="control-input" type="number" min="1" max="3600" step="1">
+            </div>
+            <div class="input-wrap">
+              <div class="label">No Fwd Retry Delay</div>
+              <input id="queue-no-forward-retry-delay" class="control-input" type="number" min="1" max="3600" step="1">
             </div>
             <div class="input-wrap">
               <div class="label">CQ %</div>
@@ -2668,8 +2731,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/queue/tx-freq', { slot_family: txParity, tx_freq_hz: txFreqHz });
       scheduleRefresh(10);
     }
-    async function updateQueueRetryDelay(seconds) {
-      await postJson('/api/queue/retry-delay', { retry_delay_seconds: seconds });
+    async function updateQueueRetryDelay(kind, seconds) {
+      await postJson('/api/queue/retry-delay', { kind, retry_delay_seconds: seconds });
       scheduleRefresh(10);
     }
     async function removeQueuedCall(callsign) {
@@ -3015,7 +3078,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const queue = data.queue || {};
       const count = document.getElementById('queue-count');
       const status = document.getElementById('queue-status');
-      const retryDelay = document.getElementById('queue-retry-delay');
+      const noMessageRetryDelay = document.getElementById('queue-no-message-retry-delay');
+      const noForwardRetryDelay = document.getElementById('queue-no-forward-retry-delay');
       const autoAddDirect = document.getElementById('queue-auto-add-direct');
       const ignoreDirectWorked = document.getElementById('queue-ignore-direct-worked');
       const cqEnabled = document.getElementById('queue-cq-enabled');
@@ -3033,8 +3097,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
       compoundRr73.checked = !!queue.use_compound_rr73_handoff;
       cqPercent.value = String(queue.cq_percent ?? 80);
       nextCqParity.textContent = queue.next_cq_parity_flipped ? 'Next CQ Parity Flipped' : 'Flip Next CQ Parity';
-      if (retryDelay.value === '' || Number(retryDelay.value) !== Number(queue.retry_delay_seconds)) {
-        retryDelay.value = String(queue.retry_delay_seconds ?? 35);
+      if (
+        noMessageRetryDelay.value === ''
+        || Number(noMessageRetryDelay.value) !== Number(queue.no_message_retry_delay_seconds)
+      ) {
+        noMessageRetryDelay.value = String(queue.no_message_retry_delay_seconds ?? 35);
+      }
+      if (
+        noForwardRetryDelay.value === ''
+        || Number(noForwardRetryDelay.value) !== Number(queue.no_forward_retry_delay_seconds)
+      ) {
+        noForwardRetryDelay.value = String(queue.no_forward_retry_delay_seconds ?? 300);
       }
       list.innerHTML = `
         <div class="queue-item queue-head">
@@ -3277,13 +3350,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       updateQueueTxFreq('odd', value).catch((error) => console.error(error));
     });
-    document.getElementById('queue-retry-delay').addEventListener('change', (event) => {
+    document.getElementById('queue-no-message-retry-delay').addEventListener('change', (event) => {
       const value = Number(event.currentTarget.value);
       if (!Number.isFinite(value) || value < 1 || value > 3600) {
         if (lastSnapshot) renderQueue(lastSnapshot);
         return;
       }
-      updateQueueRetryDelay(Math.round(value)).catch((error) => console.error(error));
+      updateQueueRetryDelay('no_message', Math.round(value)).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-no-forward-retry-delay').addEventListener('change', (event) => {
+      const value = Number(event.currentTarget.value);
+      if (!Number.isFinite(value) || value < 1 || value > 3600) {
+        if (lastSnapshot) renderQueue(lastSnapshot);
+        return;
+      }
+      updateQueueRetryDelay('no_forward', Math.round(value)).catch((error) => console.error(error));
     });
     document.getElementById('queue-clear').addEventListener('click', () => {
       clearQueue().catch((error) => console.error(error));
@@ -3661,14 +3742,28 @@ async fn api_queue_retry_delay_handler(
             }),
         );
     }
+    let kind = match request.kind.as_str() {
+        "no_message" => QueueRetryDelayKind::NoMessage,
+        "no_forward" => QueueRetryDelayKind::NoForward,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiStatus {
+                    ok: false,
+                    message: "kind must be 'no_message' or 'no_forward'".to_string(),
+                }),
+            );
+        }
+    };
     state.queue_control.enqueue(QueueCommand::SetRetryDelay {
+        kind,
         retry_delay_seconds: request.retry_delay_seconds,
     });
     (
         StatusCode::ACCEPTED,
         Json(ApiStatus {
             ok: true,
-            message: "queue retry delay updated".to_string(),
+            message: format!("queue {} retry delay updated", kind.as_str()),
         }),
     )
 }
@@ -3691,9 +3786,8 @@ async fn api_rig_config_handler(
             }),
         );
     }
-    let tx_active = snapshot.qso.tx_active
-        || snapshot.rig_tune_active
-        || snapshot.rig_is_tx == Some(true);
+    let tx_active =
+        snapshot.qso.tx_active || snapshot.rig_tune_active || snapshot.rig_is_tx == Some(true);
     if tx_active {
         return (
             StatusCode::CONFLICT,
@@ -4313,8 +4407,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     }
                 }
                 QueueCommand::SetRetryDelay {
+                    kind,
                     retry_delay_seconds,
-                } => work_queue.set_retry_delay(Duration::from_secs(retry_delay_seconds)),
+                } => work_queue.set_retry_delay(kind, Duration::from_secs(retry_delay_seconds)),
                 QueueCommand::SetAutoAddDirect { enabled } => {
                     work_queue.set_auto_add_direct_calls(enabled)
                 }
@@ -6988,6 +7083,8 @@ mod tests {
                 cq_enabled_default: false,
                 cq_percent_default: 80,
                 use_compound_rr73_handoff_default: true,
+                no_message_retry_delay_seconds_default: 35,
+                no_forward_retry_delay_seconds_default: 300,
             },
             fsm: FsmConfig {
                 rr73_enabled: true,
@@ -7412,7 +7509,35 @@ mod tests {
         let entry = queue.entries.front().expect("requeued entry");
         assert_eq!(entry.callsign, "K1ABC");
         assert_eq!(entry.queued_at, now);
-        assert_eq!(entry.ok_to_schedule_after, now + DEFAULT_QUEUE_RETRY_DELAY);
+        assert_eq!(
+            entry.ok_to_schedule_after,
+            now + DEFAULT_QUEUE_NO_MSG_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn queue_requeue_after_no_fwd_uses_no_fwd_retry_delay() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let mut tracker = StationTracker::default();
+        tracker.ingest_decode(now, &cq_decode("K1ABC"));
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.handle_qso_outcome(
+            &QsoOutcome {
+                partner_call: "K1ABC".to_string(),
+                exit_reason: "send_sig_no_fwd_limit".to_string(),
+                finished_at: now,
+                sent_terminal_73: false,
+            },
+            &tracker,
+        );
+        let entry = queue.entries.front().expect("requeued entry");
+        assert_eq!(entry.callsign, "K1ABC");
+        assert_eq!(entry.queued_at, now);
+        assert_eq!(
+            entry.ok_to_schedule_after,
+            now + DEFAULT_QUEUE_NO_FWD_RETRY_DELAY
+        );
     }
 
     #[test]
