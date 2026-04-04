@@ -1163,6 +1163,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       grid-template-columns: 1fr;
       gap: 16px;
     }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .panel-head .label {
+      margin-bottom: 0;
+    }
     .map-grid {
       display: grid;
       grid-template-columns: repeat(15, minmax(0, 1fr));
@@ -1702,7 +1711,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="label">Direct Calls</div>
         <div class="value" id="direct-count">0 heard</div>
         <div class="detail-block">
-          <div class="label">Messages To Our Call</div>
+          <div class="label">Messages To Or From Our Call</div>
           <div class="activity-list scroll-surface" id="direct-list"></div>
         </div>
       </section>
@@ -1717,11 +1726,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <div class="maps">
       <section class="panel">
-        <div class="label">Even Slots (:00 / :30)</div>
+        <div class="panel-head">
+          <div class="label">Even Slots (:00 / :30)</div>
+          <button id="queue-even-map" class="button secondary" type="button">Add To Queue</button>
+        </div>
         <div id="even-map" class="map-grid"></div>
       </section>
       <section class="panel">
-        <div class="label">Odd Slots (:15 / :45)</div>
+        <div class="panel-head">
+          <div class="label">Odd Slots (:15 / :45)</div>
+          <button id="queue-odd-map" class="button secondary" type="button">Add To Queue</button>
+        </div>
         <div id="odd-map" class="map-grid"></div>
       </section>
     </div>
@@ -1873,6 +1888,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       return best ? best.centerHz : fallback;
     }
+    function eligibleBandmapCallsigns(data, grid) {
+      const queuedCalls = new Set((data.queue?.entries || []).map((entry) => entry.callsign));
+      const calls = [];
+      for (const row of grid || []) {
+        for (const cell of row || []) {
+          for (const entry of cell || []) {
+            if (queuedCalls.has(entry.callsign) || entry.worked_recently) continue;
+            calls.push(entry.callsign);
+          }
+        }
+      }
+      return [...new Set(calls)];
+    }
     async function postJson(url, body) {
       const response = await fetch(url, {
         method: 'POST',
@@ -1926,6 +1954,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function removeQueuedCall(callsign) {
       await postJson('/api/queue/remove', { callsign });
+      scheduleRefresh(10);
+    }
+    async function addBandmapCallsToQueue(slotFamily) {
+      if (!lastSnapshot) return;
+      const grid = slotFamily === 'even' ? lastSnapshot.bandmaps?.even : lastSnapshot.bandmaps?.odd;
+      const callsigns = eligibleBandmapCallsigns(lastSnapshot, grid);
+      if (!callsigns.length) return;
+      const results = await Promise.allSettled(
+        callsigns.map((callsign) => postJson('/api/queue/add', { callsign }))
+      );
+      const failures = results.filter((result) => result.status === 'rejected');
+      if (failures.length) {
+        console.error(`bulk queue add had ${failures.length} failures`, failures);
+      }
       scheduleRefresh(10);
     }
     async function autoPickQuietSpot() {
@@ -2287,8 +2329,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       list.innerHTML = `
         <div class="activity-item activity-head">
           <div class="activity-col">Time</div>
-          <div class="activity-col">De</div>
           <div class="activity-col">To</div>
+          <div class="activity-col">De</div>
           <div class="activity-col">SNR</div>
           <div class="activity-col">dT</div>
           <div class="activity-col">Freq</div>
@@ -2303,8 +2345,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
         row.className = item.is_ours ? 'activity-item direct-sent' : 'activity-item';
         row.innerHTML = `
           <div class="activity-col">${escapeHtml(item.timestamp)}</div>
-          <div class="activity-col">${renderParty(item.from_call, selectedCall)}</div>
-          <div class="activity-col">${renderParty(item.to_call, selectedCall)}</div>
+          <div class="activity-col">${renderCallValue(escapeHtml(item.to_call), item.to_call)}</div>
+          <div class="activity-col">${renderCallValue(escapeHtml(item.from_call), item.from_call)}</div>
           <div class="activity-col">${item.snr_db == null ? '-' : item.snr_db}</div>
           <div class="activity-col">${item.dt_seconds == null ? '-' : item.dt_seconds.toFixed(2)}</div>
           <div class="activity-col">${item.freq_hz == null ? '-' : Math.round(item.freq_hz)}</div>
@@ -2341,7 +2383,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         row.innerHTML = `
           <div class="history-cell muted">${escapeHtml(entry.time)}</div>
           <div class="history-cell muted">${escapeHtml(entry.age)}</div>
-          <div class="history-cell">${escapeHtml(entry.callsign)}</div>
+          <div class="history-cell">${renderCallValue(escapeHtml(entry.callsign), entry.callsign)}</div>
           <div class="history-cell muted">${entry.got_reply ? 'Y' : '-'}</div>
           <div class="history-cell muted">${entry.reached_73 ? 'Y' : '-'}</div>
           <div class="history-cell">${escapeHtml(entry.sent_info)}</div>
@@ -2386,6 +2428,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderWaterfall(data.waterfall);
       renderBandMap('even-map', data.bandmaps.even);
       renderBandMap('odd-map', data.bandmaps.odd);
+      document.getElementById('queue-even-map').disabled = eligibleBandmapCallsigns(data, data.bandmaps?.even).length === 0;
+      document.getElementById('queue-odd-map').disabled = eligibleBandmapCallsigns(data, data.bandmaps?.odd).length === 0;
       renderDecodes(data.decodes);
       renderRigControls(data);
       renderDetail(data);
@@ -2475,6 +2519,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
         return;
       }
       updateQueueRetryDelay(Math.round(value)).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-even-map').addEventListener('click', () => {
+      addBandmapCallsToQueue('even').catch((error) => console.error(error));
+    });
+    document.getElementById('queue-odd-map').addEventListener('click', () => {
+      addBandmapCallsToQueue('odd').catch((error) => console.error(error));
     });
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && lastSnapshot?.qso && (lastSnapshot.qso.active || lastSnapshot.qso.tx_active)) {
