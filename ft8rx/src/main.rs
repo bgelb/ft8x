@@ -49,8 +49,9 @@ const WATERFALL_HISTORY_ROWS: usize = 180;
 const WATERFALL_SAMPLES: usize = 4096;
 const WATERFALL_UPDATE_MS: u64 = 200;
 const WEB_BIND_DEFAULT: &str = "127.0.0.1:8000";
-const BANDMAP_COLUMNS: usize = 15;
-const BANDMAP_ROWS: usize = 4;
+const BANDMAP_CELL_HZ: f32 = 400.0;
+const BANDMAP_COLUMNS: usize = 10;
+const BANDMAP_ROWS: usize = 1;
 const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
 const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
@@ -1188,12 +1189,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .map-grid {
       display: grid;
-      grid-template-columns: repeat(15, minmax(0, 1fr));
+      grid-template-columns: repeat(10, minmax(0, 1fr));
       gap: 6px;
       margin-top: 10px;
     }
     .cell {
-      min-height: 74px;
+      min-height: 314px;
       background: linear-gradient(180deg, rgba(19, 40, 56, 0.95), rgba(10, 23, 34, 0.95));
       border: 1px solid rgba(143, 176, 192, 0.12);
       border-radius: 8px;
@@ -1898,8 +1899,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       let best = null;
       for (let row = 0; row < grid.length; row++) {
         for (let col = 0; col < grid[row].length; col++) {
-          const startHz = col * 200 + row * 50;
-          const centerHz = startHz + 25;
+          const startHz = col * 400 + row * 400;
+          const centerHz = startHz + 200;
           if (centerHz < min || centerHz > max) continue;
           const entries = grid[row][col] || [];
           const occupancy = entries.length;
@@ -2112,12 +2113,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       root.innerHTML = '';
       for (let row = 0; row < grid.length; row++) {
         for (let col = 0; col < grid[row].length; col++) {
-          const startHz = col * 200 + row * 50;
+          const startHz = col * 400 + row * 400;
           const cell = document.createElement('div');
           cell.className = 'cell';
           const title = document.createElement('div');
           title.className = 'cell-title';
-          title.textContent = `${startHz}-${startHz + 49} Hz`;
+          title.textContent = `${startHz}-${startHz + 399} Hz`;
           cell.appendChild(title);
           const entries = grid[row][col] || [];
           for (const entry of entries) {
@@ -5357,8 +5358,8 @@ fn build_bandmap_grid(
         if !(0.0..WATERFALL_MAX_HZ).contains(&entry.freq_hz) {
             continue;
         }
-        let column = (entry.freq_hz / 200.0).floor() as usize;
-        let row = ((entry.freq_hz % 200.0) / 50.0).floor() as usize;
+        let column = (entry.freq_hz / BANDMAP_CELL_HZ).floor() as usize;
+        let row = 0usize;
         if row < BANDMAP_ROWS && column < BANDMAP_COLUMNS {
             cells[row][column].push((
                 entry.freq_hz,
