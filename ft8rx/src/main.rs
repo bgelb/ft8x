@@ -1804,9 +1804,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .queue-panel,
     .qso-panel {
-      height: 540px;
-    }
-    .qso-panel {
       height: 760px;
     }
     .direct-panel,
@@ -1820,6 +1817,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 0;
     }
     .detail-panel .detail-block:last-child {
+      flex: 1 1 auto;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .queue-panel .detail-block:last-child,
+    .qso-panel .detail-block:last-child,
+    .direct-panel .detail-block:last-child,
+    .log-panel .detail-block:last-child {
       flex: 1 1 auto;
       display: flex;
       flex-direction: column;
