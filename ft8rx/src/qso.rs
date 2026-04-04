@@ -184,6 +184,8 @@ pub struct QsoController {
     session: Option<ActiveSession>,
     last_snapshot: WebQsoSnapshot,
     pending_outcomes: VecDeque<QsoOutcome>,
+    current_rig_frequency_hz: Option<u64>,
+    current_rig_band: Option<String>,
 }
 
 impl QsoController {
@@ -199,6 +201,17 @@ impl QsoController {
             session: None,
             last_snapshot,
             pending_outcomes: VecDeque::new(),
+            current_rig_frequency_hz: None,
+            current_rig_band: None,
+        }
+    }
+
+    pub fn update_rig_context(&mut self, frequency_hz: Option<u64>, band: Option<String>) {
+        self.current_rig_frequency_hz = frequency_hz;
+        self.current_rig_band = band.clone();
+        if let Some(session) = &mut self.session {
+            session.rig_frequency_hz = frequency_hz;
+            session.rig_band = band;
         }
     }
 
@@ -969,6 +982,8 @@ impl QsoController {
             no_msg_count: 0,
             no_fwd_count: 0,
             partner_rx_count: 0,
+            rig_frequency_hz: self.current_rig_frequency_hz,
+            rig_band: self.current_rig_band.clone(),
             last_rx_event: station_info
                 .as_ref()
                 .and_then(|info| info.last_text.as_ref())
@@ -1116,6 +1131,8 @@ impl QsoController {
             session_id = session.session_id,
             partner_call = %session.partner_call,
             start_mode = %session.start_mode.as_str(),
+            rig_frequency_hz = session.rig_frequency_hz.unwrap_or_default(),
+            rig_band = session.rig_band.clone().unwrap_or_default(),
             tx_slot_family = %session.tx_slot_family.as_str(),
             tx_freq_hz = session.tx_freq_hz,
             state_before = %state_before.as_str(),
@@ -1264,6 +1281,8 @@ struct ActiveSession {
     tx_slot_family: SlotFamily,
     tx_freq_hz: f32,
     latest_partner_snr_db: i32,
+    rig_frequency_hz: Option<u64>,
+    rig_band: Option<String>,
     started_at: SystemTime,
     deadline_at: SystemTime,
     next_tx_slot: Option<SystemTime>,
@@ -2902,6 +2921,8 @@ mod tests {
             tx_slot_family: SlotFamily::Even,
             tx_freq_hz: 1000.0,
             latest_partner_snr_db: -9,
+            rig_frequency_hz: None,
+            rig_band: None,
             started_at: now,
             deadline_at: now + Duration::from_secs(600),
             next_tx_slot: None,

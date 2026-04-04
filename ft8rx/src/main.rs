@@ -3948,6 +3948,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let mut bandmaps = BandMapStore::default();
     let mut dt_frame_history = VecDeque::<Vec<DecodedMessage>>::with_capacity(DT_HISTORY_FRAMES);
     let mut station_tracker = StationTracker::default();
+    qso_controller.update_rig_context(
+        display.rig.as_ref().map(|rig| rig.frequency_hz),
+        display.rig.as_ref().map(|rig| rig.band.to_string()),
+    );
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
@@ -3960,7 +3964,16 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
         let now = SystemTime::now();
         if now.duration_since(last_rig_poll).unwrap_or_default() >= Duration::from_secs(2) {
+            let previous_band = display.rig.as_ref().map(|rig| rig.band.to_string());
             display.rig = read_rig_snapshot_shared(&rig);
+            let current_band = display.rig.as_ref().map(|rig| rig.band.to_string());
+            if previous_band != current_band {
+                clear_bandmaps(&mut bandmaps);
+            }
+            qso_controller.update_rig_context(
+                display.rig.as_ref().map(|rig| rig.frequency_hz),
+                current_band,
+            );
             last_rig_poll = now;
         }
         qso_jsonl_cache.refresh(now);
@@ -4018,7 +4031,16 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     if let Err(error) = apply_rig_config(&rig, band, power_w) {
                         display.decode_status = format!("Rig config failed: {error}");
                     } else {
+                        let previous_band = display.rig.as_ref().map(|rig| rig.band.to_string());
                         display.rig = read_rig_snapshot_shared(&rig);
+                        let current_band = display.rig.as_ref().map(|rig| rig.band.to_string());
+                        if previous_band != current_band {
+                            clear_bandmaps(&mut bandmaps);
+                        }
+                        qso_controller.update_rig_context(
+                            display.rig.as_ref().map(|rig| rig.frequency_hz),
+                            current_band,
+                        );
                         last_rig_poll = now;
                     }
                 }
@@ -6220,6 +6242,11 @@ fn update_bandmaps(store: &mut BandMapStore, slot_start: SystemTime, decodes: &[
             );
         }
     }
+}
+
+fn clear_bandmaps(store: &mut BandMapStore) {
+    store.even.clear();
+    store.odd.clear();
 }
 
 fn prune_bandmap(map: &mut BTreeMap<String, BandMapEntry>, current_slot_index: u64) {
