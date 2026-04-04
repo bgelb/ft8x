@@ -215,6 +215,7 @@ enum RigCommand {
 enum QueueCommand {
     Add { callsign: String },
     Remove { callsign: String },
+    Clear,
     SetAuto { enabled: bool },
     SetTxFreq { tx_freq_hz: f32 },
     SetRetryDelay { retry_delay_seconds: u64 },
@@ -644,6 +645,17 @@ impl WorkQueueState {
         } else {
             false
         }
+    }
+
+    fn clear(&mut self, reason: &str) {
+        let removed = self.entries.len();
+        self.entries.clear();
+        info!(removed, reason, "queue_cleared");
+        self.scheduler_status = if self.auto_enabled {
+            "queue empty".to_string()
+        } else {
+            "auto disabled".to_string()
+        };
     }
 
     fn set_auto_enabled(&mut self, enabled: bool) {
@@ -1260,7 +1272,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .queue-panel,
     .qso-panel {
-      height: 460px;
+      height: 540px;
     }
     .direct-panel,
     .log-panel {
@@ -1357,8 +1369,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .control-row {
       display: grid;
       grid-template-columns: 1fr;
-      gap: 10px;
-      margin-top: 12px;
+      gap: 8px;
+      margin-top: 8px;
     }
     .control-inline {
       display: grid;
@@ -1405,14 +1417,29 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .qso-summary {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px 12px;
-      margin-top: 12px;
+      gap: 6px 12px;
+      margin-top: 8px;
+    }
+    .qso-kv {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 0;
+      font-size: 12px;
+      line-height: 1.3;
+    }
+    .qso-kv .label {
+      margin-bottom: 0;
+      flex: 0 0 auto;
     }
     .qso-status-line {
       color: var(--ink);
-      font-size: 13px;
-      line-height: 1.45;
-      white-space: pre-wrap;
+      font-size: 12px;
+      line-height: 1.3;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
     }
     .qso-transcript {
       margin-top: 0;
@@ -1425,13 +1452,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .qso-entry {
       border: 1px solid rgba(143, 176, 192, 0.1);
       border-radius: 8px;
-      padding: 6px 8px;
+      padding: 4px 6px;
       background: rgba(19, 40, 56, 0.45);
       display: grid;
       grid-template-columns: 62px 42px 82px minmax(0, 1fr);
       gap: 6px;
-      font-size: 12px;
-      line-height: 1.2;
+      font-size: 11px;
+      line-height: 1.15;
     }
     .qso-entry .stamp,
     .qso-entry .dir,
@@ -1663,11 +1690,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="detail-lines" id="queue-status">auto disabled</div>
         </div>
         <div class="detail-block">
-          <div class="label">Retry Delay</div>
+          <div class="label">Queue Controls</div>
           <div class="control-inline">
             <div class="input-wrap">
+              <div class="label">Retry Delay</div>
               <input id="queue-retry-delay" class="control-input" type="number" min="1" max="3600" step="1">
             </div>
+            <button id="queue-clear" class="button secondary" type="button">Clear Queue</button>
           </div>
         </div>
         <div class="detail-block">
@@ -1693,12 +1722,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="hint" id="qso-hint">Auto QSO starts the oldest ready station from the work queue.</div>
         </div>
         <div class="qso-summary">
-          <div><div class="label">State</div><div class="qso-status-line" id="qso-state">idle</div></div>
-          <div><div class="label">Timeout</div><div class="qso-status-line" id="qso-timeout">-</div></div>
-          <div><div class="label">Counters</div><div class="qso-status-line" id="qso-counters">no_msg=0 no_fwd=0</div></div>
-          <div><div class="label">Latest RX</div><div class="qso-status-line" id="qso-last-rx">-</div></div>
-          <div><div class="label">TX Parity</div><div class="qso-status-line" id="qso-parity">-</div></div>
-          <div><div class="label">Signal</div><div class="qso-status-line" id="qso-snr">-</div></div>
+          <div class="qso-kv"><div class="label">State</div><div class="qso-status-line" id="qso-state">idle</div></div>
+          <div class="qso-kv"><div class="label">Timeout</div><div class="qso-status-line" id="qso-timeout">-</div></div>
+          <div class="qso-kv"><div class="label">Counters</div><div class="qso-status-line" id="qso-counters">no_msg=0 no_fwd=0</div></div>
+          <div class="qso-kv"><div class="label">Latest RX</div><div class="qso-status-line" id="qso-last-rx">-</div></div>
+          <div class="qso-kv"><div class="label">TX Parity</div><div class="qso-status-line" id="qso-parity">-</div></div>
+          <div class="qso-kv"><div class="label">Signal</div><div class="qso-status-line" id="qso-snr">-</div></div>
         </div>
         <div class="detail-block">
           <div class="label">Transcript</div>
@@ -1954,6 +1983,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function removeQueuedCall(callsign) {
       await postJson('/api/queue/remove', { callsign });
+      scheduleRefresh(10);
+    }
+    async function clearQueue() {
+      await postJson('/api/queue/clear', {});
       scheduleRefresh(10);
     }
     async function addBandmapCallsToQueue(slotFamily) {
@@ -2276,7 +2309,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       const freqOkay = txFreqValid(data, Number(freqInput.value));
       stop.disabled = !qso.active && !qso.tx_active;
-      autoToggle.disabled = qso.active || qso.tx_active || rigBusy;
+      autoToggle.disabled = !!data.rig_tune_active;
       freqInput.disabled = qso.active || qso.tx_active;
       autoPick.disabled = !candidateStation || !txParity || qso.active || qso.tx_active;
     }
@@ -2285,9 +2318,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const count = document.getElementById('queue-count');
       const status = document.getElementById('queue-status');
       const retryDelay = document.getElementById('queue-retry-delay');
+      const clearButton = document.getElementById('queue-clear');
       const list = document.getElementById('queue-list');
       count.textContent = `${(queue.entries || []).length} queued`;
       status.textContent = queue.scheduler_status || 'auto disabled';
+      clearButton.disabled = !(queue.entries || []).length;
       if (retryDelay.value === '' || Number(retryDelay.value) !== Number(queue.retry_delay_seconds)) {
         retryDelay.value = String(queue.retry_delay_seconds ?? 35);
       }
@@ -2520,6 +2555,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       updateQueueRetryDelay(Math.round(value)).catch((error) => console.error(error));
     });
+    document.getElementById('queue-clear').addEventListener('click', () => {
+      clearQueue().catch((error) => console.error(error));
+    });
     document.getElementById('queue-even-map').addEventListener('click', () => {
       addBandmapCallsToQueue('even').catch((error) => console.error(error));
     });
@@ -2567,6 +2605,7 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route("/api/rig/tune", post(api_rig_tune_handler))
                 .route("/api/queue/add", post(api_queue_add_handler))
                 .route("/api/queue/remove", post(api_queue_remove_handler))
+                .route("/api/queue/clear", post(api_queue_clear_handler))
                 .route("/api/queue/auto", post(api_queue_auto_handler))
                 .route("/api/queue/tx-freq", post(api_queue_tx_freq_handler))
                 .route("/api/queue/retry-delay", post(api_queue_retry_delay_handler))
@@ -2657,6 +2696,17 @@ async fn api_queue_remove_handler(
         Json(ApiStatus {
             ok: true,
             message: "queue remove queued".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_clear_handler(State(state): State<WebAppState>) -> (StatusCode, Json<ApiStatus>) {
+    state.queue_control.enqueue(QueueCommand::Clear);
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue clear queued".to_string(),
         }),
     )
 }
@@ -3268,6 +3318,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 QueueCommand::Remove { callsign } => {
                     work_queue.remove_station(&callsign, "manual_remove");
                 }
+                QueueCommand::Clear => work_queue.clear("manual_clear"),
                 QueueCommand::SetAuto { enabled } => work_queue.set_auto_enabled(enabled),
                 QueueCommand::SetTxFreq { tx_freq_hz } => {
                     if config.validate_tx_freq_hz(tx_freq_hz) {
