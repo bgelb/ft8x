@@ -319,6 +319,7 @@ struct WebBandMapCall {
     callsign: String,
     detail: Option<String>,
     age_slots: u64,
+    worked_recently: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1990,10 +1991,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
             const line = document.createElement('div');
             line.className = 'call';
             const fade = Math.min(1, (entry.age_slots || 0) / 4);
-            const lightness = 72 - fade * 34;
-            const saturation = 88 - fade * 58;
-            line.style.color = `hsl(135 ${saturation}% ${lightness}%)`;
-            const queueButton = queuedCalls.has(entry.callsign)
+            if (entry.worked_recently) {
+              const lightness = 82 - fade * 14;
+              line.style.color = `hsl(0 0% ${lightness}%)`;
+            } else {
+              const lightness = 72 - fade * 34;
+              const saturation = 88 - fade * 58;
+              line.style.color = `hsl(135 ${saturation}% ${lightness}%)`;
+            }
+            const queueButton = queuedCalls.has(entry.callsign) || entry.worked_recently
               ? ''
               : `<span class="queue-tag" data-queue-call="${escapeHtml(entry.callsign)}">Q</span>`;
             line.innerHTML = `
@@ -3416,6 +3422,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             &bandmaps,
             &dt_frame_history,
             &station_tracker,
+            &work_queue,
             &qso_controller.snapshot(SystemTime::now()),
             &qso_controller.defaults(),
             &work_queue.web_snapshot(&station_tracker, SystemTime::now()),
@@ -3440,6 +3447,7 @@ fn refresh_web_snapshot(
     bandmaps: &BandMapStore,
     dt_frame_history: &VecDeque<Vec<DecodedMessage>>,
     station_tracker: &StationTracker,
+    work_queue: &WorkQueueState,
     qso_snapshot: &WebQsoSnapshot,
     qso_defaults: &WebQsoDefaults,
     queue_snapshot: &WebQueueSnapshot,
@@ -3536,8 +3544,8 @@ fn refresh_web_snapshot(
     guard.decodes = decodes;
     guard.waterfall = waterfall_rows.iter().cloned().collect();
     guard.bandmaps = WebBandMaps {
-        even: build_bandmap_grid(&bandmaps.even, current_slot_index),
-        odd: build_bandmap_grid(&bandmaps.odd, current_slot_index),
+        even: build_bandmap_grid(&bandmaps.even, current_slot_index, work_queue, now),
+        odd: build_bandmap_grid(&bandmaps.odd, current_slot_index, work_queue, now),
     };
     guard.stations = station_tracker.web_station_summaries();
     guard.station_logs = station_tracker.web_logs();
@@ -5176,6 +5184,8 @@ fn bandmap_calls_from_decode(decode: &DecodedMessage) -> Vec<(String, Option<Str
 fn build_bandmap_grid(
     map: &BTreeMap<String, BandMapEntry>,
     current_slot_index: u64,
+    work_queue: &WorkQueueState,
+    now: SystemTime,
 ) -> Vec<Vec<Vec<WebBandMapCall>>> {
     let mut cells = vec![vec![Vec::<(f32, WebBandMapCall)>::new(); BANDMAP_COLUMNS]; BANDMAP_ROWS];
     for entry in map.values() {
@@ -5195,6 +5205,7 @@ fn build_bandmap_grid(
                     callsign: entry.callsign.clone(),
                     detail: entry.detail.clone(),
                     age_slots,
+                    worked_recently: work_queue.was_worked_recently(&entry.callsign, now),
                 },
             ));
         }
