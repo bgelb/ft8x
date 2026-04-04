@@ -7,6 +7,7 @@ use crate::AppError;
 pub struct AppConfig {
     pub station: StationConfig,
     pub tx: TxConfig,
+    pub queue: QueueConfig,
     pub fsm: FsmConfig,
     pub logging: LoggingConfig,
 }
@@ -26,6 +27,14 @@ pub struct TxConfig {
     pub power_w: Option<f32>,
     pub tx_freq_min_hz: f32,
     pub tx_freq_max_hz: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueConfig {
+    pub auto_add_direct_calls_default: bool,
+    pub ignore_direct_calls_from_recently_worked_default: bool,
+    pub cq_enabled_default: bool,
+    pub cq_percent_default: u8,
 }
 
 #[derive(Debug, Clone, Deserialize)]

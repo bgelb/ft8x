@@ -59,6 +59,7 @@ pub enum TxDirectedPayload {
 pub enum TxMessage {
     Cq {
         my_call: String,
+        my_grid: Option<String>,
     },
     Directed {
         my_call: String,
@@ -356,12 +357,18 @@ pub fn parse_standard_info(text: &str) -> Result<GridReport, EncodeError> {
 
 fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, String) {
     match message {
-        TxMessage::Cq { my_call } => (
+        TxMessage::Cq { my_call, my_grid } => (
             "CQ".to_string(),
             my_call.clone(),
             false,
-            GridReport::Blank,
-            format!("CQ {}", my_call.trim()),
+            my_grid
+                .as_ref()
+                .map(|grid| GridReport::Grid(grid.trim().to_uppercase()))
+                .unwrap_or(GridReport::Blank),
+            my_grid
+                .as_ref()
+                .map(|grid| format!("CQ {} {}", my_call.trim(), grid.trim().to_uppercase()))
+                .unwrap_or_else(|| format!("CQ {}", my_call.trim())),
         ),
         TxMessage::Directed {
             my_call,

@@ -16,8 +16,8 @@ use ft8_decoder::{
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qso::{
-    QsoCommand, QsoController, QsoOutcome, RigTxBackend, StationStartInfo, WebQsoDefaults,
-    WebQsoSnapshot,
+    QsoCommand, QsoController, QsoOutcome, QsoStartMode, QsoState, RigTxBackend,
+    StationStartInfo, WebQsoDefaults, WebQsoSnapshot,
 };
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream, play_tone};
 use rigctl::{
@@ -220,6 +220,10 @@ enum QueueCommand {
     SetAuto { enabled: bool },
     SetTxFreq { tx_freq_hz: f32 },
     SetRetryDelay { retry_delay_seconds: u64 },
+    SetAutoAddDirect { enabled: bool },
+    SetIgnoreDirectWorked { enabled: bool },
+    SetCqEnabled { enabled: bool },
+    SetCqPercent { percent: u8 },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -393,6 +397,11 @@ struct QueueAutoRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct QueueFlagRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct QueueTxFreqRequest {
     tx_freq_hz: f32,
 }
@@ -400,6 +409,11 @@ struct QueueTxFreqRequest {
 #[derive(Debug, Deserialize)]
 struct QueueRetryDelayRequest {
     retry_delay_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueCqPercentRequest {
+    percent: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -411,6 +425,10 @@ struct ApiStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 struct WebQueueSnapshot {
     auto_enabled: bool,
+    auto_add_direct_calls: bool,
+    ignore_direct_calls_from_recently_worked: bool,
+    cq_enabled: bool,
+    cq_percent: u8,
     tx_freq_hz: f32,
     retry_delay_seconds: u64,
     scheduler_status: String,
@@ -422,6 +440,10 @@ struct WebQueueEntry {
     callsign: String,
     queued_at: String,
     ok_to_schedule_after: String,
+    direct_pending: bool,
+    priority_direct: bool,
+    direct_count: u32,
+    direct_last_heard_at: Option<String>,
     last_heard_at: Option<String>,
     last_heard_message: String,
     last_heard_slot_family: Option<String>,
@@ -506,6 +528,10 @@ struct LoggedDecode {
 #[derive(Debug, Clone)]
 struct WorkQueueState {
     auto_enabled: bool,
+    auto_add_direct_calls: bool,
+    ignore_direct_calls_from_recently_worked: bool,
+    cq_enabled: bool,
+    cq_percent: u8,
     tx_freq_hz: f32,
     retry_delay: Duration,
     entries: VecDeque<WorkQueueEntry>,
@@ -519,6 +545,15 @@ struct WorkQueueEntry {
     queued_at: SystemTime,
     ok_to_schedule_after: SystemTime,
     last_observed_at: SystemTime,
+    direct_pending: bool,
+    direct_count: u32,
+    last_direct_at: Option<SystemTime>,
+    last_direct_slot_index: Option<u64>,
+    last_direct_slot_family: Option<qso::SlotFamily>,
+    last_direct_snr_db: Option<i32>,
+    direct_start_state: Option<QsoState>,
+    last_direct_text: Option<String>,
+    last_direct_structured_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,7 +589,33 @@ struct QueueEntryStatus {
 }
 
 #[derive(Debug, Clone)]
+struct DirectCallObservation {
+    callsign: String,
+    observed_at: SystemTime,
+    slot_index: u64,
+    slot_family: qso::SlotFamily,
+    snr_db: i32,
+    start_state: QsoState,
+    text: String,
+    structured_json: String,
+}
+
+#[derive(Debug, Clone)]
+enum QueueDispatchKind {
+    Station {
+        callsign: String,
+        initial_state: QsoState,
+        start_mode: QsoStartMode,
+        context_text: Option<String>,
+        context_structured_json: Option<String>,
+        context_snr_db: Option<i32>,
+    },
+    Cq,
+}
+
+#[derive(Debug, Clone)]
 struct QueueDispatch {
+    kind: QueueDispatchKind,
     callsign: String,
     tx_freq_hz: f32,
 }
@@ -601,9 +662,15 @@ impl Default for StationTracker {
 }
 
 impl WorkQueueState {
-    fn new(tx_freq_hz: f32, recent_worked: BTreeMap<String, SystemTime>) -> Self {
+    fn new(config: &AppConfig, tx_freq_hz: f32, recent_worked: BTreeMap<String, SystemTime>) -> Self {
         Self {
             auto_enabled: false,
+            auto_add_direct_calls: config.queue.auto_add_direct_calls_default,
+            ignore_direct_calls_from_recently_worked: config
+                .queue
+                .ignore_direct_calls_from_recently_worked_default,
+            cq_enabled: config.queue.cq_enabled_default,
+            cq_percent: config.queue.cq_percent_default.min(100),
             tx_freq_hz,
             retry_delay: DEFAULT_QUEUE_RETRY_DELAY,
             entries: VecDeque::new(),
@@ -632,8 +699,79 @@ impl WorkQueueState {
             queued_at: now,
             ok_to_schedule_after: now,
             last_observed_at,
+            direct_pending: false,
+            direct_count: 0,
+            last_direct_at: None,
+            last_direct_slot_index: None,
+            last_direct_slot_family: None,
+            last_direct_snr_db: None,
+            direct_start_state: None,
+            last_direct_text: None,
+            last_direct_structured_json: None,
         });
         info!(callsign, queued_at = %format_time(now), "queue_add_accepted");
+        Ok(())
+    }
+
+    fn add_direct_observation(
+        &mut self,
+        observation: DirectCallObservation,
+        now: SystemTime,
+    ) -> Result<(), String> {
+        self.prune_recent_worked(now);
+        if self.ignore_direct_calls_from_recently_worked
+            && self.was_worked_recently(&observation.callsign, now)
+        {
+            info!(callsign = observation.callsign, "queue_direct_rejected_recently_worked");
+            return Err("direct caller worked in last 24h".to_string());
+        }
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.callsign == observation.callsign)
+        {
+            entry.last_observed_at = entry.last_observed_at.max(observation.observed_at);
+            entry.direct_pending = true;
+            entry.direct_count = entry.direct_count.saturating_add(1);
+            entry.last_direct_at = Some(observation.observed_at);
+            entry.last_direct_slot_index = Some(observation.slot_index);
+            entry.last_direct_slot_family = Some(observation.slot_family);
+            entry.last_direct_snr_db = Some(observation.snr_db);
+            entry.direct_start_state = Some(observation.start_state);
+            entry.last_direct_text = Some(observation.text.clone());
+            entry.last_direct_structured_json = Some(observation.structured_json.clone());
+            entry.ok_to_schedule_after = now;
+            info!(
+                callsign = entry.callsign,
+                direct_count = entry.direct_count,
+                start_state = entry
+                    .direct_start_state
+                    .map(QsoState::as_str)
+                    .unwrap_or(""),
+                "queue_direct_updated"
+            );
+            return Ok(());
+        }
+        self.entries.push_back(WorkQueueEntry {
+            callsign: observation.callsign.clone(),
+            queued_at: now,
+            ok_to_schedule_after: now,
+            last_observed_at: observation.observed_at,
+            direct_pending: true,
+            direct_count: 1,
+            last_direct_at: Some(observation.observed_at),
+            last_direct_slot_index: Some(observation.slot_index),
+            last_direct_slot_family: Some(observation.slot_family),
+            last_direct_snr_db: Some(observation.snr_db),
+            direct_start_state: Some(observation.start_state),
+            last_direct_text: Some(observation.text),
+            last_direct_structured_json: Some(observation.structured_json),
+        });
+        info!(
+            callsign = observation.callsign,
+            queued_at = %format_time(now),
+            "queue_direct_added"
+        );
         Ok(())
     }
 
@@ -670,6 +808,26 @@ impl WorkQueueState {
             "auto disabled".to_string()
         };
         info!(enabled, "queue_auto_changed");
+    }
+
+    fn set_auto_add_direct_calls(&mut self, enabled: bool) {
+        self.auto_add_direct_calls = enabled;
+        info!(enabled, "queue_auto_add_direct_changed");
+    }
+
+    fn set_ignore_direct_calls_from_recently_worked(&mut self, enabled: bool) {
+        self.ignore_direct_calls_from_recently_worked = enabled;
+        info!(enabled, "queue_ignore_direct_recently_worked_changed");
+    }
+
+    fn set_cq_enabled(&mut self, enabled: bool) {
+        self.cq_enabled = enabled;
+        info!(enabled, "queue_cq_enabled_changed");
+    }
+
+    fn set_cq_percent(&mut self, percent: u8) {
+        self.cq_percent = percent.min(100);
+        info!(cq_percent = self.cq_percent, "queue_cq_percent_changed");
     }
 
     fn set_tx_freq_hz(&mut self, tx_freq_hz: f32) {
@@ -735,6 +893,15 @@ impl WorkQueueState {
                     queued_at: outcome.finished_at,
                     ok_to_schedule_after: outcome.finished_at + self.retry_delay,
                     last_observed_at,
+                    direct_pending: false,
+                    direct_count: 0,
+                    last_direct_at: None,
+                    last_direct_slot_index: None,
+                    last_direct_slot_family: None,
+                    last_direct_snr_db: None,
+                    direct_start_state: None,
+                    last_direct_text: None,
+                    last_direct_structured_json: None,
                 });
                 info!(
                     callsign = outcome.partner_call,
@@ -775,58 +942,79 @@ impl WorkQueueState {
             self.scheduler_status = "waiting: rig tune active".to_string();
             return None;
         }
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| self.entry_status(entry, tracker, now).ready)
-        {
-            let entry = self.entries.remove(index).expect("queue index valid");
-            self.scheduler_status = format!("dispatching {}", entry.callsign);
-            info!(
-                callsign = entry.callsign,
-                tx_freq_hz = self.tx_freq_hz,
-                queued_at = %format_time(entry.queued_at),
-                "queue_dispatch"
-            );
-            Some(QueueDispatch {
-                callsign: entry.callsign,
-                tx_freq_hz: self.tx_freq_hz,
-            })
-        } else {
-            self.scheduler_status = if self.entries.is_empty() {
-                "queue empty".to_string()
-            } else {
-                "no ready queued stations".to_string()
-            };
-            None
+        if let Some(dispatch) = self.pick_priority_direct(now) {
+            self.scheduler_status = format!("dispatching direct {}", dispatch.callsign);
+            info!(callsign = dispatch.callsign, tx_freq_hz = self.tx_freq_hz, "queue_dispatch_direct");
+            return Some(dispatch);
         }
+        let normal_pick = self.pick_oldest_ready_normal(now, tracker);
+        if self.cq_enabled && self.should_choose_cq(now) {
+            self.scheduler_status = if normal_pick.is_some() {
+                format!("dispatching cq at {}%", self.cq_percent)
+            } else {
+                format!("cq idle roll at {}%", self.cq_percent)
+            };
+            info!(cq_percent = self.cq_percent, "queue_dispatch_cq");
+            return Some(QueueDispatch {
+                kind: QueueDispatchKind::Cq,
+                callsign: "CQ".to_string(),
+                tx_freq_hz: self.tx_freq_hz,
+            });
+        }
+        if let Some(dispatch) = normal_pick {
+            self.scheduler_status = format!("dispatching {}", dispatch.callsign);
+            info!(callsign = dispatch.callsign, tx_freq_hz = self.tx_freq_hz, "queue_dispatch");
+            return Some(dispatch);
+        }
+        self.scheduler_status = if self.entries.is_empty() {
+            if self.cq_enabled {
+                format!("idle; cq skipped at {}%", self.cq_percent)
+            } else {
+                "queue empty".to_string()
+            }
+        } else {
+            "no ready queued stations".to_string()
+        };
+        None
     }
 
     fn web_snapshot(&self, tracker: &StationTracker, now: SystemTime) -> WebQueueSnapshot {
+        let mut entries = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let status = self.entry_status(entry, tracker, now);
+                let priority_direct = self.direct_priority_meta(entry, now).is_some();
+                WebQueueEntry {
+                    callsign: entry.callsign.clone(),
+                    queued_at: format_time(entry.queued_at),
+                    ok_to_schedule_after: format_time(entry.ok_to_schedule_after),
+                    direct_pending: entry.direct_pending,
+                    priority_direct,
+                    direct_count: entry.direct_count,
+                    direct_last_heard_at: entry.last_direct_at.map(format_time),
+                    last_heard_at: status.last_heard_at.map(format_time),
+                    last_heard_message: status.last_heard_message.as_str().to_string(),
+                    last_heard_slot_family: status
+                        .last_heard_slot_family
+                        .map(|family| family.as_str().to_string()),
+                    ready: status.ready,
+                    status: status.status,
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| !entry.priority_direct);
         WebQueueSnapshot {
             auto_enabled: self.auto_enabled,
+            auto_add_direct_calls: self.auto_add_direct_calls,
+            ignore_direct_calls_from_recently_worked: self
+                .ignore_direct_calls_from_recently_worked,
+            cq_enabled: self.cq_enabled,
+            cq_percent: self.cq_percent,
             tx_freq_hz: self.tx_freq_hz,
             retry_delay_seconds: self.retry_delay.as_secs(),
             scheduler_status: self.scheduler_status.clone(),
-            entries: self
-                .entries
-                .iter()
-                .map(|entry| {
-                    let status = self.entry_status(entry, tracker, now);
-                    WebQueueEntry {
-                        callsign: entry.callsign.clone(),
-                        queued_at: format_time(entry.queued_at),
-                        ok_to_schedule_after: format_time(entry.ok_to_schedule_after),
-                        last_heard_at: status.last_heard_at.map(format_time),
-                        last_heard_message: status.last_heard_message.as_str().to_string(),
-                        last_heard_slot_family: status
-                            .last_heard_slot_family
-                            .map(|family| family.as_str().to_string()),
-                        ready: status.ready,
-                        status: status.status,
-                    }
-                })
-                .collect(),
+            entries,
         }
     }
 
@@ -842,11 +1030,12 @@ impl WorkQueueState {
 
     fn prune_queue(&mut self, now: SystemTime, _tracker: &StationTracker) {
         let recent_worked = self.recent_worked.clone();
+        let ignore_direct = self.ignore_direct_calls_from_recently_worked;
         self.entries.retain(|entry| {
             let worked_recently = recent_worked.get(&entry.callsign).is_some_and(|worked_at| {
                 now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
             });
-            if worked_recently {
+            if worked_recently && !(entry.direct_pending && !ignore_direct) {
                 info!(callsign = entry.callsign, "queue_remove_already_worked");
                 return false;
             }
@@ -872,7 +1061,9 @@ impl WorkQueueState {
         tracker: &StationTracker,
         now: SystemTime,
     ) -> QueueEntryStatus {
-        if self.was_worked_recently(&entry.callsign, now) {
+        if self.was_worked_recently(&entry.callsign, now)
+            && !(entry.direct_pending && !self.ignore_direct_calls_from_recently_worked)
+        {
             return QueueEntryStatus {
                 last_heard_at: Some(entry.last_observed_at),
                 last_heard_message: StationLastMessageKind::Other,
@@ -935,9 +1126,142 @@ impl WorkQueueState {
             last_heard_message,
             last_heard_slot_family,
             ready: true,
-            status: "ready".to_string(),
+            status: if entry.direct_pending {
+                format!("direct x{}", entry.direct_count)
+            } else {
+                "ready".to_string()
+            },
         }
     }
+
+    fn has_recent_priority_direct_for_slot(&self, slot_start: SystemTime, now: SystemTime) -> bool {
+        let slot_index = slot_index(slot_start);
+        self.entries.iter().any(|entry| {
+            entry.direct_pending
+                && now >= entry.ok_to_schedule_after
+                && entry.last_direct_slot_index == Some(slot_index)
+                && !(
+                    self.ignore_direct_calls_from_recently_worked
+                        && self.was_worked_recently(&entry.callsign, now)
+                )
+        })
+    }
+
+    fn pick_priority_direct(&mut self, now: SystemTime) -> Option<QueueDispatch> {
+        let most_recent_slot = self
+            .entries
+            .iter()
+            .filter_map(|entry| self.direct_priority_meta(entry, now))
+            .map(|meta| meta.slot_index)
+            .max()?;
+        let target_slot = if self
+            .entries
+            .iter()
+            .filter_map(|entry| self.direct_priority_meta(entry, now))
+            .any(|meta| meta.slot_index == most_recent_slot)
+        {
+            most_recent_slot
+        } else {
+            most_recent_slot.saturating_sub(2)
+        };
+        let best_index = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let meta = self.direct_priority_meta(entry, now)?;
+                if meta.slot_index != target_slot {
+                    return None;
+                }
+                Some((index, meta))
+            })
+            .max_by(|(_, left), (_, right)| {
+                left.count
+                    .cmp(&right.count)
+                    .then_with(|| left.snr_db.cmp(&right.snr_db))
+                    .then_with(|| right.queued_at.cmp(&left.queued_at))
+                    .then_with(|| right.callsign.cmp(&left.callsign))
+            })
+            .map(|(index, _)| index)?;
+        let entry = self.entries.remove(best_index).expect("queue index valid");
+        Some(QueueDispatch {
+            kind: QueueDispatchKind::Station {
+                callsign: entry.callsign.clone(),
+                initial_state: entry.direct_start_state.unwrap_or(QsoState::SendSig),
+                start_mode: QsoStartMode::Direct,
+                context_text: entry.last_direct_text.clone(),
+                context_structured_json: entry.last_direct_structured_json.clone(),
+                context_snr_db: entry.last_direct_snr_db,
+            },
+            callsign: entry.callsign,
+            tx_freq_hz: self.tx_freq_hz,
+        })
+    }
+
+    fn pick_oldest_ready_normal(
+        &mut self,
+        now: SystemTime,
+        tracker: &StationTracker,
+    ) -> Option<QueueDispatch> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| self.entry_status(entry, tracker, now).ready)?;
+        let entry = self.entries.remove(index).expect("queue index valid");
+        Some(QueueDispatch {
+            kind: QueueDispatchKind::Station {
+                callsign: entry.callsign.clone(),
+                initial_state: QsoState::SendGrid,
+                start_mode: QsoStartMode::Normal,
+                context_text: None,
+                context_structured_json: None,
+                context_snr_db: None,
+            },
+            callsign: entry.callsign,
+            tx_freq_hz: self.tx_freq_hz,
+        })
+    }
+
+    fn direct_priority_meta(&self, entry: &WorkQueueEntry, now: SystemTime) -> Option<DirectPriorityMeta> {
+        if !entry.direct_pending || now < entry.ok_to_schedule_after {
+            return None;
+        }
+        if self.ignore_direct_calls_from_recently_worked
+            && self.was_worked_recently(&entry.callsign, now)
+        {
+            return None;
+        }
+        let slot_family = entry.last_direct_slot_family?;
+        let slot_index = entry.last_direct_slot_index?;
+        let latest_same_family_slot = latest_slot_index_for_family(now, slot_family);
+        if latest_same_family_slot.saturating_sub(slot_index) > 2 {
+            return None;
+        }
+        Some(DirectPriorityMeta {
+            callsign: entry.callsign.clone(),
+            queued_at: entry.queued_at,
+            slot_index,
+            count: entry.direct_count,
+            snr_db: entry.last_direct_snr_db.unwrap_or(i32::MIN),
+        })
+    }
+
+    fn should_choose_cq(&self, now: SystemTime) -> bool {
+        if !self.cq_enabled || self.cq_percent == 0 {
+            return false;
+        }
+        let roll = ((slot_index(now).wrapping_mul(1103515245).wrapping_add(12345)) % 100) as u8;
+        roll < self.cq_percent
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DirectPriorityMeta {
+    callsign: String,
+    queued_at: SystemTime,
+    slot_index: u64,
+    count: u32,
+    snr_db: i32,
 }
 
 impl QsoJsonlCache {
@@ -1598,14 +1922,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .queue-item {
       display: grid;
-      grid-template-columns: 78px 92px 92px 92px 58px 44px minmax(0, 1fr) 56px;
+      grid-template-columns: 78px 30px 36px 88px 88px 88px 58px 44px minmax(0, 1fr) 56px;
       gap: 6px;
       align-items: baseline;
       padding: 3px 6px;
       border: 1px solid rgba(143, 176, 192, 0.08);
       border-radius: 6px;
       background: rgba(19, 40, 56, 0.45);
-      min-width: 660px;
+      min-width: 760px;
     }
     .queue-head {
       position: sticky;
@@ -1613,6 +1937,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       z-index: 1;
       background: linear-gradient(180deg, rgba(13, 29, 41, 0.98), rgba(13, 29, 41, 0.92));
       border: 0;
+    }
+    .queue-item-direct {
+      border-color: rgba(244, 190, 92, 0.38);
+      background: rgba(76, 61, 20, 0.42);
     }
     .queue-call {
       font-weight: 600;
@@ -1806,7 +2134,28 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <div class="label">Retry Delay</div>
               <input id="queue-retry-delay" class="control-input" type="number" min="1" max="3600" step="1">
             </div>
+            <div class="input-wrap">
+              <div class="label">CQ %</div>
+              <select id="queue-cq-percent" class="control-input">
+                <option value="0">0%</option>
+                <option value="10">10%</option>
+                <option value="20">20%</option>
+                <option value="30">30%</option>
+                <option value="40">40%</option>
+                <option value="50">50%</option>
+                <option value="60">60%</option>
+                <option value="70">70%</option>
+                <option value="80">80%</option>
+                <option value="90">90%</option>
+                <option value="100">100%</option>
+              </select>
+            </div>
             <button id="queue-clear" class="button secondary" type="button">Clear Queue</button>
+          </div>
+          <div class="control-row">
+            <label class="toggle-row"><input id="queue-auto-add-direct" type="checkbox"> Auto add direct calls</label>
+            <label class="toggle-row"><input id="queue-ignore-direct-worked" type="checkbox"> Ignore direct calls from already worked stations</label>
+            <label class="toggle-row"><input id="queue-cq-enabled" type="checkbox"> Enable CQ</label>
           </div>
         </div>
         <div class="detail-block">
@@ -2081,6 +2430,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function updateQueueAuto(enabled) {
       await postJson('/api/queue/auto', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueAutoAddDirect(enabled) {
+      await postJson('/api/queue/auto-add-direct', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueIgnoreDirectWorked(enabled) {
+      await postJson('/api/queue/ignore-direct-worked', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueCqEnabled(enabled) {
+      await postJson('/api/queue/cq-enabled', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueCqPercent(percent) {
+      await postJson('/api/queue/cq-percent', { percent });
       scheduleRefresh(10);
     }
     async function updateQueueTxFreq(txFreqHz) {
@@ -2428,17 +2793,27 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const count = document.getElementById('queue-count');
       const status = document.getElementById('queue-status');
       const retryDelay = document.getElementById('queue-retry-delay');
+      const autoAddDirect = document.getElementById('queue-auto-add-direct');
+      const ignoreDirectWorked = document.getElementById('queue-ignore-direct-worked');
+      const cqEnabled = document.getElementById('queue-cq-enabled');
+      const cqPercent = document.getElementById('queue-cq-percent');
       const clearButton = document.getElementById('queue-clear');
       const list = document.getElementById('queue-list');
       count.textContent = `${(queue.entries || []).length} queued`;
       status.textContent = queue.scheduler_status || 'auto disabled';
       clearButton.disabled = !(queue.entries || []).length;
+      autoAddDirect.checked = !!queue.auto_add_direct_calls;
+      ignoreDirectWorked.checked = !!queue.ignore_direct_calls_from_recently_worked;
+      cqEnabled.checked = !!queue.cq_enabled;
+      cqPercent.value = String(queue.cq_percent ?? 80);
       if (retryDelay.value === '' || Number(retryDelay.value) !== Number(queue.retry_delay_seconds)) {
         retryDelay.value = String(queue.retry_delay_seconds ?? 35);
       }
       list.innerHTML = `
         <div class="queue-item queue-head">
           <div>Call</div>
+          <div>Dir</div>
+          <div>Cnt</div>
           <div>Queued</div>
           <div>Ready</div>
           <div>Heard</div>
@@ -2453,12 +2828,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       for (const entry of queue.entries) {
         const row = document.createElement('div');
-        row.className = 'queue-item';
+        row.className = `queue-item${entry.priority_direct ? ' queue-item-direct' : ''}`;
         row.innerHTML = `
           <div class="queue-call">${renderCallValue(entry.callsign, entry.callsign)}</div>
+          <div class="queue-meta">${entry.direct_pending ? 'Y' : '-'}</div>
+          <div class="queue-meta">${escapeHtml(entry.direct_count ?? 0)}</div>
           <div class="queue-meta">${escapeHtml(entry.queued_at)}</div>
           <div class="queue-meta">${escapeHtml(entry.ok_to_schedule_after)}</div>
-          <div class="queue-meta">${escapeHtml(entry.last_heard_at ?? '-')}</div>
+          <div class="queue-meta">${escapeHtml(entry.direct_last_heard_at ?? entry.last_heard_at ?? '-')}</div>
           <div class="queue-meta">${escapeHtml(entry.last_heard_message)}</div>
           <div class="queue-meta">${escapeHtml(entry.last_heard_slot_family ?? '-')}</div>
           <div class="queue-meta">${escapeHtml(entry.ready ? 'ready' : entry.status)}</div>
@@ -2668,6 +3045,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById('queue-clear').addEventListener('click', () => {
       clearQueue().catch((error) => console.error(error));
     });
+    document.getElementById('queue-auto-add-direct').addEventListener('change', (event) => {
+      updateQueueAutoAddDirect(event.currentTarget.checked).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-ignore-direct-worked').addEventListener('change', (event) => {
+      updateQueueIgnoreDirectWorked(event.currentTarget.checked).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-cq-enabled').addEventListener('change', (event) => {
+      updateQueueCqEnabled(event.currentTarget.checked).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-cq-percent').addEventListener('change', (event) => {
+      updateQueueCqPercent(Number(event.currentTarget.value)).catch((error) => console.error(error));
+    });
     document.getElementById('queue-even-map').addEventListener('click', () => {
       addBandmapCallsToQueue('even').catch((error) => console.error(error));
     });
@@ -2717,6 +3106,13 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route("/api/queue/remove", post(api_queue_remove_handler))
                 .route("/api/queue/clear", post(api_queue_clear_handler))
                 .route("/api/queue/auto", post(api_queue_auto_handler))
+                .route("/api/queue/auto-add-direct", post(api_queue_auto_add_direct_handler))
+                .route(
+                    "/api/queue/ignore-direct-worked",
+                    post(api_queue_ignore_direct_worked_handler),
+                )
+                .route("/api/queue/cq-enabled", post(api_queue_cq_enabled_handler))
+                .route("/api/queue/cq-percent", post(api_queue_cq_percent_handler))
                 .route("/api/queue/tx-freq", post(api_queue_tx_freq_handler))
                 .route(
                     "/api/queue/retry-delay",
@@ -2838,6 +3234,79 @@ async fn api_queue_auto_handler(
         Json(ApiStatus {
             ok: true,
             message: "queue auto updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_auto_add_direct_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state.queue_control.enqueue(QueueCommand::SetAutoAddDirect {
+        enabled: request.enabled,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue direct auto-add updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_ignore_direct_worked_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state.queue_control.enqueue(QueueCommand::SetIgnoreDirectWorked {
+        enabled: request.enabled,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue direct worked filter updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_cq_enabled_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state.queue_control.enqueue(QueueCommand::SetCqEnabled {
+        enabled: request.enabled,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue cq enabled updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_cq_percent_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueCqPercentRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    if request.percent > 100 || request.percent % 10 != 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "cq percent must be one of 0,10,...,100".to_string(),
+            }),
+        );
+    }
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetCqPercent { percent: request.percent });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue cq percent updated".to_string(),
         }),
     )
 }
@@ -3313,6 +3782,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     );
     qso_jsonl_cache.refresh(process_started_at);
     let mut work_queue = WorkQueueState::new(
+        &config,
         qso_controller.defaults().tx_freq_default_hz,
         qso_jsonl_cache.recent_worked.clone(),
     );
@@ -3463,6 +3933,14 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 QueueCommand::SetRetryDelay {
                     retry_delay_seconds,
                 } => work_queue.set_retry_delay(Duration::from_secs(retry_delay_seconds)),
+                QueueCommand::SetAutoAddDirect { enabled } => {
+                    work_queue.set_auto_add_direct_calls(enabled)
+                }
+                QueueCommand::SetIgnoreDirectWorked { enabled } => {
+                    work_queue.set_ignore_direct_calls_from_recently_worked(enabled)
+                }
+                QueueCommand::SetCqEnabled { enabled } => work_queue.set_cq_enabled(enabled),
+                QueueCommand::SetCqPercent { percent } => work_queue.set_cq_percent(percent),
             }
         }
         for command in rig_control.drain() {
@@ -3541,12 +4019,43 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 dt_frame_history.push_back(display.full_decodes.clone());
                                 station_tracker.ingest_frame(slot_start, &display.full_decodes);
                                 update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
+                                if work_queue.auto_add_direct_calls {
+                                    let active_partner = qso_controller.active_partner_call();
+                                    for decode in &display.full_decodes {
+                                        let Some(observation) = direct_call_observation_from_decode(
+                                            decode,
+                                            &config.station.our_call,
+                                            slot_start,
+                                        ) else {
+                                            continue;
+                                        };
+                                        if active_partner.as_deref()
+                                            == Some(observation.callsign.as_str())
+                                        {
+                                            continue;
+                                        }
+                                        if let Err(message) =
+                                            work_queue.add_direct_observation(observation, slot_start)
+                                        {
+                                            warn!(message, "queue_direct_add_failed");
+                                        }
+                                    }
+                                }
                                 qso_controller.on_decode_stage(
                                     slot_start,
                                     stage,
                                     &display.full_decodes,
                                     SystemTime::now(),
                                 );
+                                if work_queue
+                                    .has_recent_priority_direct_for_slot(slot_start, SystemTime::now())
+                                    && qso_controller.preempt_for_priority_direct(SystemTime::now())
+                                {
+                                    info!(
+                                        slot = %format_slot_time(slot_start),
+                                        "qso_preempted_for_priority_direct"
+                                    );
+                                }
                             }
                         },
                         Err(error) => {
@@ -3673,15 +4182,52 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             qso_runtime_snapshot.active || qso_runtime_snapshot.tx_active,
             tune_active.load(Ordering::Relaxed) || tx_busy.load(Ordering::Relaxed),
         ) {
-            let station_info = station_tracker.start_info(&dispatch.callsign);
-            qso_controller.handle_command(
-                QsoCommand::Start {
-                    partner_call: dispatch.callsign,
-                    tx_freq_hz: dispatch.tx_freq_hz,
-                },
-                station_info,
-                SystemTime::now(),
-            );
+            let dispatch_now = SystemTime::now();
+            match dispatch.kind {
+                QueueDispatchKind::Station {
+                    callsign,
+                    initial_state,
+                    start_mode,
+                    context_text,
+                    context_structured_json,
+                    context_snr_db,
+                } => {
+                    let mut station_info = station_tracker.start_info(&callsign);
+                    if let Some(info) = &mut station_info {
+                        if let Some(text) = context_text {
+                            info.last_text = Some(text);
+                        }
+                        if let Some(structured_json) = context_structured_json {
+                            info.last_structured_json = Some(structured_json);
+                        }
+                        if let Some(snr_db) = context_snr_db {
+                            info.last_snr_db = snr_db;
+                        }
+                    }
+                    qso_controller.handle_command(
+                        QsoCommand::Start {
+                            partner_call: callsign,
+                            tx_freq_hz: dispatch.tx_freq_hz,
+                            initial_state,
+                            start_mode,
+                        },
+                        station_info,
+                        dispatch_now,
+                    );
+                }
+                QueueDispatchKind::Cq => {
+                    qso_controller.handle_command(
+                        QsoCommand::Start {
+                            partner_call: "CQ".to_string(),
+                            tx_freq_hz: dispatch.tx_freq_hz,
+                            initial_state: QsoState::SendCq,
+                            start_mode: QsoStartMode::Cq,
+                        },
+                        None,
+                        dispatch_now,
+                    );
+                }
+            }
         }
 
         if should_refresh_waterfall(
@@ -5300,6 +5846,91 @@ fn station_message_kind(message: &StructuredMessage) -> StationLastMessageKind {
     }
 }
 
+fn direct_call_observation_from_decode(
+    decode: &DecodedMessage,
+    our_call: &str,
+    observed_at: SystemTime,
+) -> Option<DirectCallObservation> {
+    let sender_call = semantic_sender_call(&decode.message)?;
+    let start_state = match &decode.message {
+        StructuredMessage::Standard {
+            first,
+            acknowledge,
+            info,
+            ..
+        } => {
+            if structured_call_station_name(first).as_deref() != Some(our_call) {
+                return None;
+            }
+            match &info.value {
+                StructuredInfoValue::Grid { locator } if locator.eq_ignore_ascii_case("RR73") => {
+                    return None;
+                }
+                StructuredInfoValue::Reply {
+                    word: ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree,
+                } => return None,
+                StructuredInfoValue::Reply {
+                    word: ft8_decoder::ReplyWord::Rrr,
+                } => QsoState::Send73,
+                StructuredInfoValue::Reply {
+                    word: ft8_decoder::ReplyWord::Blank,
+                } => {
+                    if *acknowledge {
+                        QsoState::Send73
+                    } else {
+                        QsoState::SendSig
+                    }
+                }
+                StructuredInfoValue::Grid { .. } => {
+                    if *acknowledge {
+                        QsoState::Send73
+                    } else {
+                        QsoState::SendSig
+                    }
+                }
+                StructuredInfoValue::SignalReport { .. } => {
+                    if *acknowledge {
+                        QsoState::Send73
+                    } else {
+                        QsoState::SendSigAck
+                    }
+                }
+                StructuredInfoValue::Blank => {
+                    if *acknowledge {
+                        QsoState::Send73
+                    } else {
+                        QsoState::SendSig
+                    }
+                }
+            }
+        }
+        StructuredMessage::Nonstandard { reply, cq, .. } => {
+            if *cq || semantic_first_call_display_call(&decode.message).as_deref() != Some(our_call)
+            {
+                return None;
+            }
+            match reply {
+                ft8_decoder::ReplyWord::Blank => QsoState::SendSig,
+                ft8_decoder::ReplyWord::Rrr => QsoState::Send73,
+                ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree => {
+                    return None;
+                }
+            }
+        }
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => return None,
+    };
+    Some(DirectCallObservation {
+        callsign: sender_call,
+        observed_at,
+        slot_index: slot_index(observed_at),
+        slot_family: qso::slot_family(observed_at),
+        snr_db: decode.snr_db,
+        start_state,
+        text: decode.text.clone(),
+        structured_json: serde_json::to_string(&decode.message).unwrap_or_default(),
+    })
+}
+
 fn format_time(time: SystemTime) -> String {
     let utc: DateTime<Utc> = time.into();
     utc.format("%H:%M:%S").to_string()
@@ -5525,6 +6156,63 @@ fn build_bandmap_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds, StationConfig,
+        TxConfig,
+    };
+
+    fn sample_app_config() -> AppConfig {
+        AppConfig {
+            station: StationConfig {
+                our_call: "N1VF".to_string(),
+                our_grid: "CM97".to_string(),
+            },
+            tx: TxConfig {
+                base_freq_hz: 1000.0,
+                drive_level: 0.28,
+                playback_channels: 2,
+                output_device: None,
+                power_w: Some(20.0),
+                tx_freq_min_hz: 200.0,
+                tx_freq_max_hz: 3500.0,
+            },
+            queue: QueueConfig {
+                auto_add_direct_calls_default: true,
+                ignore_direct_calls_from_recently_worked_default: true,
+                cq_enabled_default: false,
+                cq_percent_default: 80,
+            },
+            fsm: FsmConfig {
+                rr73_enabled: true,
+                timeout_seconds: 600,
+                send_grid: RetryThresholds {
+                    no_fwd: 3,
+                    no_msg: 3,
+                },
+                send_sig: RetryThresholds {
+                    no_fwd: 3,
+                    no_msg: 3,
+                },
+                send_sig_ack: RetryThresholds {
+                    no_fwd: 5,
+                    no_msg: 2,
+                },
+                send_rr73: NoFwdThreshold { no_fwd: 3 },
+                send_rrr: RetryThresholds {
+                    no_fwd: 5,
+                    no_msg: 2,
+                },
+                send_73: RetryThresholds {
+                    no_fwd: 3,
+                    no_msg: 2,
+                },
+            },
+            logging: LoggingConfig {
+                fsm_log_path: "logs/test-qso.jsonl".to_string(),
+                app_log_path: "logs/test-ft8rx.log".to_string(),
+            },
+        }
+    }
 
     fn standard_call(callsign: &str) -> StructuredCallField {
         StructuredCallField {
@@ -5648,7 +6336,8 @@ mod tests {
         tracker.ingest_decode(now, &cq_decode("OLDER"));
         tracker.ingest_decode(now, &cq_decode("NEWER"));
 
-        let mut queue = WorkQueueState::new(900.0, BTreeMap::new());
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         queue.auto_enabled = true;
         queue.add_station("OLDER", now, now).expect("older queued");
         queue
@@ -5670,7 +6359,8 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let mut tracker = StationTracker::default();
         tracker.ingest_decode(now, &cq_decode("K1ABC"));
-        let mut queue = WorkQueueState::new(900.0, BTreeMap::new());
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         queue.handle_qso_outcome(
             &QsoOutcome {
                 partner_call: "K1ABC".to_string(),
@@ -5689,7 +6379,8 @@ mod tests {
     #[test]
     fn queue_drops_recently_worked_station_immediately() {
         let now = UNIX_EPOCH + Duration::from_secs(30);
-        let mut queue = WorkQueueState::new(900.0, BTreeMap::new());
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         queue.mark_worked("K1ABC", now);
         let added = queue.add_station("K1ABC", now, now);
         assert!(added.is_err());

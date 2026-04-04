@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::next_slot_boundary;
 use chrono::{DateTime, Utc};
 use ft8_decoder::{
     DecodeStage, ReplyWord, StructuredInfoValue, StructuredMessage, TxDirectedPayload, TxMessage,
@@ -29,11 +30,30 @@ pub struct StationStartInfo {
     pub last_structured_json: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QsoStartMode {
+    Normal,
+    Direct,
+    Cq,
+}
+
+impl QsoStartMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Direct => "direct",
+            Self::Cq => "cq",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum QsoCommand {
     Start {
         partner_call: String,
         tx_freq_hz: f32,
+        initial_state: QsoState,
+        start_mode: QsoStartMode,
     },
     Stop {
         reason: String,
@@ -76,6 +96,7 @@ impl SlotFamily {
 #[serde(rename_all = "snake_case")]
 pub enum QsoState {
     Idle,
+    SendCq,
     SendGrid,
     SendSig,
     SendSigAck,
@@ -89,6 +110,7 @@ impl QsoState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::SendCq => "send_cq",
             Self::SendGrid => "send_grid",
             Self::SendSig => "send_sig",
             Self::SendSigAck => "send_sig_ack",
@@ -197,7 +219,16 @@ impl QsoController {
             QsoCommand::Start {
                 partner_call,
                 tx_freq_hz,
-            } => self.handle_start(partner_call, tx_freq_hz, station_info, now),
+                initial_state,
+                start_mode,
+            } => self.handle_start(
+                partner_call,
+                tx_freq_hz,
+                initial_state,
+                start_mode,
+                station_info,
+                now,
+            ),
             QsoCommand::Stop { reason } => self.stop_session(&reason, now),
         }
     }
@@ -226,12 +257,16 @@ impl QsoController {
         }
         Self::roll_rx_stage_tracking(session, slot_start);
 
-        let event = classify_partner_event(
-            decodes,
-            &session.partner_call,
-            &self.config.station.our_call,
-            session.state,
-        );
+        let event = if session.state == QsoState::SendCq {
+            PartnerEvent::None
+        } else {
+            classify_partner_event(
+                decodes,
+                &session.partner_call,
+                &self.config.station.our_call,
+                session.state,
+            )
+        };
         let should_consume = Self::should_consume_stage_event(session, stage, &event);
         if !should_consume {
             return;
@@ -245,6 +280,9 @@ impl QsoController {
         }
         if let Some(snr_db) = event.snr_db() {
             session.latest_partner_snr_db = snr_db;
+        }
+        if event.has_partner_message() {
+            session.partner_rx_count += 1;
         }
         session.last_rx_event = Some(event.summary());
         session.last_rx_stage = Some(stage);
@@ -272,6 +310,12 @@ impl QsoController {
 
         match previous_state {
             QsoState::Idle => {}
+            QsoState::SendCq => {
+                session.no_msg_count += 1;
+                if session.no_msg_count >= self.config.fsm.send_grid.no_msg {
+                    exit_reason = Some("send_cq_no_msg_limit");
+                }
+            }
             QsoState::SendGrid => match event {
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Ack,
@@ -831,10 +875,35 @@ impl QsoController {
         self.pending_outcomes.drain(..).collect()
     }
 
+    pub fn active_partner_call(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .filter(|session| session.start_mode != QsoStartMode::Cq)
+            .map(|session| session.partner_call.clone())
+    }
+
+    pub fn preempt_for_priority_direct(&mut self, now: SystemTime) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let reason = match (session.start_mode, session.state, session.partner_rx_count) {
+            (QsoStartMode::Normal, QsoState::SendGrid, 0) => Some("send_grid_no_msg_limit"),
+            (QsoStartMode::Cq, QsoState::SendCq, _) => Some("send_cq_direct_preempt"),
+            _ => None,
+        };
+        let Some(reason) = reason else {
+            return false;
+        };
+        self.finish_session(reason, now);
+        true
+    }
+
     fn handle_start(
         &mut self,
         partner_call: String,
         tx_freq_hz: f32,
+        initial_state: QsoState,
+        start_mode: QsoStartMode,
         station_info: Option<StationStartInfo>,
         now: SystemTime,
     ) {
@@ -852,22 +921,39 @@ impl QsoController {
             );
             return;
         }
-        let Some(station_info) = station_info else {
-            warn!(
-                partner_call,
-                "qso start rejected because station info is unavailable"
-            );
-            return;
+        let station_info = if start_mode == QsoStartMode::Cq {
+            None
+        } else {
+            let Some(station_info) = station_info else {
+                warn!(
+                    partner_call,
+                    "qso start rejected because station info is unavailable"
+                );
+                return;
+            };
+            Some(station_info)
         };
-        let tx_slot_family = station_info.last_heard_slot_family.opposite();
+        let tx_slot_family = if let Some(station_info) = &station_info {
+            station_info.last_heard_slot_family.opposite()
+        } else {
+            slot_family(next_slot_boundary(now))
+        };
         let next_tx_slot = first_matching_slot_after(now, tx_slot_family);
         let mut session = ActiveSession {
             session_id: self.next_session_id,
-            partner_call: station_info.callsign,
-            state: QsoState::SendGrid,
+            partner_call: if start_mode == QsoStartMode::Cq {
+                partner_call
+            } else {
+                station_info
+                    .as_ref()
+                    .map(|info| info.callsign.clone())
+                    .unwrap_or(partner_call)
+            },
+            state: initial_state,
+            start_mode,
             tx_slot_family,
             tx_freq_hz,
-            latest_partner_snr_db: station_info.last_snr_db,
+            latest_partner_snr_db: station_info.as_ref().map(|info| info.last_snr_db).unwrap_or(0),
             started_at: now,
             deadline_at: now + Duration::from_secs(self.config.fsm.timeout_seconds),
             next_tx_slot: Some(next_tx_slot),
@@ -876,20 +962,24 @@ impl QsoController {
             pending_action: None,
             no_msg_count: 0,
             no_fwd_count: 0,
+            partner_rx_count: 0,
             last_rx_event: station_info
-                .last_text
+                .as_ref()
+                .and_then(|info| info.last_text.as_ref())
                 .as_ref()
                 .map(|_| "start_context".to_string()),
             last_rx_stage: None,
-            last_rx_text: station_info.last_text.clone(),
-            last_rx_structured_json: station_info.last_structured_json.clone(),
+            last_rx_text: station_info.as_ref().and_then(|info| info.last_text.clone()),
+            last_rx_structured_json: station_info
+                .as_ref()
+                .and_then(|info| info.last_structured_json.clone()),
             current_rx_slot: None,
             rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
             sent_terminal_73: false,
         };
         self.next_session_id += 1;
-        if let Some(text) = station_info.last_text.clone() {
+        if let Some(text) = station_info.as_ref().and_then(|info| info.last_text.clone()) {
             let state = session.state;
             Self::push_transcript(
                 &mut session,
@@ -899,14 +989,25 @@ impl QsoController {
                 format!("start context: {text}"),
             );
         }
-        let start_line = format!(
-            "start qso with {} tx={} freq={:.0}Hz latest_snr={:+} last_heard={}",
-            session.partner_call,
-            session.tx_slot_family.as_str(),
-            session.tx_freq_hz,
-            session.latest_partner_snr_db,
-            format_timestamp(station_info.last_heard_at),
-        );
+        let start_line = if let Some(station_info) = &station_info {
+            format!(
+                "start {} with {} tx={} freq={:.0}Hz state={} latest_snr={:+} last_heard={}",
+                start_mode.as_str(),
+                session.partner_call,
+                session.tx_slot_family.as_str(),
+                session.tx_freq_hz,
+                session.state.as_str(),
+                session.latest_partner_snr_db,
+                format_timestamp(station_info.last_heard_at),
+            )
+        } else {
+            format!(
+                "start cq tx={} freq={:.0}Hz state={}",
+                session.tx_slot_family.as_str(),
+                session.tx_freq_hz,
+                session.state.as_str(),
+            )
+        };
         let state = session.state;
         Self::push_transcript(&mut session, now, "SYS:", state, start_line);
         Self::log_fsm(
@@ -915,7 +1016,7 @@ impl QsoController {
             QsoState::Idle,
             session.state,
             "start".to_string(),
-            station_info.last_text,
+            station_info.and_then(|info| info.last_text),
             None,
             now,
         );
@@ -1008,6 +1109,7 @@ impl QsoController {
             wall_ts = %format_timestamp(now),
             session_id = session.session_id,
             partner_call = %session.partner_call,
+            start_mode = %session.start_mode.as_str(),
             tx_slot_family = %session.tx_slot_family.as_str(),
             tx_freq_hz = session.tx_freq_hz,
             state_before = %state_before.as_str(),
@@ -1152,6 +1254,7 @@ struct ActiveSession {
     session_id: u64,
     partner_call: String,
     state: QsoState,
+    start_mode: QsoStartMode,
     tx_slot_family: SlotFamily,
     tx_freq_hz: f32,
     latest_partner_snr_db: i32,
@@ -1163,6 +1266,7 @@ struct ActiveSession {
     pending_action: Option<PendingAction>,
     no_msg_count: u32,
     no_fwd_count: u32,
+    partner_rx_count: u32,
     last_rx_event: Option<String>,
     last_rx_stage: Option<DecodeStage>,
     last_rx_text: Option<String>,
@@ -1511,6 +1615,7 @@ fn build_tx_request(
 ) -> TxRequest {
     let payload = match session.state {
         QsoState::Idle => TxDirectedPayload::Blank,
+        QsoState::SendCq => TxDirectedPayload::Blank,
         QsoState::SendGrid => TxDirectedPayload::Grid(config.station.our_grid.clone()),
         QsoState::SendSig => {
             TxDirectedPayload::Signal(clamp_report_db(session.latest_partner_snr_db))
@@ -1524,10 +1629,17 @@ fn build_tx_request(
             TxDirectedPayload::Reply(ReplyWord::SeventyThree)
         }
     };
-    let message = TxMessage::Directed {
-        my_call: config.station.our_call.clone(),
-        peer_call: session.partner_call.clone(),
-        payload,
+    let message = if session.state == QsoState::SendCq {
+        TxMessage::Cq {
+            my_call: config.station.our_call.clone(),
+            my_grid: Some(config.station.our_grid.clone()),
+        }
+    } else {
+        TxMessage::Directed {
+            my_call: config.station.our_call.clone(),
+            peer_call: session.partner_call.clone(),
+            payload,
+        }
     };
     let message_text = render_tx_message(config, session);
     TxRequest {
@@ -1545,6 +1657,7 @@ fn build_tx_request(
 fn render_tx_message(config: &AppConfig, session: &ActiveSession) -> String {
     match session.state {
         QsoState::Idle => String::new(),
+        QsoState::SendCq => format!("CQ {} {}", config.station.our_call, config.station.our_grid),
         QsoState::SendGrid => format!(
             "{} {} {}",
             session.partner_call, config.station.our_call, config.station.our_grid
@@ -1754,6 +1867,7 @@ fn classify_single_message(
 
 fn to_us_priority(event: ToUsEvent, state: QsoState) -> u8 {
     match state {
+        QsoState::SendCq => 1,
         QsoState::SendGrid => match event {
             ToUsEvent::Reply(_) => 4,
             ToUsEvent::Ack => 3,
@@ -2066,7 +2180,8 @@ fn serialize_structured_message(message: &StructuredMessage) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        FsmConfig, LoggingConfig, NoFwdThreshold, RetryThresholds, StationConfig, TxConfig,
+        FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds, StationConfig,
+        TxConfig,
     };
     use ft8_decoder::{
         DecodeOptions, DecodeProfile, DecodedMessage, DecoderSession, StructuredCallField,
@@ -2132,6 +2247,12 @@ mod tests {
                 power_w: None,
                 tx_freq_min_hz: 200.0,
                 tx_freq_max_hz: 3500.0,
+            },
+            queue: QueueConfig {
+                auto_add_direct_calls_default: true,
+                ignore_direct_calls_from_recently_worked_default: true,
+                cq_enabled_default: false,
+                cq_percent_default: 80,
             },
             fsm: FsmConfig {
                 rr73_enabled: true,
@@ -2307,16 +2428,22 @@ mod tests {
         }
     }
 
+    fn start_command(partner_call: &str, tx_freq_hz: f32) -> QsoCommand {
+        QsoCommand::Start {
+            partner_call: partner_call.to_string(),
+            tx_freq_hz,
+            initial_state: QsoState::SendGrid,
+            start_mode: QsoStartMode::Normal,
+        }
+    }
+
     #[test]
     fn start_infers_opposite_slot_family() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2342,10 +2469,7 @@ mod tests {
         station_info.last_text = Some("CQ K1ABC CM97".to_string());
         station_info.last_structured_json = Some("{\"kind\":\"test\"}".to_string());
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(station_info),
             now,
         );
@@ -2365,10 +2489,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2393,10 +2514,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2452,10 +2570,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let rx_slot_start = now + Duration::from_secs(15);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "W5XO".to_string(),
-                tx_freq_hz: 1_000.0,
-            },
+            start_command("W5XO", 1_000.0),
             Some(StationStartInfo {
                 callsign: "W5XO".to_string(),
                 last_heard_at: now,
@@ -2525,10 +2640,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2561,10 +2673,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let rx_slot_start = now + Duration::from_secs(15);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2605,10 +2714,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let rx_slot_start = now + Duration::from_secs(15);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2654,10 +2760,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2685,10 +2788,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2716,10 +2816,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2747,10 +2844,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2777,6 +2871,7 @@ mod tests {
             session_id: 1,
             partner_call: "K1ABC".to_string(),
             state: QsoState::SendGrid,
+            start_mode: QsoStartMode::Normal,
             tx_slot_family: SlotFamily::Even,
             tx_freq_hz: 1000.0,
             latest_partner_snr_db: -9,
@@ -2788,6 +2883,7 @@ mod tests {
             pending_action: None,
             no_msg_count: 0,
             no_fwd_count: 0,
+            partner_rx_count: 0,
             last_rx_event: None,
             last_rx_stage: None,
             last_rx_text: None,
@@ -2815,10 +2911,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2867,10 +2960,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
@@ -2919,10 +3009,7 @@ mod tests {
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         controller.handle_command(
-            QsoCommand::Start {
-                partner_call: "K1ABC".to_string(),
-                tx_freq_hz: 1000.0,
-            },
+            start_command("K1ABC", 1000.0),
             Some(StationStartInfo {
                 callsign: "K1ABC".to_string(),
                 last_heard_at: now,
