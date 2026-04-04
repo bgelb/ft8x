@@ -1418,24 +1418,29 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .queue-list {
       margin-top: 8px;
       display: grid;
-      gap: 6px;
+      gap: 2px;
       max-height: 360px;
       overflow: auto;
       padding-right: 4px;
+      font-size: 11px;
+      line-height: 1.15;
     }
     .queue-item {
-      border: 1px solid rgba(143, 176, 192, 0.1);
-      border-radius: 8px;
-      padding: 8px;
-      background: rgba(19, 40, 56, 0.45);
       display: grid;
+      grid-template-columns: 78px 92px 92px 92px 58px 44px minmax(0, 1fr) 56px;
       gap: 6px;
+      align-items: baseline;
+      padding: 3px 6px;
+      border: 1px solid rgba(143, 176, 192, 0.08);
+      border-radius: 6px;
+      background: rgba(19, 40, 56, 0.45);
     }
-    .queue-topline {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      align-items: center;
+    .queue-head {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: linear-gradient(180deg, rgba(13, 29, 41, 0.98), rgba(13, 29, 41, 0.92));
+      border: 0;
     }
     .queue-call {
       font-weight: 600;
@@ -1443,9 +1448,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .queue-meta {
       color: var(--muted);
-      font-size: 12px;
-      line-height: 1.35;
-      white-space: pre-wrap;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .history-grid {
       margin-top: 8px;
@@ -2166,22 +2171,33 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (retryDelay.value === '' || Number(retryDelay.value) !== Number(queue.retry_delay_seconds)) {
         retryDelay.value = String(queue.retry_delay_seconds ?? 35);
       }
-      list.innerHTML = '';
+      list.innerHTML = `
+        <div class="queue-item queue-head">
+          <div>Call</div>
+          <div>Queued</div>
+          <div>Ready</div>
+          <div>Heard</div>
+          <div>Msg</div>
+          <div>Par</div>
+          <div>Status</div>
+          <div>Act</div>
+        </div>`;
       if (!(queue.entries || []).length) {
-        list.innerHTML = '<div class="detail-empty">No queued stations.</div>';
+        list.innerHTML += '<div class="detail-empty">No queued stations.</div>';
         return;
       }
       for (const entry of queue.entries) {
         const row = document.createElement('div');
         row.className = 'queue-item';
         row.innerHTML = `
-          <div class="queue-topline">
-            <div class="queue-call">${renderCallValue(entry.callsign, entry.callsign)}</div>
-            <button class="button secondary" type="button" data-queue-remove="${escapeHtml(entry.callsign)}">Remove</button>
-          </div>
-          <div class="queue-meta">queued ${escapeHtml(entry.queued_at)}\nok after ${escapeHtml(entry.ok_to_schedule_after)}</div>
-          <div class="queue-meta">heard ${escapeHtml(entry.last_heard_at ?? '-')}  msg=${escapeHtml(entry.last_heard_message)}  parity=${escapeHtml(entry.last_heard_slot_family ?? '-')}</div>
-          <div class="queue-meta">${escapeHtml(entry.ready ? 'ready' : entry.status)}</div>`;
+          <div class="queue-call">${renderCallValue(entry.callsign, entry.callsign)}</div>
+          <div class="queue-meta">${escapeHtml(entry.queued_at)}</div>
+          <div class="queue-meta">${escapeHtml(entry.ok_to_schedule_after)}</div>
+          <div class="queue-meta">${escapeHtml(entry.last_heard_at ?? '-')}</div>
+          <div class="queue-meta">${escapeHtml(entry.last_heard_message)}</div>
+          <div class="queue-meta">${escapeHtml(entry.last_heard_slot_family ?? '-')}</div>
+          <div class="queue-meta">${escapeHtml(entry.ready ? 'ready' : entry.status)}</div>
+          <div><button class="button secondary" type="button" data-queue-remove="${escapeHtml(entry.callsign)}">X</button></div>`;
         list.appendChild(row);
       }
     }
