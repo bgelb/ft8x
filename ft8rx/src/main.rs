@@ -16,8 +16,8 @@ use ft8_decoder::{
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qso::{
-    QsoCommand, QsoController, QsoOutcome, QsoStartMode, QsoState, RigTxBackend,
-    StationStartInfo, WebQsoDefaults, WebQsoSnapshot,
+    QsoCommand, QsoController, QsoOutcome, QsoStartMode, QsoState, RigTxBackend, StationStartInfo,
+    WebQsoDefaults, WebQsoSnapshot,
 };
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream, play_tone};
 use rigctl::{
@@ -214,19 +214,38 @@ enum RigCommand {
 
 #[derive(Debug, Clone)]
 enum QueueCommand {
-    Add { callsign: String },
-    Remove { callsign: String },
+    Add {
+        callsign: String,
+    },
+    Remove {
+        callsign: String,
+    },
     Clear,
-    SetAuto { enabled: bool },
+    SetAuto {
+        enabled: bool,
+    },
     SetTxFreq {
         slot_family: qso::SlotFamily,
         tx_freq_hz: f32,
     },
-    SetRetryDelay { retry_delay_seconds: u64 },
-    SetAutoAddDirect { enabled: bool },
-    SetIgnoreDirectWorked { enabled: bool },
-    SetCqEnabled { enabled: bool },
-    SetCqPercent { percent: u8 },
+    SetRetryDelay {
+        retry_delay_seconds: u64,
+    },
+    SetAutoAddDirect {
+        enabled: bool,
+    },
+    SetIgnoreDirectWorked {
+        enabled: bool,
+    },
+    SetCqEnabled {
+        enabled: bool,
+    },
+    SetCqPercent {
+        percent: u8,
+    },
+    SetCompoundRr73Handoff {
+        enabled: bool,
+    },
     ToggleNextCqParity,
 }
 
@@ -438,6 +457,7 @@ struct WebQueueSnapshot {
     ignore_direct_calls_from_recently_worked: bool,
     cq_enabled: bool,
     cq_percent: u8,
+    use_compound_rr73_handoff: bool,
     next_cq_parity_flipped: bool,
     even_tx_freq_hz: f32,
     odd_tx_freq_hz: f32,
@@ -545,6 +565,7 @@ struct WorkQueueState {
     ignore_direct_calls_from_recently_worked: bool,
     cq_enabled: bool,
     cq_percent: u8,
+    use_compound_rr73_handoff: bool,
     next_cq_parity_flipped: bool,
     even_tx_freq_hz: f32,
     odd_tx_freq_hz: f32,
@@ -567,6 +588,7 @@ struct WorkQueueEntry {
     last_direct_slot_family: Option<qso::SlotFamily>,
     last_direct_snr_db: Option<i32>,
     direct_start_state: Option<QsoState>,
+    direct_compound_eligible: bool,
     last_direct_text: Option<String>,
     last_direct_structured_json: Option<String>,
 }
@@ -611,6 +633,7 @@ struct DirectCallObservation {
     slot_family: qso::SlotFamily,
     snr_db: i32,
     start_state: QsoState,
+    compound_eligible: bool,
     text: String,
     structured_json: String,
 }
@@ -683,7 +706,11 @@ impl Default for StationTracker {
 }
 
 impl WorkQueueState {
-    fn new(config: &AppConfig, tx_freq_hz: f32, recent_worked: BTreeMap<String, SystemTime>) -> Self {
+    fn new(
+        config: &AppConfig,
+        tx_freq_hz: f32,
+        recent_worked: BTreeMap<String, SystemTime>,
+    ) -> Self {
         Self {
             auto_enabled: false,
             our_call: config.station.our_call.clone(),
@@ -693,6 +720,7 @@ impl WorkQueueState {
                 .ignore_direct_calls_from_recently_worked_default,
             cq_enabled: config.queue.cq_enabled_default,
             cq_percent: config.queue.cq_percent_default.min(100),
+            use_compound_rr73_handoff: config.queue.use_compound_rr73_handoff_default,
             next_cq_parity_flipped: false,
             even_tx_freq_hz: tx_freq_hz,
             odd_tx_freq_hz: tx_freq_hz,
@@ -734,6 +762,7 @@ impl WorkQueueState {
             last_direct_slot_family: None,
             last_direct_snr_db: None,
             direct_start_state: None,
+            direct_compound_eligible: false,
             last_direct_text: None,
             last_direct_structured_json: None,
         });
@@ -748,13 +777,19 @@ impl WorkQueueState {
     ) -> Result<(), String> {
         self.prune_recent_worked(now);
         if observation.callsign.eq_ignore_ascii_case(&self.our_call) {
-            info!(callsign = observation.callsign, "queue_direct_rejected_own_call");
+            info!(
+                callsign = observation.callsign,
+                "queue_direct_rejected_own_call"
+            );
             return Err("cannot queue our own call".to_string());
         }
         if self.ignore_direct_calls_from_recently_worked
             && self.was_worked_recently(&observation.callsign, now)
         {
-            info!(callsign = observation.callsign, "queue_direct_rejected_recently_worked");
+            info!(
+                callsign = observation.callsign,
+                "queue_direct_rejected_recently_worked"
+            );
             return Err("direct caller worked in last 24h".to_string());
         }
         if let Some(entry) = self
@@ -770,11 +805,13 @@ impl WorkQueueState {
             entry.last_direct_slot_index = Some(observation.slot_index);
             entry.last_direct_slot_family = Some(observation.slot_family);
             entry.last_direct_snr_db = Some(
-                entry.last_direct_snr_db
+                entry
+                    .last_direct_snr_db
                     .map(|existing| existing.max(observation.snr_db))
                     .unwrap_or(observation.snr_db),
             );
             entry.direct_start_state = Some(observation.start_state);
+            entry.direct_compound_eligible = observation.compound_eligible;
             entry.last_direct_text = Some(observation.text.clone());
             entry.last_direct_structured_json = Some(observation.structured_json.clone());
             entry.ok_to_schedule_after = now;
@@ -784,10 +821,7 @@ impl WorkQueueState {
             info!(
                 callsign = entry.callsign,
                 direct_count = entry.direct_count,
-                start_state = entry
-                    .direct_start_state
-                    .map(QsoState::as_str)
-                    .unwrap_or(""),
+                start_state = entry.direct_start_state.map(QsoState::as_str).unwrap_or(""),
                 duplicate_slot,
                 "queue_direct_updated"
             );
@@ -805,6 +839,7 @@ impl WorkQueueState {
             last_direct_slot_family: Some(observation.slot_family),
             last_direct_snr_db: Some(observation.snr_db),
             direct_start_state: Some(observation.start_state),
+            direct_compound_eligible: observation.compound_eligible,
             last_direct_text: Some(observation.text),
             last_direct_structured_json: Some(observation.structured_json),
         });
@@ -814,6 +849,59 @@ impl WorkQueueState {
             "queue_direct_added"
         );
         Ok(())
+    }
+
+    fn best_priority_direct_index_excluding(
+        &self,
+        now: SystemTime,
+        excluded_callsign: Option<&str>,
+    ) -> Option<usize> {
+        let most_recent_slot = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                excluded_callsign
+                    .is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+            })
+            .filter_map(|entry| self.direct_priority_meta(entry, now))
+            .map(|meta| meta.slot_index)
+            .max()?;
+        let target_slot = if self
+            .entries
+            .iter()
+            .filter(|entry| {
+                excluded_callsign
+                    .is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+            })
+            .filter_map(|entry| self.direct_priority_meta(entry, now))
+            .any(|meta| meta.slot_index == most_recent_slot)
+        {
+            most_recent_slot
+        } else {
+            most_recent_slot.saturating_sub(2)
+        };
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                excluded_callsign
+                    .is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+            })
+            .filter_map(|(index, entry)| {
+                let meta = self.direct_priority_meta(entry, now)?;
+                if meta.slot_index != target_slot {
+                    return None;
+                }
+                Some((index, meta))
+            })
+            .max_by(|(_, left), (_, right)| {
+                left.count
+                    .cmp(&right.count)
+                    .then_with(|| left.snr_db.cmp(&right.snr_db))
+                    .then_with(|| right.queued_at.cmp(&left.queued_at))
+                    .then_with(|| right.callsign.cmp(&left.callsign))
+            })
+            .map(|(index, _)| index)
     }
 
     fn remove_station(&mut self, callsign: &str, reason: &str) -> bool {
@@ -871,6 +959,11 @@ impl WorkQueueState {
         info!(cq_percent = self.cq_percent, "queue_cq_percent_changed");
     }
 
+    fn set_use_compound_rr73_handoff(&mut self, enabled: bool) {
+        self.use_compound_rr73_handoff = enabled;
+        info!(enabled, "queue_compound_rr73_handoff_changed");
+    }
+
     fn toggle_next_cq_parity(&mut self) {
         self.next_cq_parity_flipped = !self.next_cq_parity_flipped;
         info!(
@@ -886,8 +979,7 @@ impl WorkQueueState {
         }
         info!(
             slot_family = slot_family.as_str(),
-            tx_freq_hz,
-            "queue_tx_freq_changed"
+            tx_freq_hz, "queue_tx_freq_changed"
         );
     }
 
@@ -963,6 +1055,7 @@ impl WorkQueueState {
                     last_direct_slot_family: None,
                     last_direct_snr_db: None,
                     direct_start_state: None,
+                    direct_compound_eligible: false,
                     last_direct_text: None,
                     last_direct_structured_json: None,
                 });
@@ -1095,10 +1188,10 @@ impl WorkQueueState {
         WebQueueSnapshot {
             auto_enabled: self.auto_enabled,
             auto_add_direct_calls: self.auto_add_direct_calls,
-            ignore_direct_calls_from_recently_worked: self
-                .ignore_direct_calls_from_recently_worked,
+            ignore_direct_calls_from_recently_worked: self.ignore_direct_calls_from_recently_worked,
             cq_enabled: self.cq_enabled,
             cq_percent: self.cq_percent,
+            use_compound_rr73_handoff: self.use_compound_rr73_handoff,
             next_cq_parity_flipped: self.next_cq_parity_flipped,
             even_tx_freq_hz: self.even_tx_freq_hz,
             odd_tx_freq_hz: self.odd_tx_freq_hz,
@@ -1230,55 +1323,21 @@ impl WorkQueueState {
             entry.direct_pending
                 && now >= entry.ok_to_schedule_after
                 && entry.last_direct_slot_index == Some(slot_index)
-                && !(
-                    self.ignore_direct_calls_from_recently_worked
-                        && self.was_worked_recently(&entry.callsign, now)
-                )
+                && !(self.ignore_direct_calls_from_recently_worked
+                    && self.was_worked_recently(&entry.callsign, now))
         })
     }
 
-    fn pick_priority_direct(&mut self, now: SystemTime) -> Option<QueueDispatch> {
-        let most_recent_slot = self
-            .entries
-            .iter()
-            .filter_map(|entry| self.direct_priority_meta(entry, now))
-            .map(|meta| meta.slot_index)
-            .max()?;
-        let target_slot = if self
-            .entries
-            .iter()
-            .filter_map(|entry| self.direct_priority_meta(entry, now))
-            .any(|meta| meta.slot_index == most_recent_slot)
-        {
-            most_recent_slot
-        } else {
-            most_recent_slot.saturating_sub(2)
-        };
-        let best_index = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let meta = self.direct_priority_meta(entry, now)?;
-                if meta.slot_index != target_slot {
-                    return None;
-                }
-                Some((index, meta))
-            })
-            .max_by(|(_, left), (_, right)| {
-                left.count
-                    .cmp(&right.count)
-                    .then_with(|| left.snr_db.cmp(&right.snr_db))
-                    .then_with(|| right.queued_at.cmp(&left.queued_at))
-                    .then_with(|| right.callsign.cmp(&left.callsign))
-            })
-            .map(|(index, _)| index)?;
-        let entry = self.entries.remove(best_index).expect("queue index valid");
+    fn best_priority_direct_index(&self, now: SystemTime) -> Option<usize> {
+        self.best_priority_direct_index_excluding(now, None)
+    }
+
+    fn direct_dispatch_from_entry(&self, entry: &WorkQueueEntry, now: SystemTime) -> QueueDispatch {
         let tx_slot_family = entry
             .last_direct_slot_family
             .map(|family| family.opposite())
             .unwrap_or(qso::slot_family(next_slot_boundary(now)));
-        Some(QueueDispatch {
+        QueueDispatch {
             kind: QueueDispatchKind::Station {
                 callsign: entry.callsign.clone(),
                 initial_state: entry.direct_start_state.unwrap_or(QsoState::SendSig),
@@ -1289,10 +1348,32 @@ impl WorkQueueState {
                 context_structured_json: entry.last_direct_structured_json.clone(),
                 context_snr_db: entry.last_direct_snr_db,
             },
-            callsign: entry.callsign,
+            callsign: entry.callsign.clone(),
             tx_slot_family,
             tx_freq_hz: self.tx_freq_hz_for(tx_slot_family),
-        })
+        }
+    }
+
+    fn peek_compound_handoff_candidate(
+        &self,
+        now: SystemTime,
+        excluded_callsign: Option<&str>,
+    ) -> Option<QueueDispatch> {
+        if !self.use_compound_rr73_handoff {
+            return None;
+        }
+        let index = self.best_priority_direct_index_excluding(now, excluded_callsign)?;
+        let entry = self.entries.get(index)?;
+        if !entry.direct_compound_eligible {
+            return None;
+        }
+        Some(self.direct_dispatch_from_entry(entry, now))
+    }
+
+    fn pick_priority_direct(&mut self, now: SystemTime) -> Option<QueueDispatch> {
+        let best_index = self.best_priority_direct_index(now)?;
+        let entry = self.entries.remove(best_index).expect("queue index valid");
+        Some(self.direct_dispatch_from_entry(&entry, now))
     }
 
     fn pick_oldest_ready_normal(
@@ -1326,7 +1407,11 @@ impl WorkQueueState {
         })
     }
 
-    fn direct_priority_meta(&self, entry: &WorkQueueEntry, now: SystemTime) -> Option<DirectPriorityMeta> {
+    fn direct_priority_meta(
+        &self,
+        entry: &WorkQueueEntry,
+        now: SystemTime,
+    ) -> Option<DirectPriorityMeta> {
         if !entry.direct_pending || now < entry.ok_to_schedule_after {
             return None;
         }
@@ -2257,11 +2342,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <button id="queue-next-cq-parity" class="button secondary" type="button">Flip Next CQ Parity</button>
             <button id="queue-clear" class="button secondary" type="button">Clear Queue</button>
           </div>
-          <div class="control-row">
-            <label class="toggle-row"><input id="queue-auto-add-direct" type="checkbox"> Auto add direct calls</label>
-            <label class="toggle-row"><input id="queue-ignore-direct-worked" type="checkbox"> Ignore direct calls from already worked stations</label>
-            <label class="toggle-row"><input id="queue-cq-enabled" type="checkbox"> Enable CQ</label>
-          </div>
+        <div class="control-row">
+          <label class="toggle-row"><input id="queue-auto-add-direct" type="checkbox"> Auto add direct calls</label>
+          <label class="toggle-row"><input id="queue-ignore-direct-worked" type="checkbox"> Ignore direct calls from already worked stations</label>
+          <label class="toggle-row"><input id="queue-cq-enabled" type="checkbox"> Enable CQ</label>
+          <label class="toggle-row"><input id="queue-compound-rr73" type="checkbox"> Use compound RR73 handoff</label>
+        </div>
         </div>
         <div class="detail-block">
           <div class="label">Queue</div>
@@ -2564,6 +2650,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/queue/cq-enabled', { enabled });
       scheduleRefresh(10);
     }
+    async function updateQueueCompoundRr73Handoff(enabled) {
+      await postJson('/api/queue/compound-rr73-handoff', { enabled });
+      scheduleRefresh(10);
+    }
     async function updateQueueCqPercent(percent) {
       await postJson('/api/queue/cq-percent', { percent });
       scheduleRefresh(10);
@@ -2615,8 +2705,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const hint = document.getElementById('rig-hint');
       const rigAvailable = data.rig_mode && data.rig_mode !== 'unavailable';
       const tuneActive = !!data.rig_tune_active;
-      const qsoBusy = !!(data.qso?.active || data.qso?.tx_active);
-      const txBusy = tuneActive || !!data.rig_is_tx;
+      const qsoActive = !!data.qso?.active;
+      const txBusy = tuneActive || !!data.qso?.tx_active || !!data.rig_is_tx;
       if (
         pendingRigConfig &&
         data.rig_band === pendingRigConfig.band &&
@@ -2635,13 +2725,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (rigAvailable && effectivePower != null) {
         powerInput.value = String(effectivePower);
       }
-      tune.disabled = !rigAvailable || tuneActive || qsoBusy || txBusy;
+      bandInput.disabled = !rigAvailable || txBusy || qsoActive;
+      powerInput.disabled = !rigAvailable || txBusy;
+      tune.disabled = !rigAvailable || tuneActive || qsoActive || txBusy;
       if (!rigAvailable) {
         hint.textContent = 'Rig control unavailable.';
       } else if (tuneActive) {
         hint.textContent = 'Tuning: 1000 Hz tone for 10 seconds. TX will return to RX automatically.';
-      } else if (qsoBusy) {
-        hint.textContent = 'Rig control disabled while QSO transmit is active.';
+      } else if (txBusy) {
+        hint.textContent = 'Rig control disabled while transmit is active.';
+      } else if (qsoActive) {
+        hint.textContent = 'Power can be changed mid-QSO while not transmitting. Band changes wait until the QSO is idle.';
       } else if (pendingRigConfig) {
         hint.textContent = `Applying ${pendingRigConfig.band} at ${pendingRigConfig.power_w.toFixed(0)} W...`;
       } else {
@@ -2919,6 +3013,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const autoAddDirect = document.getElementById('queue-auto-add-direct');
       const ignoreDirectWorked = document.getElementById('queue-ignore-direct-worked');
       const cqEnabled = document.getElementById('queue-cq-enabled');
+      const compoundRr73 = document.getElementById('queue-compound-rr73');
       const cqPercent = document.getElementById('queue-cq-percent');
       const nextCqParity = document.getElementById('queue-next-cq-parity');
       const clearButton = document.getElementById('queue-clear');
@@ -2929,6 +3024,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       autoAddDirect.checked = !!queue.auto_add_direct_calls;
       ignoreDirectWorked.checked = !!queue.ignore_direct_calls_from_recently_worked;
       cqEnabled.checked = !!queue.cq_enabled;
+      compoundRr73.checked = !!queue.use_compound_rr73_handoff;
       cqPercent.value = String(queue.cq_percent ?? 80);
       nextCqParity.textContent = queue.next_cq_parity_flipped ? 'Next CQ Parity Flipped' : 'Flip Next CQ Parity';
       if (retryDelay.value === '' || Number(retryDelay.value) !== Number(queue.retry_delay_seconds)) {
@@ -3195,6 +3291,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById('queue-cq-enabled').addEventListener('change', (event) => {
       updateQueueCqEnabled(event.currentTarget.checked).catch((error) => console.error(error));
     });
+    document.getElementById('queue-compound-rr73').addEventListener('change', (event) => {
+      updateQueueCompoundRr73Handoff(event.currentTarget.checked).catch((error) => console.error(error));
+    });
     document.getElementById('queue-cq-percent').addEventListener('change', (event) => {
       updateQueueCqPercent(Number(event.currentTarget.value)).catch((error) => console.error(error));
     });
@@ -3250,14 +3349,24 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route("/api/queue/remove", post(api_queue_remove_handler))
                 .route("/api/queue/clear", post(api_queue_clear_handler))
                 .route("/api/queue/auto", post(api_queue_auto_handler))
-                .route("/api/queue/auto-add-direct", post(api_queue_auto_add_direct_handler))
+                .route(
+                    "/api/queue/auto-add-direct",
+                    post(api_queue_auto_add_direct_handler),
+                )
                 .route(
                     "/api/queue/ignore-direct-worked",
                     post(api_queue_ignore_direct_worked_handler),
                 )
                 .route("/api/queue/cq-enabled", post(api_queue_cq_enabled_handler))
                 .route("/api/queue/cq-percent", post(api_queue_cq_percent_handler))
-                .route("/api/queue/next-cq-parity", post(api_queue_next_cq_parity_handler))
+                .route(
+                    "/api/queue/compound-rr73-handoff",
+                    post(api_queue_compound_rr73_handoff_handler),
+                )
+                .route(
+                    "/api/queue/next-cq-parity",
+                    post(api_queue_next_cq_parity_handler),
+                )
                 .route("/api/queue/tx-freq", post(api_queue_tx_freq_handler))
                 .route(
                     "/api/queue/retry-delay",
@@ -3403,9 +3512,11 @@ async fn api_queue_ignore_direct_worked_handler(
     State(state): State<WebAppState>,
     Json(request): Json<QueueFlagRequest>,
 ) -> (StatusCode, Json<ApiStatus>) {
-    state.queue_control.enqueue(QueueCommand::SetIgnoreDirectWorked {
-        enabled: request.enabled,
-    });
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetIgnoreDirectWorked {
+            enabled: request.enabled,
+        });
     (
         StatusCode::ACCEPTED,
         Json(ApiStatus {
@@ -3444,9 +3555,9 @@ async fn api_queue_cq_percent_handler(
             }),
         );
     }
-    state
-        .queue_control
-        .enqueue(QueueCommand::SetCqPercent { percent: request.percent });
+    state.queue_control.enqueue(QueueCommand::SetCqPercent {
+        percent: request.percent,
+    });
     (
         StatusCode::ACCEPTED,
         Json(ApiStatus {
@@ -3456,10 +3567,30 @@ async fn api_queue_cq_percent_handler(
     )
 }
 
+async fn api_queue_compound_rr73_handoff_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetCompoundRr73Handoff {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "compound rr73 handoff updated".to_string(),
+        }),
+    )
+}
+
 async fn api_queue_next_cq_parity_handler(
     State(state): State<WebAppState>,
 ) -> (StatusCode, Json<ApiStatus>) {
-    state.queue_control.enqueue(QueueCommand::ToggleNextCqParity);
+    state
+        .queue_control
+        .enqueue(QueueCommand::ToggleNextCqParity);
     (
         StatusCode::ACCEPTED,
         Json(ApiStatus {
@@ -3554,16 +3685,15 @@ async fn api_rig_config_handler(
             }),
         );
     }
-    if snapshot.qso.active
-        || snapshot.qso.tx_active
+    let tx_active = snapshot.qso.tx_active
         || snapshot.rig_tune_active
-        || snapshot.rig_is_tx == Some(true)
-    {
+        || snapshot.rig_is_tx == Some(true);
+    if tx_active {
         return (
             StatusCode::CONFLICT,
             Json(ApiStatus {
                 ok: false,
-                message: "rig busy".to_string(),
+                message: "transmit active".to_string(),
             }),
         );
     }
@@ -3585,6 +3715,15 @@ async fn api_rig_config_handler(
             Json(ApiStatus {
                 ok: false,
                 message: "power must be between 0.1 and 110.0 W".to_string(),
+            }),
+        );
+    }
+    if snapshot.qso.active && snapshot.rig_band != band.to_string() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiStatus {
+                ok: false,
+                message: "cannot change band during active qso".to_string(),
             }),
         );
     }
@@ -3757,6 +3896,10 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             .get("tx_text")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let compound_next_call = fields
+            .get("compound_next_call")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
         let rig_band = fields
             .get("rig_band")
             .and_then(|value| value.as_str())
@@ -3809,7 +3952,8 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         {
             session.reached_73 = true;
         }
-        if event == "tx_launch" && matches!(state_before, "send_rr73" | "send_73" | "send_73_once") {
+        if event == "tx_launch" && matches!(state_before, "send_rr73" | "send_73" | "send_73_once")
+        {
             session.reached_73 = true;
             if now.duration_since(timestamp).unwrap_or_default() <= RECENT_WORKED_RETENTION {
                 match recent_worked.get(partner_call).copied() {
@@ -3835,7 +3979,9 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
                 is_ours: true,
             });
         }
-        if let Some(info) = extract_exchange_info(tx_text) {
+        if let Some(info) =
+            extract_tx_exchange_info(tx_text, event, partner_call, compound_next_call)
+        {
             push_unique_info(&mut session.sent_infos, info);
         }
         if let Some(info) = extract_exchange_info(rx_text) {
@@ -3912,7 +4058,41 @@ fn extract_exchange_info(text: &str) -> Option<String> {
     Some(info)
 }
 
+fn extract_tx_exchange_info(
+    text: &str,
+    event: &str,
+    partner_call: &str,
+    compound_next_call: &str,
+) -> Option<String> {
+    if text.contains(" RR73; ") {
+        if event == "compound_start"
+            || (!compound_next_call.is_empty()
+                && compound_next_call.eq_ignore_ascii_case(partner_call))
+        {
+            return text
+                .split_whitespace()
+                .last()
+                .map(|report| report.trim().to_uppercase())
+                .filter(|report| !report.is_empty());
+        }
+        return None;
+    }
+    extract_exchange_info(text)
+}
+
 fn parse_direct_message_calls(text: &str) -> Option<(String, String)> {
+    if let Some((_, rest)) = text.split_once(" RR73; ") {
+        let mut parts = rest.split_whitespace();
+        let to_call = parts.next()?.trim();
+        let from_call = parts
+            .next()?
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>');
+        if !to_call.is_empty() && !from_call.is_empty() {
+            return Some((to_call.to_string(), from_call.to_string()));
+        }
+    }
     let mut parts = text.split_whitespace();
     let to_call = parts.next()?.trim();
     let from_call = parts.next()?.trim();
@@ -4119,7 +4299,11 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     if config.validate_tx_freq_hz(tx_freq_hz) {
                         work_queue.set_tx_freq_hz(slot_family, tx_freq_hz);
                     } else {
-                        warn!(tx_freq_hz, slot_family = slot_family.as_str(), "queue_tx_freq_invalid");
+                        warn!(
+                            tx_freq_hz,
+                            slot_family = slot_family.as_str(),
+                            "queue_tx_freq_invalid"
+                        );
                     }
                 }
                 QueueCommand::SetRetryDelay {
@@ -4133,6 +4317,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 }
                 QueueCommand::SetCqEnabled { enabled } => work_queue.set_cq_enabled(enabled),
                 QueueCommand::SetCqPercent { percent } => work_queue.set_cq_percent(percent),
+                QueueCommand::SetCompoundRr73Handoff { enabled } => {
+                    work_queue.set_use_compound_rr73_handoff(enabled)
+                }
                 QueueCommand::ToggleNextCqParity => work_queue.toggle_next_cq_parity(),
             }
         }
@@ -4203,9 +4390,18 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     &display.early41_decodes,
                                     SystemTime::now(),
                                 );
-                                if work_queue
-                                    .has_recent_priority_direct_for_slot(slot_start, SystemTime::now())
-                                    && qso_controller.preempt_for_priority_direct(SystemTime::now())
+                                maybe_arm_compound_handoff_from_queue(
+                                    &mut work_queue,
+                                    &mut qso_controller,
+                                    &station_tracker,
+                                    slot_start,
+                                    SystemTime::now(),
+                                );
+                                if work_queue.has_recent_priority_direct_for_slot(
+                                    slot_start,
+                                    SystemTime::now(),
+                                ) && qso_controller
+                                    .preempt_for_priority_direct(SystemTime::now())
                                 {
                                     info!(
                                         slot = %format_slot_time(slot_start),
@@ -4232,9 +4428,18 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     &display.early47_decodes,
                                     SystemTime::now(),
                                 );
-                                if work_queue
-                                    .has_recent_priority_direct_for_slot(slot_start, SystemTime::now())
-                                    && qso_controller.preempt_for_priority_direct(SystemTime::now())
+                                maybe_arm_compound_handoff_from_queue(
+                                    &mut work_queue,
+                                    &mut qso_controller,
+                                    &station_tracker,
+                                    slot_start,
+                                    SystemTime::now(),
+                                );
+                                if work_queue.has_recent_priority_direct_for_slot(
+                                    slot_start,
+                                    SystemTime::now(),
+                                ) && qso_controller
+                                    .preempt_for_priority_direct(SystemTime::now())
                                 {
                                     info!(
                                         slot = %format_slot_time(slot_start),
@@ -4266,9 +4471,18 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     &display.full_decodes,
                                     SystemTime::now(),
                                 );
-                                if work_queue
-                                    .has_recent_priority_direct_for_slot(slot_start, SystemTime::now())
-                                    && qso_controller.preempt_for_priority_direct(SystemTime::now())
+                                maybe_arm_compound_handoff_from_queue(
+                                    &mut work_queue,
+                                    &mut qso_controller,
+                                    &station_tracker,
+                                    slot_start,
+                                    SystemTime::now(),
+                                );
+                                if work_queue.has_recent_priority_direct_for_slot(
+                                    slot_start,
+                                    SystemTime::now(),
+                                ) && qso_controller
+                                    .preempt_for_priority_direct(SystemTime::now())
                                 {
                                     info!(
                                         slot = %format_slot_time(slot_start),
@@ -4402,43 +4616,14 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             tune_active.load(Ordering::Relaxed) || tx_busy.load(Ordering::Relaxed),
         ) {
             let dispatch_now = SystemTime::now();
+            let station_info = station_info_from_dispatch(&station_tracker, &dispatch.kind);
             match dispatch.kind {
                 QueueDispatchKind::Station {
                     callsign,
                     initial_state,
                     start_mode,
-                    context_last_heard_at,
-                    context_last_heard_slot_family,
-                    context_text,
-                    context_structured_json,
-                    context_snr_db,
+                    ..
                 } => {
-                    let mut station_info = station_tracker.start_info(&callsign);
-                    if station_info.is_none() {
-                        if let (Some(last_heard_at), Some(last_heard_slot_family)) =
-                            (context_last_heard_at, context_last_heard_slot_family)
-                        {
-                            station_info = Some(StationStartInfo {
-                                callsign: callsign.clone(),
-                                last_heard_at,
-                                last_heard_slot_family,
-                                last_snr_db: context_snr_db.unwrap_or(0),
-                                last_text: context_text.clone(),
-                                last_structured_json: context_structured_json.clone(),
-                            });
-                        }
-                    }
-                    if let Some(info) = &mut station_info {
-                        if let Some(text) = context_text {
-                            info.last_text = Some(text);
-                        }
-                        if let Some(structured_json) = context_structured_json {
-                            info.last_structured_json = Some(structured_json);
-                        }
-                        if let Some(snr_db) = context_snr_db {
-                            info.last_snr_db = snr_db;
-                        }
-                    }
                     qso_controller.handle_command(
                         QsoCommand::Start {
                             partner_call: callsign,
@@ -6332,7 +6517,7 @@ fn direct_call_observation_from_decode(
     observed_at: SystemTime,
 ) -> Option<DirectCallObservation> {
     let sender_call = semantic_sender_call(&decode.message)?;
-    let start_state = match &decode.message {
+    let (start_state, compound_eligible) = match &decode.message {
         StructuredMessage::Standard {
             first,
             acknowledge,
@@ -6351,35 +6536,35 @@ fn direct_call_observation_from_decode(
                 } => return None,
                 StructuredInfoValue::Reply {
                     word: ft8_decoder::ReplyWord::Rrr,
-                } => QsoState::Send73,
+                } => (QsoState::Send73, false),
                 StructuredInfoValue::Reply {
                     word: ft8_decoder::ReplyWord::Blank,
                 } => {
                     if *acknowledge {
-                        QsoState::Send73
+                        (QsoState::Send73, false)
                     } else {
-                        QsoState::SendSig
+                        (QsoState::SendSig, false)
                     }
                 }
                 StructuredInfoValue::Grid { .. } => {
                     if *acknowledge {
-                        QsoState::Send73
+                        (QsoState::Send73, false)
                     } else {
-                        QsoState::SendSig
+                        (QsoState::SendSig, true)
                     }
                 }
                 StructuredInfoValue::SignalReport { .. } => {
                     if *acknowledge {
-                        QsoState::Send73
+                        (QsoState::Send73, false)
                     } else {
-                        QsoState::SendSigAck
+                        (QsoState::SendSigAck, false)
                     }
                 }
                 StructuredInfoValue::Blank => {
                     if *acknowledge {
-                        QsoState::Send73
+                        (QsoState::Send73, false)
                     } else {
-                        QsoState::SendSig
+                        (QsoState::SendSig, false)
                     }
                 }
             }
@@ -6390,8 +6575,8 @@ fn direct_call_observation_from_decode(
                 return None;
             }
             match reply {
-                ft8_decoder::ReplyWord::Blank => QsoState::SendSig,
-                ft8_decoder::ReplyWord::Rrr => QsoState::Send73,
+                ft8_decoder::ReplyWord::Blank => (QsoState::SendSig, false),
+                ft8_decoder::ReplyWord::Rrr => (QsoState::Send73, false),
                 ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree => {
                     return None;
                 }
@@ -6410,6 +6595,7 @@ fn direct_call_observation_from_decode(
         slot_family: qso::slot_family(observed_at),
         snr_db: decode.snr_db,
         start_state,
+        compound_eligible,
         text: decode.text.clone(),
         structured_json: serde_json::to_string(&decode.message).unwrap_or_default(),
     })
@@ -6425,17 +6611,109 @@ fn maybe_track_priority_directs(
     if work_queue.auto_add_direct_calls {
         let active_partner = qso_controller.active_partner_call();
         for decode in decodes {
-            let Some(observation) = direct_call_observation_from_decode(decode, our_call, slot_start)
+            let Some(observation) =
+                direct_call_observation_from_decode(decode, our_call, slot_start)
             else {
                 continue;
             };
             if active_partner.as_deref() == Some(observation.callsign.as_str()) {
                 continue;
             }
+            let reserved_station = qso::StationStartInfo {
+                callsign: observation.callsign.clone(),
+                last_heard_at: observation.observed_at,
+                last_heard_slot_family: observation.slot_family,
+                last_snr_db: observation.snr_db,
+                last_text: Some(observation.text.clone()),
+                last_structured_json: Some(observation.structured_json.clone()),
+            };
+            if qso_controller
+                .refresh_reserved_compound_next_station(reserved_station, observation.observed_at)
+            {
+                continue;
+            }
             if let Err(message) = work_queue.add_direct_observation(observation, slot_start) {
                 warn!(message, "queue_direct_add_failed");
             }
         }
+    }
+}
+
+fn station_info_from_dispatch(
+    tracker: &StationTracker,
+    kind: &QueueDispatchKind,
+) -> Option<StationStartInfo> {
+    let QueueDispatchKind::Station {
+        callsign,
+        context_last_heard_at,
+        context_last_heard_slot_family,
+        context_text,
+        context_structured_json,
+        context_snr_db,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    let mut station_info = tracker.start_info(callsign);
+    if station_info.is_none() {
+        if let (Some(last_heard_at), Some(last_heard_slot_family)) =
+            (*context_last_heard_at, *context_last_heard_slot_family)
+        {
+            station_info = Some(StationStartInfo {
+                callsign: callsign.clone(),
+                last_heard_at,
+                last_heard_slot_family,
+                last_snr_db: context_snr_db.unwrap_or(0),
+                last_text: context_text.clone(),
+                last_structured_json: context_structured_json.clone(),
+            });
+        }
+    }
+    if let Some(info) = &mut station_info {
+        if let Some(text) = context_text.clone() {
+            info.last_text = Some(text);
+        }
+        if let Some(structured_json) = context_structured_json.clone() {
+            info.last_structured_json = Some(structured_json);
+        }
+        if let Some(snr_db) = *context_snr_db {
+            info.last_snr_db = snr_db;
+        }
+    }
+    station_info
+}
+
+fn maybe_arm_compound_handoff_from_queue(
+    work_queue: &mut WorkQueueState,
+    qso_controller: &mut QsoController,
+    tracker: &StationTracker,
+    slot_start: SystemTime,
+    now: SystemTime,
+) {
+    let active_partner = qso_controller.active_partner_call();
+    let Some(candidate) =
+        work_queue.peek_compound_handoff_candidate(now, active_partner.as_deref())
+    else {
+        return;
+    };
+    let Some(station_info) = station_info_from_dispatch(tracker, &candidate.kind) else {
+        return;
+    };
+    if qso_controller.maybe_arm_compound_handoff(
+        slot_start,
+        qso::CompoundHandoffPlan {
+            next_station: station_info,
+        },
+        now,
+    ) {
+        work_queue.remove_station(&candidate.callsign, "compound_handoff_reserved");
+        info!(
+            finished_call = qso_controller.active_partner_call().unwrap_or_default(),
+            next_call = candidate.callsign,
+            slot = %format_slot_time(slot_start),
+            "qso_compound_handoff_reserved"
+        );
     }
 }
 
@@ -6681,6 +6959,7 @@ mod tests {
         FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds, StationConfig,
         TxConfig,
     };
+    use crate::qso::{SlotFamily, TxBackend};
 
     fn sample_app_config() -> AppConfig {
         AppConfig {
@@ -6702,6 +6981,7 @@ mod tests {
                 ignore_direct_calls_from_recently_worked_default: true,
                 cq_enabled_default: false,
                 cq_percent_default: 80,
+                use_compound_rr73_handoff_default: true,
             },
             fsm: FsmConfig {
                 rr73_enabled: true,
@@ -6811,6 +7091,25 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct NoopTxBackend;
+
+    impl TxBackend for NoopTxBackend {
+        fn start(&mut self, _request: qso::TxRequest) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn abort(&mut self) {}
+
+        fn poll_event(&mut self) -> Option<qso::TxEvent> {
+            None
+        }
+
+        fn is_active(&self) -> bool {
+            false
+        }
+    }
+
     #[test]
     fn related_calls_ignore_previous_qso_peer() {
         let mut tracker = StationTracker::default();
@@ -6888,6 +7187,7 @@ mod tests {
             slot_family: qso::slot_family(now),
             snr_db: -5,
             start_state: QsoState::SendSig,
+            compound_eligible: true,
             text: "N1VF K1ABC FN20".to_string(),
             structured_json: "{}".to_string(),
         };
@@ -6899,6 +7199,192 @@ mod tests {
             .expect("duplicate stage add");
         let entry = queue.entries.front().expect("queued entry");
         assert_eq!(entry.direct_count, 1);
+    }
+
+    #[test]
+    fn compound_handoff_candidate_only_uses_grid_style_directs() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        queue
+            .add_direct_observation(
+                DirectCallObservation {
+                    callsign: "GRID".to_string(),
+                    observed_at: now,
+                    slot_index: slot_index(now),
+                    slot_family: qso::slot_family(now),
+                    snr_db: -8,
+                    start_state: QsoState::SendSig,
+                    compound_eligible: true,
+                    text: "N1VF GRID FN20".to_string(),
+                    structured_json: "{}".to_string(),
+                },
+                now,
+            )
+            .expect("grid direct");
+        queue
+            .add_direct_observation(
+                DirectCallObservation {
+                    callsign: "GRID".to_string(),
+                    observed_at: now + Duration::from_secs(15),
+                    slot_index: slot_index(now + Duration::from_secs(15)),
+                    slot_family: qso::slot_family(now + Duration::from_secs(15)),
+                    snr_db: -8,
+                    start_state: QsoState::SendSig,
+                    compound_eligible: true,
+                    text: "N1VF GRID FN20".to_string(),
+                    structured_json: "{}".to_string(),
+                },
+                now + Duration::from_secs(15),
+            )
+            .expect("grid repeat");
+        queue
+            .add_direct_observation(
+                DirectCallObservation {
+                    callsign: "SIG".to_string(),
+                    observed_at: now + Duration::from_secs(15),
+                    slot_index: slot_index(now + Duration::from_secs(15)),
+                    slot_family: qso::slot_family(now + Duration::from_secs(15)),
+                    snr_db: -2,
+                    start_state: QsoState::SendSigAck,
+                    compound_eligible: false,
+                    text: "N1VF SIG -02".to_string(),
+                    structured_json: "{}".to_string(),
+                },
+                now + Duration::from_secs(15),
+            )
+            .expect("signal direct");
+        let candidate = queue
+            .peek_compound_handoff_candidate(now + Duration::from_secs(16), None)
+            .expect("compound candidate");
+        assert_eq!(candidate.callsign, "GRID");
+
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue
+            .add_direct_observation(
+                DirectCallObservation {
+                    callsign: "SIG".to_string(),
+                    observed_at: now,
+                    slot_index: slot_index(now),
+                    slot_family: qso::slot_family(now),
+                    snr_db: -2,
+                    start_state: QsoState::SendSigAck,
+                    compound_eligible: false,
+                    text: "N1VF SIG -02".to_string(),
+                    structured_json: "{}".to_string(),
+                },
+                now,
+            )
+            .expect("signal direct");
+        assert!(
+            queue
+                .peek_compound_handoff_candidate(now + Duration::from_secs(1), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reserved_compound_next_call_is_not_readded_to_queue() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let mut controller = qso::QsoController::new(config.clone(), Box::new(NoopTxBackend));
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+
+        controller.handle_command(
+            qso::QsoCommand::Start {
+                partner_call: "OLD1".to_string(),
+                tx_freq_hz: 900.0,
+                initial_state: QsoState::SendSig,
+                start_mode: qso::QsoStartMode::Direct,
+                tx_slot_family_override: Some(SlotFamily::Even),
+            },
+            Some(qso::StationStartInfo {
+                callsign: "OLD1".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -5,
+                last_text: None,
+                last_structured_json: None,
+            }),
+            now,
+        );
+        controller.on_full_decode(
+            rx_slot_start,
+            &[DecodedMessage {
+                utc: "00:00:00".to_string(),
+                snr_db: -10,
+                dt_seconds: 0.1,
+                freq_hz: 1000.0,
+                text: StructuredMessage::Standard {
+                    i3: 0,
+                    first: standard_call("N1VF"),
+                    second: standard_call("OLD1"),
+                    acknowledge: true,
+                    info: StructuredInfoField {
+                        raw: 0,
+                        value: StructuredInfoValue::Blank,
+                    },
+                }
+                .to_text(),
+                candidate_score: 0.0,
+                ldpc_iterations: 0,
+                message: StructuredMessage::Standard {
+                    i3: 0,
+                    first: standard_call("N1VF"),
+                    second: standard_call("OLD1"),
+                    acknowledge: true,
+                    info: StructuredInfoField {
+                        raw: 0,
+                        value: StructuredInfoValue::Blank,
+                    },
+                },
+            }],
+            rx_slot_start + Duration::from_secs(15),
+        );
+        assert!(controller.maybe_arm_compound_handoff(
+            rx_slot_start,
+            qso::CompoundHandoffPlan {
+                next_station: qso::StationStartInfo {
+                    callsign: "NEW1".to_string(),
+                    last_heard_at: rx_slot_start,
+                    last_heard_slot_family: SlotFamily::Odd,
+                    last_snr_db: -7,
+                    last_text: Some("N1VF NEW1 FN20".to_string()),
+                    last_structured_json: Some("{}".to_string()),
+                },
+            },
+            rx_slot_start + Duration::from_secs(15),
+        ));
+        assert_eq!(
+            controller.reserved_compound_next_call().as_deref(),
+            Some("NEW1")
+        );
+
+        let decode = DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -7,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: "N1VF NEW1 FN20".to_string(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message: StructuredMessage::Standard {
+                i3: 0,
+                first: standard_call("N1VF"),
+                second: standard_call("NEW1"),
+                acknowledge: false,
+                info: grid_info("FN20"),
+            },
+        };
+        maybe_track_priority_directs(
+            &mut queue,
+            &mut controller,
+            &[decode],
+            "N1VF",
+            rx_slot_start,
+        );
+        assert!(queue.entries.is_empty());
     }
 
     #[test]
@@ -6948,6 +7434,7 @@ mod tests {
             slot_family: qso::slot_family(now),
             snr_db: -10,
             start_state: QsoState::SendSig,
+            compound_eligible: false,
             text: "N1VF N1VF FN20".to_string(),
             structured_json: "{}".to_string(),
         };
@@ -6990,7 +7477,9 @@ mod tests {
                 tx_slot_family_override,
             } => assert_eq!(
                 tx_slot_family_override,
-                Some(qso::slot_family(next_slot_boundary(now + Duration::from_secs(15))))
+                Some(qso::slot_family(next_slot_boundary(
+                    now + Duration::from_secs(15)
+                )))
             ),
             _ => panic!("expected cq dispatch"),
         }
@@ -7021,5 +7510,30 @@ mod tests {
         assert_eq!(scan.history.len(), 1);
         assert_eq!(scan.history[0].callsign, "KJ7JJ");
         assert_eq!(scan.history[0].received_info, "DN17");
+    }
+
+    #[test]
+    fn qso_jsonl_scan_attributes_compound_report_only_to_follow_on_qso() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":10,"partner_call":"OLD1","state_before":"idle","state_after":"send_sig","last_rx_event":"start","rx_text":"","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":10,"partner_call":"OLD1","state_before":"send_rr73","state_after":"send_rr73","last_rx_event":"to_us_ack","rx_text":"","tx_text":"OLD1 RR73; NEW1 <N1VF> -07","compound_finished_call":"OLD1","compound_next_call":"NEW1"}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":10,"partner_call":"OLD1","state_before":"send_rr73","state_after":"idle","last_rx_event":"compound_handoff_sent","rx_text":"","tx_text":"","compound_finished_call":"OLD1","compound_next_call":"NEW1"}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":11,"partner_call":"NEW1","state_before":"idle","state_after":"send_sig","last_rx_event":"start_context","rx_text":"N1VF NEW1 FN20","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"compound_start","session_id":11,"partner_call":"NEW1","state_before":"idle","state_after":"send_sig","last_rx_event":"start_context","rx_text":"","tx_text":"OLD1 RR73; NEW1 <N1VF> -07","compound_finished_call":"OLD1","compound_next_call":"NEW1"}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert_eq!(scan.history.len(), 2);
+        let old = scan
+            .history
+            .iter()
+            .find(|entry| entry.callsign == "OLD1")
+            .expect("old qso");
+        let new = scan
+            .history
+            .iter()
+            .find(|entry| entry.callsign == "NEW1")
+            .expect("new qso");
+        assert_eq!(new.sent_info, "-07");
+        assert_eq!(old.sent_info, "-");
+        assert!(old.reached_73);
     }
 }

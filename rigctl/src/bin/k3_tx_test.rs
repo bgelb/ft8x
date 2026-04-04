@@ -1,12 +1,18 @@
 use clap::Parser;
 use rigctl::audio::{AudioStreamConfig, SampleStream, play_tone};
-use rigctl::{K3s, K3sConfig, TxMeterMode, detect_k3s_audio_device, detect_k3s_audio_output_device};
+use rigctl::{
+    K3s, K3sConfig, TxMeterMode, detect_k3s_audio_device, detect_k3s_audio_output_device,
+};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Exercise K3S RX/TX metering and audio tone drive")]
+#[command(
+    author,
+    version,
+    about = "Exercise K3S RX/TX metering and audio tone drive"
+)]
 struct Cli {
     #[arg(long)]
     port: Option<PathBuf>,
@@ -113,7 +119,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("input_device={} ({})", input_device.name, input_device.spec);
-    println!("output_device={} ({})", output_device.name, output_device.spec);
+    println!(
+        "output_device={} ({})",
+        output_device.name, output_device.spec
+    );
     println!(
         "rig={} Hz  mode={}  band={}  antenna={}",
         rig_state.frequency_hz, rig_state.mode, rig_state.band, rig_state.antenna
@@ -147,7 +156,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tx_tone = sample_transmit(&mut rig, &capture, tone_duration, poll)?;
     let tone_result = tone_thread.join().map_err(|_| "tone thread panicked")?;
 
-    let cleanup_result = rig.enter_rx().and_then(|_| rig.set_tx_meter_mode(original_meter_mode));
+    let cleanup_result = rig
+        .enter_rx()
+        .and_then(|_| rig.set_tx_meter_mode(original_meter_mode));
     tone_result?;
     cleanup_result?;
 
@@ -167,7 +178,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Interpretation");
     println!(
         "- audio_drop_db={:.1}",
-        rx_baseline.avg_audio_dbfs().unwrap_or(-120.0) - tx_silent.avg_audio_dbfs().unwrap_or(-120.0)
+        rx_baseline.avg_audio_dbfs().unwrap_or(-120.0)
+            - tx_silent.avg_audio_dbfs().unwrap_or(-120.0)
     );
     println!(
         "- rf_meter_gain={} -> {} bars",

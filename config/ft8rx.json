@@ -16,7 +16,8 @@
     "auto_add_direct_calls_default": true,
     "ignore_direct_calls_from_recently_worked_default": true,
     "cq_enabled_default": false,
-    "cq_percent_default": 80
+    "cq_percent_default": 80,
+    "use_compound_rr73_handoff_default": true
   },
   "fsm": {
     "rr73_enabled": true,

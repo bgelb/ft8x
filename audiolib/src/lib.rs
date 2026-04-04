@@ -137,17 +137,31 @@ impl AudioRing {
         self.recoveries += 1;
     }
 
-    fn extract_window(&self, sample_rate_hz: u32, start_time: SystemTime, sample_count: usize) -> Result<Vec<i16>> {
+    fn extract_window(
+        &self,
+        sample_rate_hz: u32,
+        start_time: SystemTime,
+        sample_count: usize,
+    ) -> Result<Vec<i16>> {
         let latest_time = self.latest_sample_time.ok_or(Error::WindowNotReady)?;
         let end_time = start_time + samples_to_duration(sample_rate_hz, sample_count as u64);
         if latest_time < end_time {
             return Err(Error::WindowNotReady);
         }
 
-        let samples_after_window =
-            duration_to_samples(sample_rate_hz, latest_time.duration_since(end_time).map_err(|_| Error::Clock)?);
-        let end_index = self.total_samples.checked_sub(samples_after_window).ok_or(Error::WindowNotReady)?;
-        let start_index = end_index.checked_sub(sample_count as u64).ok_or(Error::WindowNotReady)?;
+        let samples_after_window = duration_to_samples(
+            sample_rate_hz,
+            latest_time
+                .duration_since(end_time)
+                .map_err(|_| Error::Clock)?,
+        );
+        let end_index = self
+            .total_samples
+            .checked_sub(samples_after_window)
+            .ok_or(Error::WindowNotReady)?;
+        let start_index = end_index
+            .checked_sub(sample_count as u64)
+            .ok_or(Error::WindowNotReady)?;
         let earliest_index = self.total_samples.saturating_sub(self.len as u64);
         if start_index < earliest_index {
             return Err(Error::WindowNotReady);
@@ -197,7 +211,8 @@ impl SampleStream {
             let device_spec = device.spec.clone();
             let thread_config = config.clone();
             let join = thread::spawn(move || {
-                let result = run_capture_loop(device_spec, thread_ring, thread_stop, thread_config, tx);
+                let result =
+                    run_capture_loop(device_spec, thread_ring, thread_stop, thread_config, tx);
                 if let Err(error) = result {
                     eprintln!("audio capture thread failed: {error}");
                 }
@@ -326,8 +341,8 @@ pub fn play_tone(
     amplitude: f32,
 ) -> Result<()> {
     let channel_count = channels.max(1);
-    let frame_count =
-        ((duration.as_secs_f64() * sample_rate_hz as f64).round() as usize).max(sample_rate_hz as usize / 10);
+    let frame_count = ((duration.as_secs_f64() * sample_rate_hz as f64).round() as usize)
+        .max(sample_rate_hz as usize / 10);
     let gain = amplitude.clamp(0.0, 1.0);
     let mut samples = Vec::with_capacity(frame_count);
     for index in 0..frame_count {
@@ -379,13 +394,7 @@ pub fn play_mono_samples_until(
 ) -> Result<()> {
     let channel_count = channels.max(1);
     let interleaved = interleave_mono_samples_i16(samples, channel_count);
-    play_interleaved_samples_i16_until(
-        device,
-        sample_rate_hz,
-        channel_count,
-        &interleaved,
-        cancel,
-    )
+    play_interleaved_samples_i16_until(device, sample_rate_hz, channel_count, &interleaved, cancel)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -434,7 +443,10 @@ pub fn play_interleaved_samples_i16_until(
     let io = pcm.io_i16()?;
     let mut offset = 0usize;
     while offset < samples.len() {
-        if cancel.map(|flag| flag.load(Ordering::Relaxed)).unwrap_or(false) {
+        if cancel
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
             pcm.drop()?;
             return Ok(());
         }
@@ -458,7 +470,10 @@ pub fn play_interleaved_samples_i16_until(
         }
     }
 
-    if cancel.map(|flag| flag.load(Ordering::Relaxed)).unwrap_or(false) {
+    if cancel
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(false)
+    {
         pcm.drop()?;
         return Ok(());
     }
@@ -576,7 +591,10 @@ fn run_capture_loop(
                     .collect()
             })
             .collect();
-        let channel_rms_dbfs: Vec<f32> = per_channel.iter().map(|samples| slice_rms_dbfs(samples)).collect();
+        let channel_rms_dbfs: Vec<f32> = per_channel
+            .iter()
+            .map(|samples| slice_rms_dbfs(samples))
+            .collect();
         let selected_channel = channel_rms_dbfs
             .iter()
             .enumerate()
@@ -584,14 +602,12 @@ fn run_capture_loop(
             .map(|(index, _)| index)
             .unwrap_or(0);
 
-        ring.lock()
-            .expect("audio ring poisoned")
-            .push_mono_samples(
-                &per_channel[selected_channel],
-                SystemTime::now(),
-                channel_rms_dbfs,
-                selected_channel,
-            );
+        ring.lock().expect("audio ring poisoned").push_mono_samples(
+            &per_channel[selected_channel],
+            SystemTime::now(),
+            channel_rms_dbfs,
+            selected_channel,
+        );
     }
     Ok(())
 }
