@@ -1236,6 +1236,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       cursor: pointer;
       flex: 0 0 auto;
     }
+    .queue-tag.placeholder {
+      visibility: hidden;
+      pointer-events: none;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -1293,10 +1297,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
       line-height: 1.45;
       white-space: pre-wrap;
     }
+    #detail-state {
+      min-height: 3.2em;
+    }
+    #queue-status {
+      min-height: 1.5em;
+    }
     .history-list {
       max-height: none;
       overflow: auto;
       padding: 8px;
+      height: 108px;
     }
     .detail-empty {
       color: var(--muted);
@@ -1317,6 +1328,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       max-height: none;
       overflow: auto;
       min-height: 0;
+    }
+    #detail-logs {
+      height: 392px;
+    }
+    #direct-list {
+      height: 292px;
     }
     .activity-item {
       border: 1px solid rgba(143, 176, 192, 0.1);
@@ -1452,6 +1469,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       overflow: auto;
       min-height: 0;
     }
+    #qso-transcript {
+      height: 338px;
+    }
     .qso-entry {
       border: 1px solid rgba(143, 176, 192, 0.1);
       border-radius: 8px;
@@ -1478,6 +1498,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       color: var(--muted);
       font-size: 12px;
       line-height: 1.4;
+      min-height: 2.8em;
     }
     .toggle-row {
       display: flex;
@@ -1495,6 +1516,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 0;
       font-size: 11px;
       line-height: 1.15;
+    }
+    #queue-list {
+      height: 382px;
     }
     .queue-item {
       display: grid;
@@ -1533,6 +1557,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 0;
       font-size: 11px;
       line-height: 1.15;
+    }
+    #qso-history-list {
+      height: 292px;
     }
     .history-row {
       display: grid;
@@ -1578,22 +1605,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .table-scroll table {
       min-width: 980px;
     }
-    .detail-panel .detail-block:last-child,
-    .queue-panel .detail-block:last-child,
-    .direct-panel .detail-block:last-child,
-    .qso-panel .detail-block:last-child,
-    .log-panel .detail-block:last-child {
-      flex: 1 1 auto;
-      min-height: 0;
-    }
-    .detail-panel #detail-logs,
-    .queue-panel #queue-list,
-    .direct-panel #direct-list,
-    .qso-panel #qso-transcript,
-    .log-panel #qso-history-list {
-      flex: 1 1 auto;
-      min-height: 0;
-    }
     @media (max-width: 1100px) {
       .status-grid { grid-template-columns: 1fr; }
       .top-layout { grid-template-columns: 1fr; }
@@ -1605,6 +1616,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       .direct-panel,
       .qso-panel,
       .log-panel {
+        height: auto;
+      }
+      .history-list,
+      #detail-logs,
+      #direct-list,
+      #qso-transcript,
+      #queue-list,
+      #qso-history-list {
         height: auto;
       }
     }
@@ -2134,7 +2153,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
               line.style.color = `hsl(135 ${saturation}% ${lightness}%)`;
             }
             const queueButton = queuedCalls.has(entry.callsign) || entry.worked_recently
-              ? ''
+              ? '<span class="queue-tag placeholder">Q</span>'
               : `<span class="queue-tag" data-queue-call="${escapeHtml(entry.callsign)}">Q</span>`;
             line.innerHTML = `
               ${queueButton}
