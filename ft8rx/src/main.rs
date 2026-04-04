@@ -427,6 +427,7 @@ struct WebQueueEntry {
 struct WebQsoHistoryEntry {
     time: String,
     age: String,
+    age_seconds: u64,
     callsign: String,
     sent_info: String,
     received_info: String,
@@ -2175,7 +2176,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         row.className = 'queue-item';
         row.innerHTML = `
           <div class="queue-topline">
-            <div class="queue-call">${escapeHtml(entry.callsign)}</div>
+            <div class="queue-call">${renderCallValue(entry.callsign, entry.callsign)}</div>
             <button class="button secondary" type="button" data-queue-remove="${escapeHtml(entry.callsign)}">Remove</button>
           </div>
           <div class="queue-meta">queued ${escapeHtml(entry.queued_at)}\nok after ${escapeHtml(entry.ok_to_schedule_after)}</div>
@@ -2221,7 +2222,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const history = (data.qso_history || []).filter((entry) => entry.got_reply || entry.reached_73);
       const count = document.getElementById('qso-history-count');
       const list = document.getElementById('qso-history-list');
-      count.textContent = `${history.length} sessions`;
+      const last10m = history.filter((entry) => (entry.age_seconds ?? Number.MAX_SAFE_INTEGER) <= 10 * 60).length;
+      const last1h = history.filter((entry) => (entry.age_seconds ?? Number.MAX_SAFE_INTEGER) <= 60 * 60).length;
+      count.textContent = `${history.length} sessions  10m=${last10m}  1h=${last1h}`;
       list.innerHTML = `
         <div class="history-row history-head">
           <div>Time</div>
@@ -2869,9 +2872,11 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime) -> QsoJsonlScan {
         .into_values()
         .filter_map(|session| {
             let time = session.ended_at.or(session.last_seen_at).or(session.started_at)?;
+            let age = now.duration_since(time).unwrap_or_default();
             Some((time, WebQsoHistoryEntry {
                 time: format_datetime(time),
-                age: format_relative_age(now.duration_since(time).unwrap_or_default()),
+                age: format_relative_age(age),
+                age_seconds: age.as_secs(),
                 callsign: session.partner_call,
                 sent_info: if session.sent_infos.is_empty() {
                     "-".to_string()
