@@ -25,6 +25,8 @@ pub struct StationStartInfo {
     pub last_heard_at: SystemTime,
     pub last_heard_slot_family: SlotFamily,
     pub last_snr_db: i32,
+    pub last_text: Option<String>,
+    pub last_structured_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -461,7 +463,9 @@ impl QsoController {
                         if is_no_partner_case {
                             format!("exit queued after committed tx ({reason})")
                         } else {
-                            format!("late RX after tx launch: exit queued after current tx ({reason})")
+                            format!(
+                                "late RX after tx launch: exit queued after current tx ({reason})"
+                            )
                         },
                     );
                     Self::log_fsm(
@@ -872,16 +876,29 @@ impl QsoController {
             pending_action: None,
             no_msg_count: 0,
             no_fwd_count: 0,
-            last_rx_event: None,
+            last_rx_event: station_info
+                .last_text
+                .as_ref()
+                .map(|_| "start_context".to_string()),
             last_rx_stage: None,
-            last_rx_text: None,
-            last_rx_structured_json: None,
+            last_rx_text: station_info.last_text.clone(),
+            last_rx_structured_json: station_info.last_structured_json.clone(),
             current_rx_slot: None,
             rx_slot_consumed_stage: None,
             transcript: VecDeque::new(),
             sent_terminal_73: false,
         };
         self.next_session_id += 1;
+        if let Some(text) = station_info.last_text.clone() {
+            let state = session.state;
+            Self::push_transcript(
+                &mut session,
+                now,
+                "RX:",
+                state,
+                format!("start context: {text}"),
+            );
+        }
         let start_line = format!(
             "start qso with {} tx={} freq={:.0}Hz latest_snr={:+} last_heard={}",
             session.partner_call,
@@ -898,7 +915,7 @@ impl QsoController {
             QsoState::Idle,
             session.state,
             "start".to_string(),
-            None,
+            station_info.last_text,
             None,
             now,
         );
@@ -2279,6 +2296,17 @@ mod tests {
             .expect("decode synthesized audio")
     }
 
+    fn station_start_info(callsign: &str, now: SystemTime, family: SlotFamily) -> StationStartInfo {
+        StationStartInfo {
+            callsign: callsign.to_string(),
+            last_heard_at: now,
+            last_heard_slot_family: family,
+            last_snr_db: -9,
+            last_text: None,
+            last_structured_json: None,
+        }
+    }
+
     #[test]
     fn start_infers_opposite_slot_family() {
         let mut controller =
@@ -2294,12 +2322,40 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Even,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
         assert_eq!(
             controller.snapshot(now).tx_slot_family.as_deref(),
             Some("odd")
+        );
+    }
+
+    #[test]
+    fn start_context_seeds_last_received_decode() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let mut station_info = station_start_info("K1ABC", now, SlotFamily::Odd);
+        station_info.last_text = Some("CQ K1ABC CM97".to_string());
+        station_info.last_structured_json = Some("{\"kind\":\"test\"}".to_string());
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+            },
+            Some(station_info),
+            now,
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.last_rx_event.as_deref(), Some("start_context"));
+        assert!(
+            snapshot
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "start context: CQ K1ABC CM97")
         );
     }
 
@@ -2318,6 +2374,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2344,6 +2402,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2401,6 +2461,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2472,6 +2534,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2506,6 +2570,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2548,6 +2614,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2595,6 +2663,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2624,6 +2694,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2653,6 +2725,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2682,6 +2756,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Even,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2748,6 +2824,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2798,6 +2876,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );
@@ -2848,6 +2928,8 @@ mod tests {
                 last_heard_at: now,
                 last_heard_slot_family: SlotFamily::Odd,
                 last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
             }),
             now,
         );

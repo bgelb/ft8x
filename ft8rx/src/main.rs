@@ -458,6 +458,8 @@ struct StationState {
     last_heard_snr_db: i32,
     last_heard_slot_family: qso::SlotFamily,
     last_message_kind: StationLastMessageKind,
+    last_text: String,
+    last_structured_json: String,
     active_qso: Option<ActiveQso>,
     last_qso_ended_at: Option<SystemTime>,
     qso_history: Vec<CompletedQso>,
@@ -677,7 +679,10 @@ impl WorkQueueState {
 
     fn set_retry_delay(&mut self, retry_delay: Duration) {
         self.retry_delay = retry_delay;
-        info!(retry_delay_seconds = retry_delay.as_secs(), "queue_retry_delay_changed");
+        info!(
+            retry_delay_seconds = retry_delay.as_secs(),
+            "queue_retry_delay_changed"
+        );
     }
 
     fn sync_recent_worked(&mut self, recent_worked: BTreeMap<String, SystemTime>) {
@@ -2658,7 +2663,10 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route("/api/queue/clear", post(api_queue_clear_handler))
                 .route("/api/queue/auto", post(api_queue_auto_handler))
                 .route("/api/queue/tx-freq", post(api_queue_tx_freq_handler))
-                .route("/api/queue/retry-delay", post(api_queue_retry_delay_handler))
+                .route(
+                    "/api/queue/retry-delay",
+                    post(api_queue_retry_delay_handler),
+                )
                 .with_state(state);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -2750,7 +2758,9 @@ async fn api_queue_remove_handler(
     )
 }
 
-async fn api_queue_clear_handler(State(state): State<WebAppState>) -> (StatusCode, Json<ApiStatus>) {
+async fn api_queue_clear_handler(
+    State(state): State<WebAppState>,
+) -> (StatusCode, Json<ApiStatus>) {
     state.queue_control.enqueue(QueueCommand::Clear);
     (
         StatusCode::ACCEPTED,
@@ -3031,7 +3041,10 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             continue;
         };
         let timestamp: SystemTime = parsed.with_timezone(&Utc).into();
-        let event = fields.get("event").and_then(|value| value.as_str()).unwrap_or_default();
+        let event = fields
+            .get("event")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
         let state_before = fields
             .get("state_before")
             .and_then(|value| value.as_str())
@@ -3071,10 +3084,12 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             active_keys.insert(session_id, key);
             key
         };
-        let session = sessions.entry(key).or_insert_with(|| QsoJsonlSessionSummary {
-            partner_call: partner_call.to_string(),
-            ..QsoJsonlSessionSummary::default()
-        });
+        let session = sessions
+            .entry(key)
+            .or_insert_with(|| QsoJsonlSessionSummary {
+                partner_call: partner_call.to_string(),
+                ..QsoJsonlSessionSummary::default()
+            });
         if session.partner_call.is_empty() {
             session.partner_call = partner_call.to_string();
         }
@@ -3132,34 +3147,43 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
     let mut session_rows = sessions
         .into_values()
         .filter_map(|session| {
-            let time = session.ended_at.or(session.last_seen_at).or(session.started_at)?;
+            let time = session
+                .ended_at
+                .or(session.last_seen_at)
+                .or(session.started_at)?;
             let age = now.duration_since(time).unwrap_or_default();
-            Some((time, WebQsoHistoryEntry {
-                time: format_datetime(time),
-                age: format_relative_age(age),
-                age_seconds: age.as_secs(),
-                callsign: session.partner_call,
-                sent_info: if session.sent_infos.is_empty() {
-                    "-".to_string()
-                } else {
-                    session.sent_infos.join(", ")
+            Some((
+                time,
+                WebQsoHistoryEntry {
+                    time: format_datetime(time),
+                    age: format_relative_age(age),
+                    age_seconds: age.as_secs(),
+                    callsign: session.partner_call,
+                    sent_info: if session.sent_infos.is_empty() {
+                        "-".to_string()
+                    } else {
+                        session.sent_infos.join(", ")
+                    },
+                    received_info: if session.received_infos.is_empty() {
+                        "-".to_string()
+                    } else {
+                        session.received_infos.join(", ")
+                    },
+                    got_reply: session.got_reply,
+                    reached_73: session.reached_73,
+                    exit_reason: session
+                        .exit_reason
+                        .unwrap_or_else(|| "in_progress".to_string()),
                 },
-                received_info: if session.received_infos.is_empty() {
-                    "-".to_string()
-                } else {
-                    session.received_infos.join(", ")
-                },
-                got_reply: session.got_reply,
-                reached_73: session.reached_73,
-                exit_reason: session
-                    .exit_reason
-                    .unwrap_or_else(|| "in_progress".to_string()),
-            }))
+            ))
         })
         .collect::<Vec<_>>();
     session_rows.sort_by(|left, right| right.0.cmp(&left.0));
     session_rows.truncate(64);
-    let history = session_rows.into_iter().map(|(_, entry)| entry).collect::<Vec<_>>();
+    let history = session_rows
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>();
     direct_calls.sort_by_key(|entry| entry.sort_epoch_ms);
     info!(
         count = history.len(),
@@ -3228,8 +3252,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     };
     let mut qso_controller = QsoController::new(config.clone(), tx_backend);
     let process_started_at = SystemTime::now();
-    let mut qso_jsonl_cache =
-        QsoJsonlCache::new(PathBuf::from(&config.logging.fsm_log_path), process_started_at);
+    let mut qso_jsonl_cache = QsoJsonlCache::new(
+        PathBuf::from(&config.logging.fsm_log_path),
+        process_started_at,
+    );
     qso_jsonl_cache.refresh(process_started_at);
     let mut work_queue = WorkQueueState::new(
         qso_controller.defaults().tx_freq_default_hz,
@@ -4820,6 +4846,8 @@ impl StationTracker {
                 last_heard_snr_db: decode.snr_db,
                 last_heard_slot_family: qso::slot_family(received_at),
                 last_message_kind: station_message_kind(&decode.message),
+                last_text: decode.text.clone(),
+                last_structured_json: serde_json::to_string(&decode.message).unwrap_or_default(),
                 active_qso: None,
                 last_qso_ended_at: None,
                 qso_history: Vec::new(),
@@ -4830,6 +4858,8 @@ impl StationTracker {
         entry.last_heard_snr_db = decode.snr_db;
         entry.last_heard_slot_family = qso::slot_family(received_at);
         entry.last_message_kind = station_message_kind(&decode.message);
+        entry.last_text = decode.text.clone();
+        entry.last_structured_json = serde_json::to_string(&decode.message).unwrap_or_default();
 
         match transition {
             QsoTransition::None => {}
@@ -5068,6 +5098,9 @@ impl StationTracker {
             last_heard_at: state.last_heard_at,
             last_heard_slot_family: state.last_heard_slot_family,
             last_snr_db: state.last_heard_snr_db,
+            last_text: (!state.last_text.is_empty()).then(|| state.last_text.clone()),
+            last_structured_json: (!state.last_structured_json.is_empty())
+                .then(|| state.last_structured_json.clone()),
         })
     }
 
@@ -5102,7 +5135,10 @@ impl StationTracker {
     fn web_direct_calls(&self, our_call: &str) -> Vec<WebDirectCallLog> {
         self.logs
             .iter()
-            .filter(|entry| entry.peer.as_ref().map(|peer| self.peer_display(peer)) == Some(our_call.to_string()))
+            .filter(|entry| {
+                entry.peer.as_ref().map(|peer| self.peer_display(peer))
+                    == Some(our_call.to_string())
+            })
             .map(|entry| WebDirectCallLog {
                 sort_epoch_ms: system_time_to_epoch_ms(entry.received_at),
                 timestamp: format_time(entry.received_at),
@@ -5226,15 +5262,9 @@ fn format_relative_age(age: Duration) -> String {
     } else if seconds < 90 * 60 {
         format!("{} mins ago", ((seconds as f64) / 60.0).round() as u64)
     } else if seconds < 36 * 60 * 60 {
-        format!(
-            "{} hours ago",
-            ((seconds as f64) / 3600.0).round() as u64
-        )
+        format!("{} hours ago", ((seconds as f64) / 3600.0).round() as u64)
     } else {
-        format!(
-            "{} days ago",
-            ((seconds as f64) / 86400.0).round() as u64
-        )
+        format!("{} days ago", ((seconds as f64) / 86400.0).round() as u64)
     }
 }
 
@@ -5625,5 +5655,16 @@ mod tests {
         assert_eq!(scan.history[1].callsign, "W0ONN");
         assert!(scan.history[0].reached_73);
         assert!(!scan.history[1].reached_73);
+    }
+
+    #[test]
+    fn qso_jsonl_scan_uses_start_context_rx_text_for_received_info() {
+        let contents = r#"{"timestamp":"2026-04-04T04:54:34Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":7,"partner_call":"KJ7JJ","state_before":"idle","state_after":"send_grid","last_rx_event":"start_context","rx_text":"CQ KJ7JJ DN17","tx_text":""}}
+{"timestamp":"2026-04-04T04:54:58Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":7,"partner_call":"KJ7JJ","state_before":"send_grid","state_after":"idle","last_rx_event":"tx_error","rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert_eq!(scan.history.len(), 1);
+        assert_eq!(scan.history[0].callsign, "KJ7JJ");
+        assert_eq!(scan.history[0].received_info, "DN17");
     }
 }
