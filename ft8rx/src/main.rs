@@ -218,7 +218,10 @@ enum QueueCommand {
     Remove { callsign: String },
     Clear,
     SetAuto { enabled: bool },
-    SetTxFreq { tx_freq_hz: f32 },
+    SetTxFreq {
+        slot_family: qso::SlotFamily,
+        tx_freq_hz: f32,
+    },
     SetRetryDelay { retry_delay_seconds: u64 },
     SetAutoAddDirect { enabled: bool },
     SetIgnoreDirectWorked { enabled: bool },
@@ -231,6 +234,8 @@ enum QueueCommand {
 struct BandMapStore {
     even: BTreeMap<String, BandMapEntry>,
     odd: BTreeMap<String, BandMapEntry>,
+    even_last_updated_at: Option<SystemTime>,
+    odd_last_updated_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +324,8 @@ struct WebDecodeRow {
 struct WebBandMaps {
     even: Vec<Vec<Vec<WebBandMapCall>>>,
     odd: Vec<Vec<Vec<WebBandMapCall>>>,
+    even_age_seconds: Option<u64>,
+    odd_age_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -404,6 +411,7 @@ struct QueueFlagRequest {
 
 #[derive(Debug, Deserialize)]
 struct QueueTxFreqRequest {
+    slot_family: String,
     tx_freq_hz: f32,
 }
 
@@ -431,7 +439,8 @@ struct WebQueueSnapshot {
     cq_enabled: bool,
     cq_percent: u8,
     next_cq_parity_flipped: bool,
-    tx_freq_hz: f32,
+    even_tx_freq_hz: f32,
+    odd_tx_freq_hz: f32,
     retry_delay_seconds: u64,
     scheduler_status: String,
     entries: Vec<WebQueueEntry>,
@@ -537,7 +546,8 @@ struct WorkQueueState {
     cq_enabled: bool,
     cq_percent: u8,
     next_cq_parity_flipped: bool,
-    tx_freq_hz: f32,
+    even_tx_freq_hz: f32,
+    odd_tx_freq_hz: f32,
     retry_delay: Duration,
     entries: VecDeque<WorkQueueEntry>,
     recent_worked: BTreeMap<String, SystemTime>,
@@ -626,6 +636,7 @@ enum QueueDispatchKind {
 struct QueueDispatch {
     kind: QueueDispatchKind,
     callsign: String,
+    tx_slot_family: qso::SlotFamily,
     tx_freq_hz: f32,
 }
 
@@ -683,7 +694,8 @@ impl WorkQueueState {
             cq_enabled: config.queue.cq_enabled_default,
             cq_percent: config.queue.cq_percent_default.min(100),
             next_cq_parity_flipped: false,
-            tx_freq_hz,
+            even_tx_freq_hz: tx_freq_hz,
+            odd_tx_freq_hz: tx_freq_hz,
             retry_delay: DEFAULT_QUEUE_RETRY_DELAY,
             entries: VecDeque::new(),
             recent_worked,
@@ -867,9 +879,23 @@ impl WorkQueueState {
         );
     }
 
-    fn set_tx_freq_hz(&mut self, tx_freq_hz: f32) {
-        self.tx_freq_hz = tx_freq_hz;
-        info!(tx_freq_hz, "queue_tx_freq_changed");
+    fn set_tx_freq_hz(&mut self, slot_family: qso::SlotFamily, tx_freq_hz: f32) {
+        match slot_family {
+            qso::SlotFamily::Even => self.even_tx_freq_hz = tx_freq_hz,
+            qso::SlotFamily::Odd => self.odd_tx_freq_hz = tx_freq_hz,
+        }
+        info!(
+            slot_family = slot_family.as_str(),
+            tx_freq_hz,
+            "queue_tx_freq_changed"
+        );
+    }
+
+    fn tx_freq_hz_for(&self, slot_family: qso::SlotFamily) -> f32 {
+        match slot_family {
+            qso::SlotFamily::Even => self.even_tx_freq_hz,
+            qso::SlotFamily::Odd => self.odd_tx_freq_hz,
+        }
     }
 
     fn set_retry_delay(&mut self, retry_delay: Duration) {
@@ -981,34 +1007,51 @@ impl WorkQueueState {
         }
         if let Some(dispatch) = self.pick_priority_direct(now) {
             self.scheduler_status = format!("dispatching direct {}", dispatch.callsign);
-            info!(callsign = dispatch.callsign, tx_freq_hz = self.tx_freq_hz, "queue_dispatch_direct");
+            info!(
+                callsign = dispatch.callsign,
+                tx_slot_family = dispatch.tx_slot_family.as_str(),
+                tx_freq_hz = dispatch.tx_freq_hz,
+                "queue_dispatch_direct"
+            );
             return Some(dispatch);
         }
         let normal_pick = self.pick_oldest_ready_normal(now, tracker);
         if self.cq_enabled && self.should_choose_cq(now) {
-            let tx_slot_family_override = if self.next_cq_parity_flipped {
+            let tx_slot_family = if self.next_cq_parity_flipped {
                 Some(qso::slot_family(next_slot_boundary(now)).opposite())
             } else {
                 None
-            };
+            }
+            .unwrap_or_else(|| qso::slot_family(next_slot_boundary(now)));
             self.next_cq_parity_flipped = false;
             self.scheduler_status = if normal_pick.is_some() {
                 format!("dispatching cq at {}%", self.cq_percent)
             } else {
                 format!("cq idle roll at {}%", self.cq_percent)
             };
-            info!(cq_percent = self.cq_percent, "queue_dispatch_cq");
+            info!(
+                cq_percent = self.cq_percent,
+                tx_slot_family = tx_slot_family.as_str(),
+                tx_freq_hz = self.tx_freq_hz_for(tx_slot_family),
+                "queue_dispatch_cq"
+            );
             return Some(QueueDispatch {
                 kind: QueueDispatchKind::Cq {
-                    tx_slot_family_override,
+                    tx_slot_family_override: Some(tx_slot_family),
                 },
                 callsign: "CQ".to_string(),
-                tx_freq_hz: self.tx_freq_hz,
+                tx_slot_family,
+                tx_freq_hz: self.tx_freq_hz_for(tx_slot_family),
             });
         }
         if let Some(dispatch) = normal_pick {
             self.scheduler_status = format!("dispatching {}", dispatch.callsign);
-            info!(callsign = dispatch.callsign, tx_freq_hz = self.tx_freq_hz, "queue_dispatch");
+            info!(
+                callsign = dispatch.callsign,
+                tx_slot_family = dispatch.tx_slot_family.as_str(),
+                tx_freq_hz = dispatch.tx_freq_hz,
+                "queue_dispatch"
+            );
             return Some(dispatch);
         }
         self.scheduler_status = if self.entries.is_empty() {
@@ -1057,7 +1100,8 @@ impl WorkQueueState {
             cq_enabled: self.cq_enabled,
             cq_percent: self.cq_percent,
             next_cq_parity_flipped: self.next_cq_parity_flipped,
-            tx_freq_hz: self.tx_freq_hz,
+            even_tx_freq_hz: self.even_tx_freq_hz,
+            odd_tx_freq_hz: self.odd_tx_freq_hz,
             retry_delay_seconds: self.retry_delay.as_secs(),
             scheduler_status: self.scheduler_status.clone(),
             entries,
@@ -1230,6 +1274,10 @@ impl WorkQueueState {
             })
             .map(|(index, _)| index)?;
         let entry = self.entries.remove(best_index).expect("queue index valid");
+        let tx_slot_family = entry
+            .last_direct_slot_family
+            .map(|family| family.opposite())
+            .unwrap_or(qso::slot_family(next_slot_boundary(now)));
         Some(QueueDispatch {
             kind: QueueDispatchKind::Station {
                 callsign: entry.callsign.clone(),
@@ -1242,7 +1290,8 @@ impl WorkQueueState {
                 context_snr_db: entry.last_direct_snr_db,
             },
             callsign: entry.callsign,
-            tx_freq_hz: self.tx_freq_hz,
+            tx_slot_family,
+            tx_freq_hz: self.tx_freq_hz_for(tx_slot_family),
         })
     }
 
@@ -1256,6 +1305,10 @@ impl WorkQueueState {
             .iter()
             .position(|entry| self.entry_status(entry, tracker, now).ready)?;
         let entry = self.entries.remove(index).expect("queue index valid");
+        let tx_slot_family = tracker
+            .start_info(&entry.callsign)
+            .map(|info| info.last_heard_slot_family.opposite())
+            .unwrap_or(qso::slot_family(next_slot_boundary(now)));
         Some(QueueDispatch {
             kind: QueueDispatchKind::Station {
                 callsign: entry.callsign.clone(),
@@ -1268,7 +1321,8 @@ impl WorkQueueState {
                 context_snr_db: None,
             },
             callsign: entry.callsign,
-            tx_freq_hz: self.tx_freq_hz,
+            tx_slot_family,
+            tx_freq_hz: self.tx_freq_hz_for(tx_slot_family),
         })
     }
 
@@ -2220,10 +2274,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="control-row">
           <div class="control-inline">
             <div class="input-wrap">
-              <div class="label">TX Freq</div>
-              <input id="qso-freq" class="control-input" type="number" min="200" max="3500" step="1">
+              <div class="label">Even TX Hz</div>
+              <input id="qso-freq-even" class="control-input" type="number" min="200" max="3500" step="1">
             </div>
-            <button id="qso-autopick" class="button secondary" type="button">Auto-Pick Quiet Spot</button>
+            <button id="qso-autopick-even" class="button secondary" type="button">Auto-Pick Even</button>
+            <div class="input-wrap">
+              <div class="label">Odd TX Hz</div>
+              <input id="qso-freq-odd" class="control-input" type="number" min="200" max="3500" step="1">
+            </div>
+            <button id="qso-autopick-odd" class="button secondary" type="button">Auto-Pick Odd</button>
           </div>
           <div class="control-inline dual">
             <label class="toggle-row"><input id="qso-auto" type="checkbox"> Auto QSO From Queue</label>
@@ -2375,20 +2434,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (!station || !station.last_heard_slot_family) return null;
       return station.last_heard_slot_family === 'even' ? 'odd' : 'even';
     }
-    function currentTxFreqValue(data) {
-      const input = document.getElementById('qso-freq');
+    function currentTxFreqValue(data, txParity) {
+      const input = document.getElementById(txParity === 'even' ? 'qso-freq-even' : 'qso-freq-odd');
       const current = Number(input.value);
       if (Number.isFinite(current) && input.value !== '') {
         return current;
       }
-      if (data?.qso?.active && data?.qso?.selected_tx_freq_hz != null) {
-        return data.qso.selected_tx_freq_hz;
+      if (txParity === 'even' && data?.queue?.even_tx_freq_hz != null) {
+        return data.queue.even_tx_freq_hz;
       }
-      if (data?.queue?.tx_freq_hz != null) {
-        return data.queue.tx_freq_hz;
-      }
-      if (data?.qso?.selected_tx_freq_hz != null) {
-        return data.qso.selected_tx_freq_hz;
+      if (txParity === 'odd' && data?.queue?.odd_tx_freq_hz != null) {
+        return data.queue.odd_tx_freq_hz;
       }
       return data?.qso_defaults?.tx_freq_default_hz ?? 1000;
     }
@@ -2399,8 +2455,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     function quietSpotFrequency(data, txParity) {
       const defaults = data.qso_defaults || {};
-      const min = defaults.tx_freq_min_hz ?? 200;
-      const max = defaults.tx_freq_max_hz ?? 3500;
+      const min = Math.max(defaults.tx_freq_min_hz ?? 200, 350);
+      const max = Math.min(defaults.tx_freq_max_hz ?? 3500, 2600);
       const fallback = defaults.tx_freq_default_hz ?? 1000;
       const grid = txParity === 'even' ? data.bandmaps?.even : data.bandmaps?.odd;
       if (!grid || !grid.length) return fallback;
@@ -2427,6 +2483,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
         }
       }
       return best ? best.centerHz : fallback;
+    }
+    function bandmapAgeSeconds(data, txParity) {
+      return txParity === 'even'
+        ? data?.bandmaps?.even_age_seconds
+        : data?.bandmaps?.odd_age_seconds;
+    }
+    function autoPickAllowed(data, txParity) {
+      const ageSeconds = bandmapAgeSeconds(data, txParity);
+      if (ageSeconds == null || ageSeconds >= 120) return false;
+      if (data?.rig_tune_active) return false;
+      if (data?.qso?.tx_active && data?.qso?.tx_slot_family === txParity) return false;
+      return true;
     }
     function eligibleBandmapCallsigns(data, grid) {
       const queuedCalls = new Set((data.queue?.entries || []).map((entry) => entry.callsign));
@@ -2500,8 +2568,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/queue/cq-percent', { percent });
       scheduleRefresh(10);
     }
-    async function updateQueueTxFreq(txFreqHz) {
-      await postJson('/api/queue/tx-freq', { tx_freq_hz: txFreqHz });
+    async function updateQueueTxFreq(txParity, txFreqHz) {
+      await postJson('/api/queue/tx-freq', { slot_family: txParity, tx_freq_hz: txFreqHz });
       scheduleRefresh(10);
     }
     async function updateQueueRetryDelay(seconds) {
@@ -2530,18 +2598,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       scheduleRefresh(10);
     }
-    async function autoPickQuietSpot() {
+    async function autoPickQuietSpot(txParity) {
       if (!lastSnapshot) return;
-      const queue = lastSnapshot.queue || {};
-      const selected = selectedStation(lastSnapshot);
-      const candidateCall = selected?.callsign || (queue.entries || []).find((entry) => entry.ready)?.callsign || null;
-      const station = candidateCall ? stationMap(lastSnapshot).get(candidateCall) : null;
-      const txParity = inferredTxParity(station);
-      if (!txParity) return;
+      if (!autoPickAllowed(lastSnapshot, txParity)) return;
       const picked = quietSpotFrequency(lastSnapshot, txParity).toFixed(0);
-      document.getElementById('qso-freq').value = picked;
+      document.getElementById(txParity === 'even' ? 'qso-freq-even' : 'qso-freq-odd').value = picked;
       renderQso(lastSnapshot);
-      await updateQueueTxFreq(Number(picked));
+      await updateQueueTxFreq(txParity, Number(picked));
     }
     function renderRigControls(data) {
       initRigBandOptions();
@@ -2780,20 +2843,27 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const transcript = document.getElementById('qso-transcript');
       const autoToggle = document.getElementById('qso-auto');
       const stop = document.getElementById('qso-stop');
-      const autoPick = document.getElementById('qso-autopick');
-      const freqInput = document.getElementById('qso-freq');
+      const evenAutoPick = document.getElementById('qso-autopick-even');
+      const oddAutoPick = document.getElementById('qso-autopick-odd');
+      const evenFreqInput = document.getElementById('qso-freq-even');
+      const oddFreqInput = document.getElementById('qso-freq-odd');
       const queue = data.queue || {};
       const station = selectedStation(data);
       const qso = data.qso || {};
       const readyQueueEntry = (queue.entries || []).find((entry) => entry.ready);
       const candidateStation = station || (readyQueueEntry ? stationMap(data).get(readyQueueEntry.callsign) : null);
       const txParity = qso.active ? qso.tx_slot_family : inferredTxParity(candidateStation);
-      const txFreq = qso.active ? qso.selected_tx_freq_hz : currentTxFreqValue(data);
-      const rigBusy = !!data.rig_tune_active || data.rig_is_tx === true;
-      freqInput.min = String(data.qso_defaults?.tx_freq_min_hz ?? 200);
-      freqInput.max = String(data.qso_defaults?.tx_freq_max_hz ?? 3500);
-      if (freqInput.value === '' || Number(freqInput.value) !== Number(txFreq) || qso.active) {
-        freqInput.value = Number(txFreq).toFixed(0);
+      const evenFreq = currentTxFreqValue(data, 'even');
+      const oddFreq = currentTxFreqValue(data, 'odd');
+      evenFreqInput.min = String(data.qso_defaults?.tx_freq_min_hz ?? 200);
+      evenFreqInput.max = String(data.qso_defaults?.tx_freq_max_hz ?? 3500);
+      oddFreqInput.min = String(data.qso_defaults?.tx_freq_min_hz ?? 200);
+      oddFreqInput.max = String(data.qso_defaults?.tx_freq_max_hz ?? 3500);
+      if (evenFreqInput.value === '' || Number(evenFreqInput.value) !== Number(evenFreq)) {
+        evenFreqInput.value = Number(evenFreq).toFixed(0);
+      }
+      if (oddFreqInput.value === '' || Number(oddFreqInput.value) !== Number(oddFreq)) {
+        oddFreqInput.value = Number(oddFreq).toFixed(0);
       }
       autoToggle.checked = !!queue.auto_enabled;
       call.textContent = qso.active
@@ -2834,11 +2904,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (autoFollowQso) {
         transcript.scrollTop = transcript.scrollHeight;
       }
-      const freqOkay = txFreqValid(data, Number(freqInput.value));
       stop.disabled = !qso.active && !qso.tx_active;
       autoToggle.disabled = !!data.rig_tune_active;
-      freqInput.disabled = qso.active || qso.tx_active;
-      autoPick.disabled = !candidateStation || !txParity || qso.active || qso.tx_active;
+      evenAutoPick.disabled = !autoPickAllowed(data, 'even');
+      oddAutoPick.disabled = !autoPickAllowed(data, 'odd');
+      evenAutoPick.textContent = autoPickAllowed(data, 'even') ? 'Auto-Pick Even' : 'Auto-Pick Even';
+      oddAutoPick.textContent = autoPickAllowed(data, 'odd') ? 'Auto-Pick Odd' : 'Auto-Pick Odd';
     }
     function renderQueue(data) {
       const queue = data.queue || {};
@@ -3076,19 +3147,33 @@ const INDEX_HTML: &str = r#"<!doctype html>
         console.error(error);
       });
     });
-    document.getElementById('qso-autopick').addEventListener('click', () => {
-      autoPickQuietSpot().catch((error) => console.error(error));
+    document.getElementById('qso-autopick-even').addEventListener('click', () => {
+      autoPickQuietSpot('even').catch((error) => console.error(error));
     });
-    document.getElementById('qso-freq').addEventListener('input', () => {
+    document.getElementById('qso-autopick-odd').addEventListener('click', () => {
+      autoPickQuietSpot('odd').catch((error) => console.error(error));
+    });
+    document.getElementById('qso-freq-even').addEventListener('input', () => {
       if (lastSnapshot) renderQso(lastSnapshot);
     });
-    document.getElementById('qso-freq').addEventListener('change', (event) => {
+    document.getElementById('qso-freq-even').addEventListener('change', (event) => {
       const value = Number(event.currentTarget.value);
       if (!lastSnapshot || !txFreqValid(lastSnapshot, value)) {
         if (lastSnapshot) renderQso(lastSnapshot);
         return;
       }
-      updateQueueTxFreq(value).catch((error) => console.error(error));
+      updateQueueTxFreq('even', value).catch((error) => console.error(error));
+    });
+    document.getElementById('qso-freq-odd').addEventListener('input', () => {
+      if (lastSnapshot) renderQso(lastSnapshot);
+    });
+    document.getElementById('qso-freq-odd').addEventListener('change', (event) => {
+      const value = Number(event.currentTarget.value);
+      if (!lastSnapshot || !txFreqValid(lastSnapshot, value)) {
+        if (lastSnapshot) renderQso(lastSnapshot);
+        return;
+      }
+      updateQueueTxFreq('odd', value).catch((error) => console.error(error));
     });
     document.getElementById('queue-retry-delay').addEventListener('change', (event) => {
       const value = Number(event.currentTarget.value);
@@ -3404,14 +3489,24 @@ async fn api_queue_tx_freq_handler(
             }),
         );
     }
+    let Some(slot_family) = parse_slot_family_name(&request.slot_family) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "slot_family must be 'even' or 'odd'".to_string(),
+            }),
+        );
+    };
     state.queue_control.enqueue(QueueCommand::SetTxFreq {
+        slot_family,
         tx_freq_hz: request.tx_freq_hz,
     });
     (
         StatusCode::ACCEPTED,
         Json(ApiStatus {
             ok: true,
-            message: "queue tx freq updated".to_string(),
+            message: format!("queue {} tx freq updated", slot_family.as_str()),
         }),
     )
 }
@@ -4017,11 +4112,14 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 }
                 QueueCommand::Clear => work_queue.clear("manual_clear"),
                 QueueCommand::SetAuto { enabled } => work_queue.set_auto_enabled(enabled),
-                QueueCommand::SetTxFreq { tx_freq_hz } => {
+                QueueCommand::SetTxFreq {
+                    slot_family,
+                    tx_freq_hz,
+                } => {
                     if config.validate_tx_freq_hz(tx_freq_hz) {
-                        work_queue.set_tx_freq_hz(tx_freq_hz);
+                        work_queue.set_tx_freq_hz(slot_family, tx_freq_hz);
                     } else {
-                        warn!(tx_freq_hz, "queue_tx_freq_invalid");
+                        warn!(tx_freq_hz, slot_family = slot_family.as_str(), "queue_tx_freq_invalid");
                     }
                 }
                 QueueCommand::SetRetryDelay {
@@ -4523,6 +4621,8 @@ fn refresh_web_snapshot(
     guard.bandmaps = WebBandMaps {
         even: build_bandmap_grid(&bandmaps.even, current_slot_index, work_queue, now),
         odd: build_bandmap_grid(&bandmaps.odd, current_slot_index, work_queue, now),
+        even_age_seconds: bandmap_age_seconds(bandmaps.even_last_updated_at, now),
+        odd_age_seconds: bandmap_age_seconds(bandmaps.odd_last_updated_at, now),
     };
     guard.stations = station_tracker.web_station_summaries();
     guard.station_logs = station_tracker.web_logs();
@@ -5111,6 +5211,14 @@ fn is_even_slot_family(time: SystemTime) -> bool {
         .as_secs()
         % 60;
     matches!(second, 0 | 30)
+}
+
+fn parse_slot_family_name(value: &str) -> Option<qso::SlotFamily> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "even" => Some(qso::SlotFamily::Even),
+        "odd" => Some(qso::SlotFamily::Odd),
+        _ => None,
+    }
 }
 
 fn format_slot_time(time: SystemTime) -> String {
@@ -6238,8 +6346,10 @@ fn update_bandmaps(store: &mut BandMapStore, slot_start: SystemTime, decodes: &[
     prune_bandmap(&mut store.even, slot_idx);
     prune_bandmap(&mut store.odd, slot_idx);
     let map = if is_even_slot_family(slot_start) {
+        store.even_last_updated_at = Some(slot_start);
         &mut store.even
     } else {
+        store.odd_last_updated_at = Some(slot_start);
         &mut store.odd
     };
     for decode in decodes {
@@ -6260,6 +6370,12 @@ fn update_bandmaps(store: &mut BandMapStore, slot_start: SystemTime, decodes: &[
 fn clear_bandmaps(store: &mut BandMapStore) {
     store.even.clear();
     store.odd.clear();
+    store.even_last_updated_at = None;
+    store.odd_last_updated_at = None;
+}
+
+fn bandmap_age_seconds(last_updated_at: Option<SystemTime>, now: SystemTime) -> Option<u64> {
+    last_updated_at.map(|updated_at| now.duration_since(updated_at).unwrap_or_default().as_secs())
 }
 
 fn prune_bandmap(map: &mut BTreeMap<String, BandMapEntry>, current_slot_index: u64) {
@@ -6636,7 +6752,10 @@ mod tests {
         match second.kind {
             QueueDispatchKind::Cq {
                 tx_slot_family_override,
-            } => assert_eq!(tx_slot_family_override, None),
+            } => assert_eq!(
+                tx_slot_family_override,
+                Some(qso::slot_family(next_slot_boundary(now + Duration::from_secs(15))))
+            ),
             _ => panic!("expected cq dispatch"),
         }
     }
