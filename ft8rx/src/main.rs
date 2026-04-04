@@ -224,6 +224,7 @@ enum QueueCommand {
     SetIgnoreDirectWorked { enabled: bool },
     SetCqEnabled { enabled: bool },
     SetCqPercent { percent: u8 },
+    ToggleNextCqParity,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -429,6 +430,7 @@ struct WebQueueSnapshot {
     ignore_direct_calls_from_recently_worked: bool,
     cq_enabled: bool,
     cq_percent: u8,
+    next_cq_parity_flipped: bool,
     tx_freq_hz: f32,
     retry_delay_seconds: u64,
     scheduler_status: String,
@@ -528,10 +530,12 @@ struct LoggedDecode {
 #[derive(Debug, Clone)]
 struct WorkQueueState {
     auto_enabled: bool,
+    our_call: String,
     auto_add_direct_calls: bool,
     ignore_direct_calls_from_recently_worked: bool,
     cq_enabled: bool,
     cq_percent: u8,
+    next_cq_parity_flipped: bool,
     tx_freq_hz: f32,
     retry_delay: Duration,
     entries: VecDeque<WorkQueueEntry>,
@@ -612,7 +616,9 @@ enum QueueDispatchKind {
         context_structured_json: Option<String>,
         context_snr_db: Option<i32>,
     },
-    Cq,
+    Cq {
+        tx_slot_family_override: Option<qso::SlotFamily>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -667,12 +673,14 @@ impl WorkQueueState {
     fn new(config: &AppConfig, tx_freq_hz: f32, recent_worked: BTreeMap<String, SystemTime>) -> Self {
         Self {
             auto_enabled: false,
+            our_call: config.station.our_call.clone(),
             auto_add_direct_calls: config.queue.auto_add_direct_calls_default,
             ignore_direct_calls_from_recently_worked: config
                 .queue
                 .ignore_direct_calls_from_recently_worked_default,
             cq_enabled: config.queue.cq_enabled_default,
             cq_percent: config.queue.cq_percent_default.min(100),
+            next_cq_parity_flipped: false,
             tx_freq_hz,
             retry_delay: DEFAULT_QUEUE_RETRY_DELAY,
             entries: VecDeque::new(),
@@ -688,6 +696,10 @@ impl WorkQueueState {
         now: SystemTime,
     ) -> Result<(), String> {
         self.prune_recent_worked(now);
+        if callsign.eq_ignore_ascii_case(&self.our_call) {
+            info!(callsign, "queue_add_rejected_own_call");
+            return Err("cannot queue our own call".to_string());
+        }
         if self.was_worked_recently(callsign, now) {
             info!(callsign, "queue_add_rejected_recently_worked");
             return Err("station worked in last 24h".to_string());
@@ -721,6 +733,10 @@ impl WorkQueueState {
         now: SystemTime,
     ) -> Result<(), String> {
         self.prune_recent_worked(now);
+        if observation.callsign.eq_ignore_ascii_case(&self.our_call) {
+            info!(callsign = observation.callsign, "queue_direct_rejected_own_call");
+            return Err("cannot queue our own call".to_string());
+        }
         if self.ignore_direct_calls_from_recently_worked
             && self.was_worked_recently(&observation.callsign, now)
         {
@@ -839,6 +855,14 @@ impl WorkQueueState {
     fn set_cq_percent(&mut self, percent: u8) {
         self.cq_percent = percent.min(100);
         info!(cq_percent = self.cq_percent, "queue_cq_percent_changed");
+    }
+
+    fn toggle_next_cq_parity(&mut self) {
+        self.next_cq_parity_flipped = !self.next_cq_parity_flipped;
+        info!(
+            next_cq_parity_flipped = self.next_cq_parity_flipped,
+            "queue_next_cq_parity_toggled"
+        );
     }
 
     fn set_tx_freq_hz(&mut self, tx_freq_hz: f32) {
@@ -960,6 +984,12 @@ impl WorkQueueState {
         }
         let normal_pick = self.pick_oldest_ready_normal(now, tracker);
         if self.cq_enabled && self.should_choose_cq(now) {
+            let tx_slot_family_override = if self.next_cq_parity_flipped {
+                Some(qso::slot_family(next_slot_boundary(now)).opposite())
+            } else {
+                None
+            };
+            self.next_cq_parity_flipped = false;
             self.scheduler_status = if normal_pick.is_some() {
                 format!("dispatching cq at {}%", self.cq_percent)
             } else {
@@ -967,7 +997,9 @@ impl WorkQueueState {
             };
             info!(cq_percent = self.cq_percent, "queue_dispatch_cq");
             return Some(QueueDispatch {
-                kind: QueueDispatchKind::Cq,
+                kind: QueueDispatchKind::Cq {
+                    tx_slot_family_override,
+                },
                 callsign: "CQ".to_string(),
                 tx_freq_hz: self.tx_freq_hz,
             });
@@ -1022,6 +1054,7 @@ impl WorkQueueState {
                 .ignore_direct_calls_from_recently_worked,
             cq_enabled: self.cq_enabled,
             cq_percent: self.cq_percent,
+            next_cq_parity_flipped: self.next_cq_parity_flipped,
             tx_freq_hz: self.tx_freq_hz,
             retry_delay_seconds: self.retry_delay.as_secs(),
             scheduler_status: self.scheduler_status.clone(),
@@ -2165,6 +2198,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
                 <option value="100">100%</option>
               </select>
             </div>
+            <button id="queue-next-cq-parity" class="button secondary" type="button">Flip Next CQ Parity</button>
             <button id="queue-clear" class="button secondary" type="button">Clear Queue</button>
           </div>
           <div class="control-row">
@@ -2812,6 +2846,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const ignoreDirectWorked = document.getElementById('queue-ignore-direct-worked');
       const cqEnabled = document.getElementById('queue-cq-enabled');
       const cqPercent = document.getElementById('queue-cq-percent');
+      const nextCqParity = document.getElementById('queue-next-cq-parity');
       const clearButton = document.getElementById('queue-clear');
       const list = document.getElementById('queue-list');
       count.textContent = `${(queue.entries || []).length} queued`;
@@ -2821,6 +2856,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       ignoreDirectWorked.checked = !!queue.ignore_direct_calls_from_recently_worked;
       cqEnabled.checked = !!queue.cq_enabled;
       cqPercent.value = String(queue.cq_percent ?? 80);
+      nextCqParity.textContent = queue.next_cq_parity_flipped ? 'Next CQ Parity Flipped' : 'Flip Next CQ Parity';
       if (retryDelay.value === '' || Number(retryDelay.value) !== Number(queue.retry_delay_seconds)) {
         retryDelay.value = String(queue.retry_delay_seconds ?? 35);
       }
@@ -3072,6 +3108,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById('queue-cq-percent').addEventListener('change', (event) => {
       updateQueueCqPercent(Number(event.currentTarget.value)).catch((error) => console.error(error));
     });
+    document.getElementById('queue-next-cq-parity').addEventListener('click', () => {
+      fetchJson('/api/queue/next-cq-parity', { method: 'POST' }).then(refresh).catch((error) => console.error(error));
+    });
     document.getElementById('queue-even-map').addEventListener('click', () => {
       addBandmapCallsToQueue('even').catch((error) => console.error(error));
     });
@@ -3128,6 +3167,7 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 )
                 .route("/api/queue/cq-enabled", post(api_queue_cq_enabled_handler))
                 .route("/api/queue/cq-percent", post(api_queue_cq_percent_handler))
+                .route("/api/queue/next-cq-parity", post(api_queue_next_cq_parity_handler))
                 .route("/api/queue/tx-freq", post(api_queue_tx_freq_handler))
                 .route(
                     "/api/queue/retry-delay",
@@ -3322,6 +3362,19 @@ async fn api_queue_cq_percent_handler(
         Json(ApiStatus {
             ok: true,
             message: "queue cq percent updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_next_cq_parity_handler(
+    State(state): State<WebAppState>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state.queue_control.enqueue(QueueCommand::ToggleNextCqParity);
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "next cq parity toggled".to_string(),
         }),
     )
 }
@@ -3956,6 +4009,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 }
                 QueueCommand::SetCqEnabled { enabled } => work_queue.set_cq_enabled(enabled),
                 QueueCommand::SetCqPercent { percent } => work_queue.set_cq_percent(percent),
+                QueueCommand::ToggleNextCqParity => work_queue.toggle_next_cq_parity(),
             }
         }
         for command in rig_control.drain() {
@@ -4258,18 +4312,22 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             tx_freq_hz: dispatch.tx_freq_hz,
                             initial_state,
                             start_mode,
+                            tx_slot_family_override: None,
                         },
                         station_info,
                         dispatch_now,
                     );
                 }
-                QueueDispatchKind::Cq => {
+                QueueDispatchKind::Cq {
+                    tx_slot_family_override,
+                } => {
                     qso_controller.handle_command(
                         QsoCommand::Start {
                             partner_call: "CQ".to_string(),
                             tx_freq_hz: dispatch.tx_freq_hz,
                             initial_state: QsoState::SendCq,
                             start_mode: QsoStartMode::Cq,
+                            tx_slot_family_override,
                         },
                         None,
                         dispatch_now,
@@ -6482,6 +6540,65 @@ mod tests {
         let added = queue.add_station("K1ABC", now, now);
         assert!(added.is_err());
         assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn queue_rejects_our_own_call() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        assert!(queue.add_station("N1VF", now, now).is_err());
+        assert!(queue.entries.is_empty());
+        let observation = DirectCallObservation {
+            callsign: "N1VF".to_string(),
+            observed_at: now,
+            slot_index: slot_index(now),
+            slot_family: qso::slot_family(now),
+            snr_db: -10,
+            start_state: QsoState::SendSig,
+            text: "N1VF N1VF FN20".to_string(),
+            structured_json: "{}".to_string(),
+        };
+        assert!(queue.add_direct_observation(observation, now).is_err());
+        assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn next_cq_parity_flip_is_consumed_once() {
+        let now = UNIX_EPOCH + Duration::from_secs(31);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let tracker = StationTracker::default();
+        queue.auto_enabled = true;
+        queue.cq_enabled = true;
+        queue.cq_percent = 100;
+        queue.next_cq_parity_flipped = true;
+
+        let dispatch = queue
+            .scheduler_pick(now, &tracker, false, false)
+            .expect("cq dispatch");
+        match dispatch.kind {
+            QueueDispatchKind::Cq {
+                tx_slot_family_override,
+            } => {
+                assert_eq!(
+                    tx_slot_family_override,
+                    Some(qso::slot_family(next_slot_boundary(now)).opposite())
+                );
+            }
+            _ => panic!("expected cq dispatch"),
+        }
+        assert!(!queue.next_cq_parity_flipped);
+
+        let second = queue
+            .scheduler_pick(now + Duration::from_secs(15), &tracker, false, false)
+            .expect("second cq dispatch");
+        match second.kind {
+            QueueDispatchKind::Cq {
+                tx_slot_family_override,
+            } => assert_eq!(tx_slot_family_override, None),
+            _ => panic!("expected cq dispatch"),
+        }
     }
 
     #[test]

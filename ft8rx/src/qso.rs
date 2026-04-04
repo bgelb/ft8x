@@ -54,6 +54,7 @@ pub enum QsoCommand {
         tx_freq_hz: f32,
         initial_state: QsoState,
         start_mode: QsoStartMode,
+        tx_slot_family_override: Option<SlotFamily>,
     },
     Stop {
         reason: String,
@@ -221,11 +222,13 @@ impl QsoController {
                 tx_freq_hz,
                 initial_state,
                 start_mode,
+                tx_slot_family_override,
             } => self.handle_start(
                 partner_call,
                 tx_freq_hz,
                 initial_state,
                 start_mode,
+                tx_slot_family_override,
                 station_info,
                 now,
             ),
@@ -904,6 +907,7 @@ impl QsoController {
         tx_freq_hz: f32,
         initial_state: QsoState,
         start_mode: QsoStartMode,
+        tx_slot_family_override: Option<SlotFamily>,
         station_info: Option<StationStartInfo>,
         now: SystemTime,
     ) {
@@ -933,7 +937,9 @@ impl QsoController {
             };
             Some(station_info)
         };
-        let tx_slot_family = if let Some(station_info) = &station_info {
+        let tx_slot_family = if let Some(tx_slot_family_override) = tx_slot_family_override {
+            tx_slot_family_override
+        } else if let Some(station_info) = &station_info {
             station_info.last_heard_slot_family.opposite()
         } else {
             slot_family(next_slot_boundary(now))
@@ -2434,7 +2440,28 @@ mod tests {
             tx_freq_hz,
             initial_state: QsoState::SendGrid,
             start_mode: QsoStartMode::Normal,
+            tx_slot_family_override: None,
         }
+    }
+
+    #[test]
+    fn cq_start_can_force_tx_slot_family() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(31);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "CQ".to_string(),
+                tx_freq_hz: 1000.0,
+                initial_state: QsoState::SendCq,
+                start_mode: QsoStartMode::Cq,
+                tx_slot_family_override: Some(SlotFamily::Odd),
+            },
+            None,
+            now,
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.tx_slot_family, Some("odd".to_string()));
     }
 
     #[test]
