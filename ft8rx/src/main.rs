@@ -1281,6 +1281,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .qso-panel {
       height: 540px;
     }
+    .qso-panel {
+      height: 760px;
+    }
     .direct-panel,
     .log-panel {
       height: 380px;
@@ -1319,9 +1322,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       border: 1px solid rgba(143, 176, 192, 0.1);
       border-radius: 10px;
       background: rgba(6, 17, 26, 0.55);
-      padding: 6px 6px 10px;
+      padding: 6px 6px 18px;
       scrollbar-gutter: stable;
-      scroll-padding-bottom: 10px;
+      scroll-padding-bottom: 18px;
     }
     .activity-list {
       margin-top: 0;
@@ -1484,10 +1487,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       overflow-y: auto;
       overflow-x: hidden;
       min-height: 0;
-      padding-bottom: 2px;
+      padding-bottom: 10px;
     }
     #qso-transcript {
-      height: 338px;
+      height: 558px;
     }
     .qso-entry {
       border: 1px solid rgba(143, 176, 192, 0.1);
@@ -1536,7 +1539,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 0;
       font-size: 11px;
       line-height: 1.15;
-      padding-bottom: 2px;
+      padding-bottom: 6px;
     }
     #queue-list {
       height: 382px;
@@ -1581,7 +1584,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 0;
       font-size: 11px;
       line-height: 1.15;
-      padding-bottom: 2px;
+      padding-bottom: 6px;
     }
     #qso-history-list {
       height: 292px;
