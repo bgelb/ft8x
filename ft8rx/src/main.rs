@@ -1093,13 +1093,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .second-row {
       display: grid;
-      grid-template-columns: repeat(3, minmax(280px, 1fr));
+      grid-template-columns: repeat(2, minmax(320px, 1fr));
       gap: 16px;
       align-items: start;
     }
     .third-row {
       display: grid;
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(320px, 0.85fr) minmax(0, 1.15fr);
       gap: 16px;
       align-items: start;
     }
@@ -1160,7 +1160,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .maps {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: 1fr;
       gap: 16px;
     }
     .map-grid {
@@ -1250,10 +1250,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       height: 740px;
     }
     .queue-panel,
-    .direct-panel,
     .qso-panel {
       height: 460px;
     }
+    .direct-panel,
     .log-panel {
       height: 380px;
     }
@@ -1559,6 +1559,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       .status-grid { grid-template-columns: 1fr; }
       .top-layout { grid-template-columns: 1fr; }
       .second-row { grid-template-columns: 1fr; }
+      .third-row { grid-template-columns: 1fr; }
       .maps { grid-template-columns: 1fr; }
       .detail-panel,
       .queue-panel,
@@ -1665,14 +1666,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="queue-list scroll-surface" id="queue-list"></div>
         </div>
       </section>
-      <section class="panel direct-panel">
-        <div class="label">Direct Calls</div>
-        <div class="value" id="direct-count">0 heard</div>
-        <div class="detail-block">
-          <div class="label">Messages To Our Call</div>
-          <div class="activity-list scroll-surface" id="direct-list"></div>
-        </div>
-      </section>
       <section class="panel qso-panel">
         <div class="label">QSO</div>
         <div class="value" id="qso-call">Idle</div>
@@ -1705,6 +1698,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       </section>
     </div>
     <div class="third-row">
+      <section class="panel direct-panel">
+        <div class="label">Direct Calls</div>
+        <div class="value" id="direct-count">0 heard</div>
+        <div class="detail-block">
+          <div class="label">Messages To Our Call</div>
+          <div class="activity-list scroll-surface" id="direct-list"></div>
+        </div>
+      </section>
       <section class="panel log-panel">
         <div class="label">QSO Log</div>
         <div class="value" id="qso-history-count">0 sessions</div>
