@@ -1306,6 +1306,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       gap: 8px;
       min-height: 0;
     }
+    .detail-panel .detail-block:last-child {
+      flex: 1 1 auto;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
     .detail-lines {
       color: var(--ink);
       font-size: 13px;
@@ -1365,7 +1371,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 18px;
     }
     #detail-logs {
-      height: 392px;
+      height: auto;
+      flex: 1 1 auto;
+      min-height: 0;
     }
     #direct-list {
       height: auto;
