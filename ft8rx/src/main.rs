@@ -559,6 +559,7 @@ struct QueueDispatch {
 #[derive(Debug, Clone)]
 struct QsoJsonlCache {
     path: PathBuf,
+    direct_calls_since: SystemTime,
     last_modified: Option<SystemTime>,
     last_len: u64,
     history: Vec<WebQsoHistoryEntry>,
@@ -934,9 +935,10 @@ impl WorkQueueState {
 }
 
 impl QsoJsonlCache {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, direct_calls_since: SystemTime) -> Self {
         Self {
             path,
+            direct_calls_since,
             last_modified: None,
             last_len: 0,
             history: Vec::new(),
@@ -962,7 +964,7 @@ impl QsoJsonlCache {
         let Ok(contents) = std::fs::read_to_string(&self.path) else {
             return;
         };
-        let scan = scan_qso_jsonl(&contents, now);
+        let scan = scan_qso_jsonl(&contents, now, self.direct_calls_since);
         self.history = scan.history;
         self.direct_calls = scan.direct_calls;
         self.recent_worked = scan.recent_worked;
@@ -2952,7 +2954,7 @@ fn init_tracing(config: &AppConfig) -> Result<(), AppError> {
     Ok(())
 }
 
-fn scan_qso_jsonl(contents: &str, now: SystemTime) -> QsoJsonlScan {
+fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTime) -> QsoJsonlScan {
     let mut sessions = BTreeMap::<QsoHistoryKey, QsoJsonlSessionSummary>::new();
     let mut active_keys = BTreeMap::<u64, QsoHistoryKey>::new();
     let mut next_ordinal = 1_u64;
@@ -3056,7 +3058,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime) -> QsoJsonlScan {
                 }
             }
         }
-        if event == "tx_launch" && !tx_text.is_empty() {
+        if event == "tx_launch" && !tx_text.is_empty() && timestamp >= direct_calls_since {
             let (to_call, from_call) = parse_direct_message_calls(tx_text)
                 .unwrap_or_else(|| (partner_call.to_string(), "TX".to_string()));
             direct_calls.push(WebDirectCallLog {
@@ -3177,8 +3179,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         Err(error) => Box::new(qso::UnavailableTxBackend::new(error.to_string())),
     };
     let mut qso_controller = QsoController::new(config.clone(), tx_backend);
-    let mut qso_jsonl_cache = QsoJsonlCache::new(PathBuf::from(&config.logging.fsm_log_path));
-    qso_jsonl_cache.refresh(SystemTime::now());
+    let process_started_at = SystemTime::now();
+    let mut qso_jsonl_cache =
+        QsoJsonlCache::new(PathBuf::from(&config.logging.fsm_log_path), process_started_at);
+    qso_jsonl_cache.refresh(process_started_at);
     let mut work_queue = WorkQueueState::new(
         qso_controller.defaults().tx_freq_default_hz,
         qso_jsonl_cache.recent_worked.clone(),
@@ -5566,7 +5570,8 @@ mod tests {
 {"timestamp":"2026-04-04T01:24:12Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":2,"partner_call":"K4SYT","state_before":"idle","state_after":"send_grid","last_rx_event":"start","rx_text":"","tx_text":""}}
 {"timestamp":"2026-04-04T01:26:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":2,"partner_call":"K4SYT","state_before":"send_73","state_after":"send_73","last_rx_event":"to_us_reply_rr73","rx_text":"","tx_text":"K4SYT N1VF 73"}}
 {"timestamp":"2026-04-04T01:27:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":2,"partner_call":"K4SYT","state_before":"send_73","state_after":"idle","last_rx_event":"send_73_no_msg_limit","rx_text":"","tx_text":""}}"#;
-        let scan = scan_qso_jsonl(contents, UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60));
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
         assert_eq!(scan.history.len(), 2);
         assert_eq!(scan.history[0].callsign, "K4SYT");
         assert_eq!(scan.history[1].callsign, "W0ONN");
