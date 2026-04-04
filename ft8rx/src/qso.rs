@@ -935,6 +935,58 @@ impl QsoController {
             .map(|handoff| handoff.next_station.callsign.clone())
     }
 
+    pub fn refresh_reserved_compound_next_station(
+        &mut self,
+        station_info: StationStartInfo,
+        now: SystemTime,
+    ) -> bool {
+        let Some(session) = &mut self.session else {
+            return false;
+        };
+        let Some(handoff) = &mut session.pending_compound_handoff else {
+            return false;
+        };
+        if !handoff
+            .next_station
+            .callsign
+            .eq_ignore_ascii_case(&station_info.callsign)
+        {
+            return false;
+        }
+        handoff.next_station = station_info.clone();
+        let report_db = clamp_report_db(handoff.next_station.last_snr_db);
+        handoff.tx_text = format!(
+            "{} RR73; {} <{}> {:+03}",
+            handoff.finished_call,
+            handoff.next_station.callsign,
+            self.config.station.our_call,
+            report_db
+        );
+        let next_text = handoff.next_station.last_text.clone().unwrap_or_default();
+        let tx_text = handoff.tx_text.clone();
+        let last_rx_event = session
+            .last_rx_event
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
+        info!(
+            finished_call = %handoff.finished_call,
+            next_call = %handoff.next_station.callsign,
+            report_db,
+            "qso_compound_handoff_refreshed"
+        );
+        Self::log_fsm(
+            session,
+            "compound_handoff_refreshed",
+            session.state,
+            session.state,
+            last_rx_event,
+            Some(next_text),
+            Some(tx_text),
+            now,
+        );
+        true
+    }
+
     pub fn maybe_arm_compound_handoff(
         &mut self,
         slot_start: SystemTime,
@@ -953,17 +1005,6 @@ impl QsoController {
                 Some(PendingAction::Transition(QsoState::SendRR73))
             );
         if !rr73_pending || session.pending_compound_handoff.is_some() {
-            return false;
-        }
-        if session
-            .partner_call
-            .eq_ignore_ascii_case(&plan.next_station.callsign)
-        {
-            warn!(
-                finished_call = %session.partner_call,
-                next_call = %plan.next_station.callsign,
-                "qso_compound_handoff_rejected_self_target"
-            );
             return false;
         }
         let report_db = clamp_report_db(plan.next_station.last_snr_db);
@@ -3008,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    fn compound_rr73_handoff_rejects_self_target() {
+    fn reserved_compound_handoff_can_refresh_next_station_report() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
@@ -3024,15 +3065,37 @@ mod tests {
             &[directed_decode("K1ABC", "N1VF", ToUsEvent::Ack)],
             rx_slot_start + Duration::from_secs(15),
         );
-        assert_eq!(controller.snapshot(now).state, "send_rr73");
-        assert!(!controller.maybe_arm_compound_handoff(
+        assert!(controller.maybe_arm_compound_handoff(
             rx_slot_start,
             CompoundHandoffPlan {
-                next_station: station_start_info("K1ABC", rx_slot_start, SlotFamily::Odd),
+                next_station: StationStartInfo {
+                    callsign: "K2ABC".to_string(),
+                    last_heard_at: rx_slot_start,
+                    last_heard_slot_family: SlotFamily::Odd,
+                    last_snr_db: -7,
+                    last_text: Some("N1VF K2ABC FN20".to_string()),
+                    last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                },
             },
             rx_slot_start + Duration::from_secs(15),
         ));
-        assert!(controller.reserved_compound_next_call().is_none());
+        assert!(controller.refresh_reserved_compound_next_station(
+            StationStartInfo {
+                callsign: "K2ABC".to_string(),
+                last_heard_at: rx_slot_start,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -3,
+                last_text: Some("N1VF K2ABC FN20".to_string()),
+                last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+            },
+            rx_slot_start + Duration::from_secs(16),
+        ));
+        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        if let Some(session) = controller.session.as_ref() {
+            if let Some(tx) = session.in_flight_tx.as_ref() {
+                assert_eq!(tx.message_text, "K1ABC RR73; K2ABC <N1VF> -03");
+            }
+        }
     }
 
     #[test]

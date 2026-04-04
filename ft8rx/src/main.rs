@@ -851,6 +851,56 @@ impl WorkQueueState {
         Ok(())
     }
 
+    fn best_priority_direct_index_excluding(
+        &self,
+        now: SystemTime,
+        excluded_callsign: Option<&str>,
+    ) -> Option<usize> {
+        let most_recent_slot = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                excluded_callsign.is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+            })
+            .filter_map(|entry| self.direct_priority_meta(entry, now))
+            .map(|meta| meta.slot_index)
+            .max()?;
+        let target_slot = if self
+            .entries
+            .iter()
+            .filter(|entry| {
+                excluded_callsign.is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+            })
+            .filter_map(|entry| self.direct_priority_meta(entry, now))
+            .any(|meta| meta.slot_index == most_recent_slot)
+        {
+            most_recent_slot
+        } else {
+            most_recent_slot.saturating_sub(2)
+        };
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                excluded_callsign.is_none_or(|excluded| !entry.callsign.eq_ignore_ascii_case(excluded))
+            })
+            .filter_map(|(index, entry)| {
+                let meta = self.direct_priority_meta(entry, now)?;
+                if meta.slot_index != target_slot {
+                    return None;
+                }
+                Some((index, meta))
+            })
+            .max_by(|(_, left), (_, right)| {
+                left.count
+                    .cmp(&right.count)
+                    .then_with(|| left.snr_db.cmp(&right.snr_db))
+                    .then_with(|| right.queued_at.cmp(&left.queued_at))
+                    .then_with(|| right.callsign.cmp(&left.callsign))
+            })
+            .map(|(index, _)| index)
+    }
+
     fn remove_station(&mut self, callsign: &str, reason: &str) -> bool {
         if let Some(index) = self
             .entries
@@ -1276,42 +1326,7 @@ impl WorkQueueState {
     }
 
     fn best_priority_direct_index(&self, now: SystemTime) -> Option<usize> {
-        let most_recent_slot = self
-            .entries
-            .iter()
-            .filter_map(|entry| self.direct_priority_meta(entry, now))
-            .map(|meta| meta.slot_index)
-            .max()?;
-        let target_slot = if self
-            .entries
-            .iter()
-            .filter_map(|entry| self.direct_priority_meta(entry, now))
-            .any(|meta| meta.slot_index == most_recent_slot)
-        {
-            most_recent_slot
-        } else {
-            most_recent_slot.saturating_sub(2)
-        };
-        let best_index = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let meta = self.direct_priority_meta(entry, now)?;
-                if meta.slot_index != target_slot {
-                    return None;
-                }
-                Some((index, meta))
-            })
-            .max_by(|(_, left), (_, right)| {
-                left.count
-                    .cmp(&right.count)
-                    .then_with(|| left.snr_db.cmp(&right.snr_db))
-                    .then_with(|| right.queued_at.cmp(&left.queued_at))
-                    .then_with(|| right.callsign.cmp(&left.callsign))
-            })
-            .map(|(index, _)| index);
-        best_index
+        self.best_priority_direct_index_excluding(now, None)
     }
 
     fn direct_dispatch_from_entry(&self, entry: &WorkQueueEntry, now: SystemTime) -> QueueDispatch {
@@ -1336,11 +1351,15 @@ impl WorkQueueState {
         }
     }
 
-    fn peek_compound_handoff_candidate(&self, now: SystemTime) -> Option<QueueDispatch> {
+    fn peek_compound_handoff_candidate(
+        &self,
+        now: SystemTime,
+        excluded_callsign: Option<&str>,
+    ) -> Option<QueueDispatch> {
         if !self.use_compound_rr73_handoff {
             return None;
         }
-        let index = self.best_priority_direct_index(now)?;
+        let index = self.best_priority_direct_index_excluding(now, excluded_callsign)?;
         let entry = self.entries.get(index)?;
         if !entry.direct_compound_eligible {
             return None;
@@ -6576,7 +6595,6 @@ fn maybe_track_priority_directs(
 ) {
     if work_queue.auto_add_direct_calls {
         let active_partner = qso_controller.active_partner_call();
-        let reserved_compound_next = qso_controller.reserved_compound_next_call();
         for decode in decodes {
             let Some(observation) =
                 direct_call_observation_from_decode(decode, our_call, slot_start)
@@ -6586,7 +6604,18 @@ fn maybe_track_priority_directs(
             if active_partner.as_deref() == Some(observation.callsign.as_str()) {
                 continue;
             }
-            if reserved_compound_next.as_deref() == Some(observation.callsign.as_str()) {
+            let reserved_station = qso::StationStartInfo {
+                callsign: observation.callsign.clone(),
+                last_heard_at: observation.observed_at,
+                last_heard_slot_family: observation.slot_family,
+                last_snr_db: observation.snr_db,
+                last_text: Some(observation.text.clone()),
+                last_structured_json: Some(observation.structured_json.clone()),
+            };
+            if qso_controller.refresh_reserved_compound_next_station(
+                reserved_station,
+                observation.observed_at,
+            ) {
                 continue;
             }
             if let Err(message) = work_queue.add_direct_observation(observation, slot_start) {
@@ -6648,18 +6677,12 @@ fn maybe_arm_compound_handoff_from_queue(
     slot_start: SystemTime,
     now: SystemTime,
 ) {
-    let Some(candidate) = work_queue.peek_compound_handoff_candidate(now) else {
+    let active_partner = qso_controller.active_partner_call();
+    let Some(candidate) =
+        work_queue.peek_compound_handoff_candidate(now, active_partner.as_deref())
+    else {
         return;
     };
-    if qso_controller.active_partner_call().as_deref() == Some(candidate.callsign.as_str()) {
-        work_queue.remove_station(&candidate.callsign, "compound_handoff_invalid_self_target");
-        warn!(
-            finished_call = qso_controller.active_partner_call().unwrap_or_default(),
-            next_call = candidate.callsign,
-            "qso_compound_handoff_invalid_self_target"
-        );
-        return;
-    }
     let Some(station_info) = station_info_from_dispatch(tracker, &candidate.kind) else {
         return;
     };
@@ -7218,7 +7241,7 @@ mod tests {
             )
             .expect("signal direct");
         let candidate = queue
-            .peek_compound_handoff_candidate(now + Duration::from_secs(16))
+            .peek_compound_handoff_candidate(now + Duration::from_secs(16), None)
             .expect("compound candidate");
         assert_eq!(candidate.callsign, "GRID");
 
@@ -7241,7 +7264,7 @@ mod tests {
             .expect("signal direct");
         assert!(
             queue
-                .peek_compound_handoff_candidate(now + Duration::from_secs(1))
+                .peek_compound_handoff_candidate(now + Duration::from_secs(1), None)
                 .is_none()
         );
     }
