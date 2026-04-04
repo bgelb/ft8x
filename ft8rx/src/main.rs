@@ -1341,7 +1341,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       overflow-y: auto;
       overflow-x: auto;
       min-height: 0;
-      padding-bottom: 2px;
+      padding-bottom: 0;
+    }
+    .activity-list::after {
+      content: "";
+      display: block;
+      flex: 0 0 18px;
+      min-height: 18px;
     }
     #detail-logs {
       height: 392px;
@@ -1492,7 +1498,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       overflow-y: auto;
       overflow-x: hidden;
       min-height: 0;
-      padding-bottom: 10px;
+      padding-bottom: 0;
+    }
+    .qso-transcript::after {
+      content: "";
+      display: block;
+      flex: 0 0 18px;
+      min-height: 18px;
     }
     #qso-transcript {
       height: 558px;
@@ -1544,7 +1556,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 0;
       font-size: 11px;
       line-height: 1.15;
-      padding-bottom: 6px;
+      padding-bottom: 0;
+    }
+    .queue-list::after {
+      content: "";
+      display: block;
+      flex: 0 0 18px;
+      min-height: 18px;
     }
     #queue-list {
       height: 382px;
@@ -1589,7 +1607,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 0;
       font-size: 11px;
       line-height: 1.15;
-      padding-bottom: 6px;
+      padding-bottom: 0;
+    }
+    .history-grid::after {
+      content: "";
+      display: block;
+      flex: 0 0 18px;
+      min-height: 18px;
     }
     #qso-history-list {
       height: 292px;
