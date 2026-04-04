@@ -459,6 +459,7 @@ struct WebQsoHistoryEntry {
     age: String,
     age_seconds: u64,
     callsign: String,
+    band: String,
     sent_info: String,
     received_info: String,
     got_reply: bool,
@@ -642,6 +643,7 @@ struct QsoJsonlCache {
 #[derive(Debug, Default)]
 struct QsoJsonlSessionSummary {
     partner_call: String,
+    rig_band: Option<String>,
     started_at: Option<SystemTime>,
     ended_at: Option<SystemTime>,
     last_seen_at: Option<SystemTime>,
@@ -2253,10 +2255,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </div>
       </section>
       <section class="panel log-panel">
-        <div class="label">QSO Log</div>
-        <div class="value" id="qso-history-count">0 sessions</div>
+        <div class="label">QSO Log (24h)</div>
+        <div class="value" id="qso-history-count">0 QSOs</div>
         <div class="detail-block">
-          <div class="label">Recent QSOs</div>
+          <div class="label">QSOs From Last 24 Hours</div>
+          <div class="label">Rpl = any reply to our call. 73 = reached RR73/73 sending state.</div>
           <div class="history-grid scroll-surface" id="qso-history-list"></div>
         </div>
       </section>
@@ -2934,12 +2937,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const list = document.getElementById('qso-history-list');
       const last10m = history.filter((entry) => (entry.age_seconds ?? Number.MAX_SAFE_INTEGER) <= 10 * 60).length;
       const last1h = history.filter((entry) => (entry.age_seconds ?? Number.MAX_SAFE_INTEGER) <= 60 * 60).length;
-      count.textContent = `${history.length} sessions  10m=${last10m}  1h=${last1h}`;
+      count.textContent = `${history.length} QSOs  10m=${last10m}  1h=${last1h}`;
       list.innerHTML = `
         <div class="history-row history-head">
           <div>Time</div>
           <div>Ago</div>
           <div>Call</div>
+          <div>Bd</div>
           <div>Rpl</div>
           <div>73</div>
           <div>Sent</div>
@@ -2947,7 +2951,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div>Exit</div>
         </div>`;
       if (!history.length) {
-        list.innerHTML += '<div class="detail-empty">No recent QSO history in the JSONL log.</div>';
+        list.innerHTML += '<div class="detail-empty">No QSO history from the last 24 hours in the JSONL log.</div>';
         return;
       }
       for (const entry of history) {
@@ -2957,6 +2961,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="history-cell muted">${escapeHtml(entry.time)}</div>
           <div class="history-cell muted">${escapeHtml(entry.age)}</div>
           <div class="history-cell">${renderCallValue(escapeHtml(entry.callsign), entry.callsign)}</div>
+          <div class="history-cell muted">${escapeHtml(entry.band ?? '-')}</div>
           <div class="history-cell muted">${entry.got_reply ? 'Y' : '-'}</div>
           <div class="history-cell muted">${entry.reached_73 ? 'Y' : '-'}</div>
           <div class="history-cell">${escapeHtml(entry.sent_info)}</div>
@@ -3657,6 +3662,10 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             .get("tx_text")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let rig_band = fields
+            .get("rig_band")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
         let key = if event == "start" {
             let key = QsoHistoryKey {
                 session_id,
@@ -3685,6 +3694,9 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         if session.partner_call.is_empty() {
             session.partner_call = partner_call.to_string();
         }
+        if !rig_band.is_empty() && session.rig_band.is_none() {
+            session.rig_band = Some(rig_band.to_string());
+        }
         session.last_seen_at = Some(timestamp);
         if event == "start" && session.started_at.is_none() {
             session.started_at = Some(timestamp);
@@ -3697,12 +3709,12 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         if last_rx_event.starts_with("to_us_") {
             session.got_reply = true;
         }
-        if matches!(state_before, "send_73" | "send_73_once")
-            || matches!(state_after, "send_73" | "send_73_once")
+        if matches!(state_before, "send_rr73" | "send_73" | "send_73_once")
+            || matches!(state_after, "send_rr73" | "send_73" | "send_73_once")
         {
             session.reached_73 = true;
         }
-        if event == "tx_launch" && matches!(state_before, "send_73" | "send_73_once") {
+        if event == "tx_launch" && matches!(state_before, "send_rr73" | "send_73" | "send_73_once") {
             session.reached_73 = true;
             if now.duration_since(timestamp).unwrap_or_default() <= RECENT_WORKED_RETENTION {
                 match recent_worked.get(partner_call).copied() {
@@ -3751,6 +3763,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
                     age: format_relative_age(age),
                     age_seconds: age.as_secs(),
                     callsign: session.partner_call,
+                    band: session.rig_band.unwrap_or_else(|| "-".to_string()),
                     sent_info: if session.sent_infos.is_empty() {
                         "-".to_string()
                     } else {
@@ -3770,8 +3783,8 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             ))
         })
         .collect::<Vec<_>>();
+    session_rows.retain(|(_, entry)| entry.age_seconds <= RECENT_WORKED_RETENTION.as_secs());
     session_rows.sort_by(|left, right| right.0.cmp(&left.0));
-    session_rows.truncate(64);
     let history = session_rows
         .into_iter()
         .map(|(_, entry)| entry)
