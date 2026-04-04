@@ -2083,14 +2083,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .history-row {
       display: grid;
-      grid-template-columns: 152px 78px 72px 34px 28px 88px 88px minmax(0, 1fr);
-      gap: 6px;
+      grid-template-columns: 132px 58px 72px 28px 24px 24px 74px 74px minmax(140px, 1fr);
+      gap: 4px;
       align-items: baseline;
-      padding: 3px 6px;
+      padding: 2px 4px;
       border: 1px solid rgba(143, 176, 192, 0.08);
       border-radius: 6px;
       background: rgba(19, 40, 56, 0.45);
-      min-width: 760px;
+      min-width: 640px;
     }
     .history-head {
       position: sticky;
