@@ -1079,33 +1079,35 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .page {
       width: 100%;
-      margin: 0;
-      padding: 18px;
+      max-width: 1800px;
+      margin: 0 auto;
+      padding: 16px;
+      display: grid;
+      gap: 16px;
     }
     .top-layout {
       display: grid;
       grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr);
-      gap: 18px;
+      gap: 16px;
       align-items: start;
     }
     .second-row {
       display: grid;
       grid-template-columns: repeat(3, minmax(280px, 1fr));
-      gap: 18px;
-      margin-bottom: 18px;
+      gap: 16px;
       align-items: start;
     }
     .third-row {
       display: grid;
       grid-template-columns: 1fr;
-      gap: 18px;
-      margin-bottom: 18px;
+      gap: 16px;
       align-items: start;
     }
     .top-main {
       display: grid;
-      gap: 18px;
-      width: min(100%, var(--waterfall-shell-width));
+      gap: 16px;
+      width: 100%;
+      min-width: 0;
     }
     .panel {
       background: rgba(13, 29, 41, 0.95);
@@ -1113,7 +1115,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       border-radius: 14px;
       padding: 14px;
       box-shadow: 0 14px 40px rgba(0, 0, 0, 0.24);
-      margin-bottom: 16px;
+      margin: 0;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
     }
     .status-grid {
       display: grid;
@@ -1148,13 +1156,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .status-panel,
     .waterfall-panel {
       width: 100%;
-      max-width: var(--waterfall-shell-width);
+      max-width: none;
     }
     .maps {
       display: grid;
-      grid-template-columns: 1fr;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 16px;
-      margin-bottom: 16px;
     }
     .map-grid {
       display: grid;
@@ -1240,22 +1247,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
       text-decoration: none;
     }
     .detail-panel {
-      min-height: 100%;
+      height: 740px;
     }
+    .queue-panel,
+    .direct-panel,
     .qso-panel {
-      min-height: 100%;
-    }
-    .queue-panel {
-      min-height: 100%;
-    }
-    .direct-panel {
-      min-height: 100%;
+      height: 460px;
     }
     .log-panel {
-      min-height: 100%;
+      height: 380px;
     }
     .detail-block {
-      margin-top: 14px;
+      margin-top: 0;
+      display: grid;
+      gap: 8px;
+      min-height: 0;
     }
     .detail-lines {
       color: var(--ink);
@@ -1264,21 +1270,29 @@ const INDEX_HTML: &str = r#"<!doctype html>
       white-space: pre-wrap;
     }
     .history-list {
-      max-height: 8.2em;
+      max-height: none;
       overflow: auto;
-      padding-right: 4px;
+      padding: 8px;
     }
     .detail-empty {
       color: var(--muted);
       font-size: 13px;
     }
+    .scroll-surface {
+      min-height: 0;
+      border: 1px solid rgba(143, 176, 192, 0.1);
+      border-radius: 10px;
+      background: rgba(6, 17, 26, 0.55);
+      padding: 6px;
+      scrollbar-gutter: stable;
+    }
     .activity-list {
-      margin-top: 8px;
+      margin-top: 0;
       display: grid;
       gap: 4px;
-      max-height: 220px;
+      max-height: none;
       overflow: auto;
-      padding-right: 4px;
+      min-height: 0;
     }
     .activity-item {
       border: 1px solid rgba(143, 176, 192, 0.1);
@@ -1291,6 +1305,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       grid-template-columns: 64px 110px 78px 34px 46px 50px minmax(0, 1fr);
       gap: 6px;
       align-items: baseline;
+      min-width: 520px;
     }
     .activity-head {
       position: sticky;
@@ -1391,12 +1406,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       white-space: pre-wrap;
     }
     .qso-transcript {
-      margin-top: 8px;
+      margin-top: 0;
       display: grid;
       gap: 4px;
-      max-height: 300px;
+      max-height: none;
       overflow: auto;
-      padding-right: 4px;
+      min-height: 0;
     }
     .qso-entry {
       border: 1px solid rgba(143, 176, 192, 0.1);
@@ -1433,12 +1448,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       font-size: 13px;
     }
     .queue-list {
-      margin-top: 8px;
+      margin-top: 0;
       display: grid;
       gap: 2px;
-      max-height: 360px;
+      max-height: none;
       overflow: auto;
-      padding-right: 4px;
+      min-height: 0;
       font-size: 11px;
       line-height: 1.15;
     }
@@ -1451,6 +1466,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       border: 1px solid rgba(143, 176, 192, 0.08);
       border-radius: 6px;
       background: rgba(19, 40, 56, 0.45);
+      min-width: 660px;
     }
     .queue-head {
       position: sticky;
@@ -1470,12 +1486,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       text-overflow: ellipsis;
     }
     .history-grid {
-      margin-top: 8px;
+      margin-top: 0;
       display: grid;
       gap: 2px;
-      max-height: 320px;
+      max-height: none;
       overflow: auto;
-      padding-right: 4px;
+      min-height: 0;
       font-size: 11px;
       line-height: 1.15;
     }
@@ -1488,6 +1504,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       border: 1px solid rgba(143, 176, 192, 0.08);
       border-radius: 6px;
       background: rgba(19, 40, 56, 0.45);
+      min-width: 760px;
     }
     .history-head {
       position: sticky;
@@ -1510,10 +1527,46 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .history-cell.muted {
       color: var(--muted);
     }
+    .table-scroll {
+      min-height: 0;
+      max-height: 360px;
+      overflow: auto;
+      border: 1px solid rgba(143, 176, 192, 0.1);
+      border-radius: 10px;
+      background: rgba(6, 17, 26, 0.55);
+      scrollbar-gutter: stable;
+    }
+    .table-scroll table {
+      min-width: 980px;
+    }
+    .detail-panel .detail-block:last-child,
+    .queue-panel .detail-block:last-child,
+    .direct-panel .detail-block:last-child,
+    .qso-panel .detail-block:last-child,
+    .log-panel .detail-block:last-child {
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+    .detail-panel #detail-logs,
+    .queue-panel #queue-list,
+    .direct-panel #direct-list,
+    .qso-panel #qso-transcript,
+    .log-panel #qso-history-list {
+      flex: 1 1 auto;
+      min-height: 0;
+    }
     @media (max-width: 1100px) {
       .status-grid { grid-template-columns: 1fr; }
       .top-layout { grid-template-columns: 1fr; }
       .second-row { grid-template-columns: 1fr; }
+      .maps { grid-template-columns: 1fr; }
+      .detail-panel,
+      .queue-panel,
+      .direct-panel,
+      .qso-panel,
+      .log-panel {
+        height: auto;
+      }
     }
   </style>
 </head>
@@ -1573,11 +1626,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </div>
         <div class="detail-block">
           <div class="label">Recent QSOs</div>
-          <div class="detail-lines history-list" id="detail-history"></div>
+          <div class="detail-lines history-list scroll-surface" id="detail-history"></div>
         </div>
         <div class="detail-block">
           <div class="label">Live Activity</div>
-          <div class="activity-list" id="detail-logs">
+          <div class="activity-list scroll-surface" id="detail-logs">
             <div class="activity-item activity-head">
               <div class="activity-col">Time</div>
               <div class="activity-col">To</div>
@@ -1609,7 +1662,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </div>
         <div class="detail-block">
           <div class="label">Queue</div>
-          <div class="queue-list" id="queue-list"></div>
+          <div class="queue-list scroll-surface" id="queue-list"></div>
         </div>
       </section>
       <section class="panel direct-panel">
@@ -1617,7 +1670,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="value" id="direct-count">0 heard</div>
         <div class="detail-block">
           <div class="label">Messages To Our Call</div>
-          <div class="activity-list" id="direct-list"></div>
+          <div class="activity-list scroll-surface" id="direct-list"></div>
         </div>
       </section>
       <section class="panel qso-panel">
@@ -1647,7 +1700,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </div>
         <div class="detail-block">
           <div class="label">Transcript</div>
-          <div class="qso-transcript" id="qso-transcript"></div>
+          <div class="qso-transcript scroll-surface" id="qso-transcript"></div>
         </div>
       </section>
     </div>
@@ -1657,7 +1710,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="value" id="qso-history-count">0 sessions</div>
         <div class="detail-block">
           <div class="label">Recent QSOs</div>
-          <div class="history-grid" id="qso-history-list"></div>
+          <div class="history-grid scroll-surface" id="qso-history-list"></div>
         </div>
       </section>
     </div>
@@ -1673,23 +1726,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <section class="panel">
       <div class="label">Recent Decodes</div>
-      <table>
-        <thead>
-          <tr>
-            <th>Seen</th>
-            <th>UTC</th>
-            <th>SNR</th>
-            <th>dT</th>
-            <th>Freq</th>
-            <th>Kind</th>
-            <th>Field 1</th>
-            <th>Field 2</th>
-            <th>Info</th>
-            <th>Message</th>
-          </tr>
-        </thead>
-        <tbody id="decodes"></tbody>
-      </table>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Seen</th>
+              <th>UTC</th>
+              <th>SNR</th>
+              <th>dT</th>
+              <th>Freq</th>
+              <th>Kind</th>
+              <th>Field 1</th>
+              <th>Field 2</th>
+              <th>Info</th>
+              <th>Message</th>
+            </tr>
+          </thead>
+          <tbody id="decodes"></tbody>
+        </table>
+      </div>
     </section>
   </div>
   <script>
