@@ -606,6 +606,8 @@ enum QueueDispatchKind {
         callsign: String,
         initial_state: QsoState,
         start_mode: QsoStartMode,
+        context_last_heard_at: Option<SystemTime>,
+        context_last_heard_slot_family: Option<qso::SlotFamily>,
         context_text: Option<String>,
         context_structured_json: Option<String>,
         context_snr_db: Option<i32>,
@@ -730,17 +732,25 @@ impl WorkQueueState {
             .iter_mut()
             .find(|entry| entry.callsign == observation.callsign)
         {
+            let duplicate_slot = entry.last_direct_slot_index == Some(observation.slot_index)
+                && entry.last_direct_slot_family == Some(observation.slot_family);
             entry.last_observed_at = entry.last_observed_at.max(observation.observed_at);
             entry.direct_pending = true;
-            entry.direct_count = entry.direct_count.saturating_add(1);
             entry.last_direct_at = Some(observation.observed_at);
             entry.last_direct_slot_index = Some(observation.slot_index);
             entry.last_direct_slot_family = Some(observation.slot_family);
-            entry.last_direct_snr_db = Some(observation.snr_db);
+            entry.last_direct_snr_db = Some(
+                entry.last_direct_snr_db
+                    .map(|existing| existing.max(observation.snr_db))
+                    .unwrap_or(observation.snr_db),
+            );
             entry.direct_start_state = Some(observation.start_state);
             entry.last_direct_text = Some(observation.text.clone());
             entry.last_direct_structured_json = Some(observation.structured_json.clone());
             entry.ok_to_schedule_after = now;
+            if !duplicate_slot {
+                entry.direct_count = entry.direct_count.saturating_add(1);
+            }
             info!(
                 callsign = entry.callsign,
                 direct_count = entry.direct_count,
@@ -748,6 +758,7 @@ impl WorkQueueState {
                     .direct_start_state
                     .map(QsoState::as_str)
                     .unwrap_or(""),
+                duplicate_slot,
                 "queue_direct_updated"
             );
             return Ok(());
@@ -1189,6 +1200,8 @@ impl WorkQueueState {
                 callsign: entry.callsign.clone(),
                 initial_state: entry.direct_start_state.unwrap_or(QsoState::SendSig),
                 start_mode: QsoStartMode::Direct,
+                context_last_heard_at: entry.last_direct_at,
+                context_last_heard_slot_family: entry.last_direct_slot_family,
                 context_text: entry.last_direct_text.clone(),
                 context_structured_json: entry.last_direct_structured_json.clone(),
                 context_snr_db: entry.last_direct_snr_db,
@@ -1213,6 +1226,8 @@ impl WorkQueueState {
                 callsign: entry.callsign.clone(),
                 initial_state: QsoState::SendGrid,
                 start_mode: QsoStartMode::Normal,
+                context_last_heard_at: None,
+                context_last_heard_slot_family: None,
                 context_text: None,
                 context_structured_json: None,
                 context_snr_db: None,
@@ -3988,12 +4003,28 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             DecodeStage::Early41 => {
                                 display.early41_wall_ms = Some(wall_ms);
                                 display.early41_decodes = update.report.decodes.clone();
+                                maybe_track_priority_directs(
+                                    &mut work_queue,
+                                    &mut qso_controller,
+                                    &display.early41_decodes,
+                                    &config.station.our_call,
+                                    slot_start,
+                                );
                                 qso_controller.on_decode_stage(
                                     slot_start,
                                     stage,
                                     &display.early41_decodes,
                                     SystemTime::now(),
                                 );
+                                if work_queue
+                                    .has_recent_priority_direct_for_slot(slot_start, SystemTime::now())
+                                    && qso_controller.preempt_for_priority_direct(SystemTime::now())
+                                {
+                                    info!(
+                                        slot = %format_slot_time(slot_start),
+                                        "qso_preempted_for_priority_direct"
+                                    );
+                                }
                             }
                             DecodeStage::Early47 => {
                                 display.early47_wall_ms = Some(wall_ms);
@@ -4001,12 +4032,28 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     tx_margin_after_stage_decode_ms(slot_start, stage, wall_ms)?,
                                 );
                                 display.early47_decodes = update.report.decodes.clone();
+                                maybe_track_priority_directs(
+                                    &mut work_queue,
+                                    &mut qso_controller,
+                                    &display.early47_decodes,
+                                    &config.station.our_call,
+                                    slot_start,
+                                );
                                 qso_controller.on_decode_stage(
                                     slot_start,
                                     stage,
                                     &display.early47_decodes,
                                     SystemTime::now(),
                                 );
+                                if work_queue
+                                    .has_recent_priority_direct_for_slot(slot_start, SystemTime::now())
+                                    && qso_controller.preempt_for_priority_direct(SystemTime::now())
+                                {
+                                    info!(
+                                        slot = %format_slot_time(slot_start),
+                                        "qso_preempted_for_priority_direct"
+                                    );
+                                }
                             }
                             DecodeStage::Full => {
                                 display.last_slot_start = Some(slot_start);
@@ -4019,28 +4066,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 dt_frame_history.push_back(display.full_decodes.clone());
                                 station_tracker.ingest_frame(slot_start, &display.full_decodes);
                                 update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
-                                if work_queue.auto_add_direct_calls {
-                                    let active_partner = qso_controller.active_partner_call();
-                                    for decode in &display.full_decodes {
-                                        let Some(observation) = direct_call_observation_from_decode(
-                                            decode,
-                                            &config.station.our_call,
-                                            slot_start,
-                                        ) else {
-                                            continue;
-                                        };
-                                        if active_partner.as_deref()
-                                            == Some(observation.callsign.as_str())
-                                        {
-                                            continue;
-                                        }
-                                        if let Err(message) =
-                                            work_queue.add_direct_observation(observation, slot_start)
-                                        {
-                                            warn!(message, "queue_direct_add_failed");
-                                        }
-                                    }
-                                }
+                                maybe_track_priority_directs(
+                                    &mut work_queue,
+                                    &mut qso_controller,
+                                    &display.full_decodes,
+                                    &config.station.our_call,
+                                    slot_start,
+                                );
                                 qso_controller.on_decode_stage(
                                     slot_start,
                                     stage,
@@ -4188,11 +4220,27 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     callsign,
                     initial_state,
                     start_mode,
+                    context_last_heard_at,
+                    context_last_heard_slot_family,
                     context_text,
                     context_structured_json,
                     context_snr_db,
                 } => {
                     let mut station_info = station_tracker.start_info(&callsign);
+                    if station_info.is_none() {
+                        if let (Some(last_heard_at), Some(last_heard_slot_family)) =
+                            (context_last_heard_at, context_last_heard_slot_family)
+                        {
+                            station_info = Some(StationStartInfo {
+                                callsign: callsign.clone(),
+                                last_heard_at,
+                                last_heard_slot_family,
+                                last_snr_db: context_snr_db.unwrap_or(0),
+                                last_text: context_text.clone(),
+                                last_structured_json: context_structured_json.clone(),
+                            });
+                        }
+                    }
                     if let Some(info) = &mut station_info {
                         if let Some(text) = context_text {
                             info.last_text = Some(text);
@@ -5931,6 +5979,30 @@ fn direct_call_observation_from_decode(
     })
 }
 
+fn maybe_track_priority_directs(
+    work_queue: &mut WorkQueueState,
+    qso_controller: &mut QsoController,
+    decodes: &[DecodedMessage],
+    our_call: &str,
+    slot_start: SystemTime,
+) {
+    if work_queue.auto_add_direct_calls {
+        let active_partner = qso_controller.active_partner_call();
+        for decode in decodes {
+            let Some(observation) = direct_call_observation_from_decode(decode, our_call, slot_start)
+            else {
+                continue;
+            };
+            if active_partner.as_deref() == Some(observation.callsign.as_str()) {
+                continue;
+            }
+            if let Err(message) = work_queue.add_direct_observation(observation, slot_start) {
+                warn!(message, "queue_direct_add_failed");
+            }
+        }
+    }
+}
+
 fn format_time(time: SystemTime) -> String {
     let utc: DateTime<Utc> = time.into();
     utc.format("%H:%M:%S").to_string()
@@ -6352,6 +6424,31 @@ mod tests {
             .scheduler_pick(now + Duration::from_secs(1), &tracker, false, false)
             .expect("dispatch");
         assert_eq!(dispatch.callsign, "OLDER");
+    }
+
+    #[test]
+    fn direct_observation_same_slot_does_not_increment_count() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let observation = DirectCallObservation {
+            callsign: "K1ABC".to_string(),
+            observed_at: now,
+            slot_index: slot_index(now),
+            slot_family: qso::slot_family(now),
+            snr_db: -5,
+            start_state: QsoState::SendSig,
+            text: "N1VF K1ABC FN20".to_string(),
+            structured_json: "{}".to_string(),
+        };
+        queue
+            .add_direct_observation(observation.clone(), now)
+            .expect("first add");
+        queue
+            .add_direct_observation(observation, now)
+            .expect("duplicate stage add");
+        let entry = queue.entries.front().expect("queued entry");
+        assert_eq!(entry.direct_count, 1);
     }
 
     #[test]
