@@ -1305,7 +1305,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .history-list {
       max-height: none;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: hidden;
       padding: 8px;
       height: 108px;
     }
@@ -1318,16 +1319,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
       border: 1px solid rgba(143, 176, 192, 0.1);
       border-radius: 10px;
       background: rgba(6, 17, 26, 0.55);
-      padding: 6px;
+      padding: 6px 6px 10px;
       scrollbar-gutter: stable;
+      scroll-padding-bottom: 10px;
     }
     .activity-list {
       margin-top: 0;
-      display: grid;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
       gap: 4px;
       max-height: none;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: auto;
       min-height: 0;
+      padding-bottom: 2px;
     }
     #detail-logs {
       height: 392px;
@@ -1427,6 +1433,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       background: linear-gradient(180deg, rgba(43, 55, 65, 0.95), rgba(22, 31, 38, 0.95));
       color: var(--muted);
     }
+    .button.compact {
+      padding: 2px 6px;
+      min-height: 22px;
+      border-radius: 7px;
+      font-size: 11px;
+      line-height: 1.1;
+    }
     .button.warn {
       background: linear-gradient(180deg, rgba(153, 84, 33, 0.95), rgba(110, 56, 18, 0.95));
     }
@@ -1463,11 +1476,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .qso-transcript {
       margin-top: 0;
-      display: grid;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
       gap: 4px;
       max-height: none;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: hidden;
       min-height: 0;
+      padding-bottom: 2px;
     }
     #qso-transcript {
       height: 338px;
@@ -1509,13 +1526,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .queue-list {
       margin-top: 0;
-      display: grid;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
       gap: 2px;
       max-height: none;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: auto;
       min-height: 0;
       font-size: 11px;
       line-height: 1.15;
+      padding-bottom: 2px;
     }
     #queue-list {
       height: 382px;
@@ -1550,13 +1571,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .history-grid {
       margin-top: 0;
-      display: grid;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
       gap: 2px;
       max-height: none;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: auto;
       min-height: 0;
       font-size: 11px;
       line-height: 1.15;
+      padding-bottom: 2px;
     }
     #qso-history-list {
       height: 292px;
@@ -2374,7 +2399,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="queue-meta">${escapeHtml(entry.last_heard_message)}</div>
           <div class="queue-meta">${escapeHtml(entry.last_heard_slot_family ?? '-')}</div>
           <div class="queue-meta">${escapeHtml(entry.ready ? 'ready' : entry.status)}</div>
-          <div><button class="button secondary" type="button" data-queue-remove="${escapeHtml(entry.callsign)}">X</button></div>`;
+          <div><button class="button secondary compact" type="button" data-queue-remove="${escapeHtml(entry.callsign)}">X</button></div>`;
         list.appendChild(row);
       }
     }
