@@ -15,14 +15,17 @@ pub use decoder::{
     decode_wav_file_with_state,
 };
 pub use encode::{
-    EncodeError, EncodedFrame, SynthesizedTxMessage, TxDirectedPayload, TxMessage, WaveformOptions,
-    channel_symbols_from_codeword_bits, encode_nonstandard_message, encode_standard_message,
-    parse_standard_info, synthesize_channel_reference, synthesize_rectangular_waveform,
-    synthesize_tx_message, write_rectangular_standard_wav,
+    EncodeError, EncodedFrame, SynthesizedTxMessage, TxDirectedPayload, TxMessage, TxRttyExchange,
+    WaveformOptions, channel_symbols_from_codeword_bits, encode_dxpedition_message,
+    encode_eu_vhf_message, encode_field_day_message, encode_nonstandard_message,
+    encode_rtty_contest_message, encode_standard_message, parse_standard_info,
+    synthesize_channel_reference, synthesize_rectangular_waveform, synthesize_tx_message,
+    write_rectangular_standard_wav,
 };
 pub use message::{
-    CallModifier, GridReport, HashedCallField12, MessageCallField, MessageKind, PlainCallField58,
-    ReplyWord, StructuredCallField, StructuredCallValue, StructuredInfoField, StructuredInfoValue,
-    StructuredMessage,
+    CallModifier, GridReport, HashedCallField10, HashedCallField12, HashedCallField22,
+    MessageCallField, MessageKind, PlainCallField58, ReplyWord, StructuredCallField,
+    StructuredCallValue, StructuredInfoField, StructuredInfoValue, StructuredMessage,
+    StructuredRttyExchange,
 };
 pub use wave::{AudioBuffer, DecoderError, write_wav};
