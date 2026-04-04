@@ -362,12 +362,15 @@ struct WebStationLog {
 
 #[derive(Debug, Clone, Serialize)]
 struct WebDirectCallLog {
+    sort_epoch_ms: u64,
     timestamp: String,
-    sender_call: String,
-    snr_db: i32,
-    dt_seconds: f32,
-    freq_hz: f32,
+    from_call: String,
+    to_call: String,
+    snr_db: Option<i32>,
+    dt_seconds: Option<f32>,
+    freq_hz: Option<f32>,
     text: String,
+    is_ours: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -557,6 +560,7 @@ struct QsoJsonlCache {
     last_modified: Option<SystemTime>,
     last_len: u64,
     history: Vec<WebQsoHistoryEntry>,
+    direct_calls: Vec<WebDirectCallLog>,
     recent_worked: BTreeMap<String, SystemTime>,
 }
 
@@ -923,6 +927,7 @@ impl QsoJsonlCache {
             last_modified: None,
             last_len: 0,
             history: Vec::new(),
+            direct_calls: Vec::new(),
             recent_worked: BTreeMap::new(),
         }
     }
@@ -930,6 +935,7 @@ impl QsoJsonlCache {
     fn refresh(&mut self, now: SystemTime) {
         let Ok(metadata) = std::fs::metadata(&self.path) else {
             self.history.clear();
+            self.direct_calls.clear();
             self.recent_worked.clear();
             self.last_modified = None;
             self.last_len = 0;
@@ -945,6 +951,7 @@ impl QsoJsonlCache {
         };
         let scan = scan_qso_jsonl(&contents, now);
         self.history = scan.history;
+        self.direct_calls = scan.direct_calls;
         self.recent_worked = scan.recent_worked;
         self.last_modified = modified;
         self.last_len = len;
@@ -954,6 +961,7 @@ impl QsoJsonlCache {
 #[derive(Debug, Default)]
 struct QsoJsonlScan {
     history: Vec<WebQsoHistoryEntry>,
+    direct_calls: Vec<WebDirectCallLog>,
     recent_worked: BTreeMap<String, SystemTime>,
 }
 
@@ -1312,6 +1320,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+    }
+    .activity-item.direct-sent {
+      background: rgba(38, 61, 84, 0.75);
+      border-color: rgba(186, 225, 255, 0.18);
+    }
+    .activity-item.direct-sent .activity-col,
+    .activity-item.direct-sent .activity-msg {
+      color: #eef7ff;
     }
     .control-row {
       display: grid;
@@ -2205,34 +2221,35 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const direct = data.direct_calls || [];
       const count = document.getElementById('direct-count');
       const list = document.getElementById('direct-list');
-      count.textContent = `${direct.length} heard`;
+      count.textContent = `${direct.length} msgs`;
       list.innerHTML = `
         <div class="activity-item activity-head">
           <div class="activity-col">Time</div>
-          <div class="activity-col">To</div>
           <div class="activity-col">De</div>
+          <div class="activity-col">To</div>
           <div class="activity-col">SNR</div>
           <div class="activity-col">dT</div>
           <div class="activity-col">Freq</div>
           <div class="activity-col">Msg</div>
         </div>`;
       if (!direct.length) {
-        list.innerHTML += '<div class="detail-empty">No recent messages to our call.</div>';
+        list.innerHTML += '<div class="detail-empty">No recent direct traffic.</div>';
         return;
       }
       for (const item of direct) {
         const row = document.createElement('div');
-        row.className = 'activity-item';
+        row.className = item.is_ours ? 'activity-item direct-sent' : 'activity-item';
         row.innerHTML = `
           <div class="activity-col">${escapeHtml(item.timestamp)}</div>
-          <div class="activity-col">${escapeHtml(data.our_call || 'MYCALL')}</div>
-          <div class="activity-col">${renderParty(item.sender_call, selectedCall)}</div>
-          <div class="activity-col">${item.snr_db}</div>
-          <div class="activity-col">${item.dt_seconds.toFixed(2)}</div>
-          <div class="activity-col">${Math.round(item.freq_hz)}</div>
+          <div class="activity-col">${renderParty(item.from_call, selectedCall)}</div>
+          <div class="activity-col">${renderParty(item.to_call, selectedCall)}</div>
+          <div class="activity-col">${item.snr_db == null ? '-' : item.snr_db}</div>
+          <div class="activity-col">${item.dt_seconds == null ? '-' : item.dt_seconds.toFixed(2)}</div>
+          <div class="activity-col">${item.freq_hz == null ? '-' : Math.round(item.freq_hz)}</div>
           <div class="activity-msg">${escapeHtml(item.text)}</div>`;
         list.appendChild(row);
       }
+      list.scrollTop = list.scrollHeight;
     }
     function renderQsoHistory(data) {
       const history = (data.qso_history || []).filter((entry) => entry.got_reply || entry.reached_73);
@@ -2777,6 +2794,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime) -> QsoJsonlScan {
     let mut sessions = BTreeMap::<QsoHistoryKey, QsoJsonlSessionSummary>::new();
     let mut active_keys = BTreeMap::<u64, QsoHistoryKey>::new();
     let mut next_ordinal = 1_u64;
+    let mut direct_calls = Vec::<WebDirectCallLog>::new();
     let mut recent_worked = BTreeMap::<String, SystemTime>::new();
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -2876,6 +2894,21 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime) -> QsoJsonlScan {
                 }
             }
         }
+        if event == "tx_launch" && !tx_text.is_empty() {
+            let (to_call, from_call) = parse_direct_message_calls(tx_text)
+                .unwrap_or_else(|| (partner_call.to_string(), "TX".to_string()));
+            direct_calls.push(WebDirectCallLog {
+                sort_epoch_ms: system_time_to_epoch_ms(timestamp),
+                timestamp: format_time(timestamp),
+                from_call,
+                to_call,
+                snr_db: None,
+                dt_seconds: None,
+                freq_hz: None,
+                text: tx_text.to_string(),
+                is_ours: true,
+            });
+        }
         if let Some(info) = extract_exchange_info(tx_text) {
             push_unique_info(&mut session.sent_infos, info);
         }
@@ -2915,13 +2948,16 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime) -> QsoJsonlScan {
     session_rows.sort_by(|left, right| right.0.cmp(&left.0));
     session_rows.truncate(64);
     let history = session_rows.into_iter().map(|(_, entry)| entry).collect::<Vec<_>>();
+    direct_calls.sort_by_key(|entry| entry.sort_epoch_ms);
     info!(
         count = history.len(),
+        direct_calls = direct_calls.len(),
         recent_worked = recent_worked.len(),
         "recent_worked_cache_loaded"
     );
     QsoJsonlScan {
         history,
+        direct_calls,
         recent_worked,
     }
 }
@@ -2938,6 +2974,16 @@ fn extract_exchange_info(text: &str) -> Option<String> {
         return None;
     }
     Some(info)
+}
+
+fn parse_direct_message_calls(text: &str) -> Option<(String, String)> {
+    let mut parts = text.split_whitespace();
+    let to_call = parts.next()?.trim();
+    let from_call = parts.next()?.trim();
+    if to_call.is_empty() || from_call.is_empty() {
+        return None;
+    }
+    Some((to_call.to_string(), from_call.to_string()))
 }
 
 fn push_unique_info(values: &mut Vec<String>, value: String) {
@@ -3374,6 +3420,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             &qso_controller.defaults(),
             &work_queue.web_snapshot(&station_tracker, SystemTime::now()),
             &qso_jsonl_cache.history,
+            &qso_jsonl_cache.direct_calls,
             &config.station.our_call,
             tune_active.load(Ordering::Relaxed),
         );
@@ -3397,6 +3444,7 @@ fn refresh_web_snapshot(
     qso_defaults: &WebQsoDefaults,
     queue_snapshot: &WebQueueSnapshot,
     qso_history: &[WebQsoHistoryEntry],
+    qso_direct_calls: &[WebDirectCallLog],
     our_call: &str,
     tune_active: bool,
 ) {
@@ -3493,7 +3541,10 @@ fn refresh_web_snapshot(
     };
     guard.stations = station_tracker.web_station_summaries();
     guard.station_logs = station_tracker.web_logs();
-    guard.direct_calls = station_tracker.web_direct_calls(our_call);
+    let mut direct_calls = station_tracker.web_direct_calls(our_call);
+    direct_calls.extend_from_slice(qso_direct_calls);
+    direct_calls.sort_by_key(|entry| entry.sort_epoch_ms);
+    guard.direct_calls = direct_calls;
     guard.qso = qso_snapshot.clone();
     guard.qso_defaults = qso_defaults.clone();
     guard.queue = queue_snapshot.clone();
@@ -4836,12 +4887,15 @@ impl StationTracker {
             .iter()
             .filter(|entry| entry.peer.as_ref().map(|peer| self.peer_display(peer)) == Some(our_call.to_string()))
             .map(|entry| WebDirectCallLog {
+                sort_epoch_ms: system_time_to_epoch_ms(entry.received_at),
                 timestamp: format_time(entry.received_at),
-                sender_call: entry.sender_call.clone(),
-                snr_db: entry.snr_db,
-                dt_seconds: entry.dt_seconds,
-                freq_hz: entry.freq_hz,
+                from_call: entry.sender_call.clone(),
+                to_call: our_call.to_string(),
+                snr_db: Some(entry.snr_db),
+                dt_seconds: Some(entry.dt_seconds),
+                freq_hz: Some(entry.freq_hz),
                 text: entry.text.clone(),
+                is_ours: false,
             })
             .collect()
     }
@@ -4965,6 +5019,13 @@ fn format_relative_age(age: Duration) -> String {
             ((seconds as f64) / 86400.0).round() as u64
         )
     }
+}
+
+fn system_time_to_epoch_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn resample_linear_f32(samples: &[f32], src_rate_hz: u32, dst_rate_hz: u32) -> Vec<f32> {
