@@ -280,6 +280,10 @@ impl QsoController {
                     ..
                 } => next_state = QsoState::SendSigAck,
                 PartnerEvent::ToUs {
+                    event: ToUsEvent::Reply(ReplyWord::Rr73),
+                    ..
+                } => next_state = QsoState::Send73Once,
+                PartnerEvent::ToUs {
                     event: ToUsEvent::Reply(_),
                     ..
                 } => next_state = QsoState::Send73,
@@ -305,11 +309,15 @@ impl QsoController {
                     ..
                 } => next_state = QsoState::Send73,
                 PartnerEvent::ToUs {
+                    event: ToUsEvent::Reply(ReplyWord::Rr73),
+                    ..
+                } => next_state = QsoState::Send73Once,
+                PartnerEvent::ToUs {
                     event: ToUsEvent::Ack,
                     ..
                 }
                 | PartnerEvent::ToUs {
-                    event: ToUsEvent::Reply(ReplyWord::Rrr | ReplyWord::Rr73),
+                    event: ToUsEvent::Reply(ReplyWord::Rrr),
                     ..
                 } => {
                     next_state = if self.config.fsm.rr73_enabled {
@@ -335,6 +343,10 @@ impl QsoController {
                 }
             },
             QsoState::SendSigAck => match event {
+                PartnerEvent::ToUs {
+                    event: ToUsEvent::Reply(ReplyWord::Rr73),
+                    ..
+                } => next_state = QsoState::Send73Once,
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Ack,
                     ..
@@ -381,6 +393,10 @@ impl QsoController {
                     event: ToUsEvent::Reply(ReplyWord::SeventyThree),
                     ..
                 } => next_state = QsoState::Send73,
+                PartnerEvent::ToUs {
+                    event: ToUsEvent::Reply(ReplyWord::Rr73),
+                    ..
+                } => next_state = QsoState::Send73Once,
                 PartnerEvent::ToUs { .. } => {
                     session.no_fwd_count += 1;
                     if session.no_fwd_count >= self.config.fsm.send_rrr.no_fwd {
@@ -2370,7 +2386,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesized_rr73_decode_advances_send_sig_ack_to_send_73() {
+    fn synthesized_rr73_decode_advances_send_sig_ack_to_send_73_once() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
@@ -2437,8 +2453,41 @@ mod tests {
 
         assert!(saw_rr73, "expected synthesized RR73 in decoder outputs");
         let snapshot = controller.snapshot(now);
-        assert_eq!(snapshot.state, "send_73");
+        assert_eq!(snapshot.state, "send_73_once");
         assert_eq!(snapshot.last_rx_event.as_deref(), Some("to_us_reply_rr73"));
+    }
+
+    #[test]
+    fn send_sig_rr73_transitions_to_send_73_once() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+            },
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+            }),
+            now,
+        );
+        if let Some(session) = controller.session.as_mut() {
+            session.state = QsoState::SendSig;
+        }
+        controller.on_full_decode(
+            now + Duration::from_secs(15),
+            &[directed_decode(
+                "K1ABC",
+                "N1VF",
+                ToUsEvent::Reply(ReplyWord::Rr73),
+            )],
+            now + Duration::from_secs(15),
+        );
+        assert_eq!(controller.snapshot(now).state, "send_73_once");
     }
 
     #[test]

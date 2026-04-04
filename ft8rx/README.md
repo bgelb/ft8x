@@ -195,7 +195,8 @@ Special handling:
 - Directed plain grid/report to our call counts as forward progress.
 - Directed `R`/ack to our call also counts as forward progress.
 - Next state on forward progress: `SendSigAck`
-- Directed `RRR`, `RR73`, or `73` to our call: `Send73`
+- Directed `RR73` to our call: `Send73Once`
+- Directed `RRR` or `73` to our call: `Send73`
 - No partner message to our call: increment `no_msg`
 - Message to our call without forward progress: increment `no_fwd`
 - `no_fwd` threshold: `Send73Once`
@@ -205,9 +206,10 @@ Special handling:
 ### `SendSig`
 
 - TX: `<partner> <our_call> <report>`
-- Directed `R`/ack, `RRR`, or `RR73` to our call:
+- Directed `R`/ack or `RRR` to our call:
   - `SendRR73` if `rr73_enabled = true`
   - otherwise `SendRRR`
+- Directed `RR73` to our call: `Send73Once`
 - Directed `73` to our call: `Send73`
 - No partner message to our call: increment `no_msg`
 - Message to our call without forward progress: increment `no_fwd`
@@ -218,7 +220,8 @@ Special handling:
 ### `SendSigAck`
 
 - TX: `<partner> <our_call> R<report>`
-- Directed `R`, `RRR`, `RR73`, or `73` to our call: `Send73`
+- Directed `RR73` to our call: `Send73Once`
+- Directed `R`, `RRR`, or `73` to our call: `Send73`
 - No partner message to our call: increment `no_msg`
 - Message to our call without forward progress: increment `no_fwd`
 - Either threshold: `Send73Once`
@@ -235,6 +238,7 @@ Special handling:
 
 - TX: `<partner> <our_call> RRR`
 - Directed `73` to our call: `Send73`
+- Directed `RR73` to our call: `Send73Once`
 - Directed message to another station or non-call token: `Send73Once`
 - No partner message to our call: increment `no_msg`
 - Message to our call without `73`: increment `no_fwd`
