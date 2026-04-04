@@ -656,7 +656,7 @@ pub fn decode_pcm_with_state(
 mod tests {
     use super::*;
     use crate::encode::{
-        TxDirectedPayload, TxMessage, WaveformOptions, encode_nonstandard_message,
+        TxDirectedPayload, TxMessage, TxRttyExchange, WaveformOptions, encode_nonstandard_message,
         encode_standard_message, synthesize_rectangular_waveform, synthesize_tx_message,
     };
     use crate::message::{GridReport, ReplyWord};
@@ -862,6 +862,7 @@ mod tests {
             Case {
                 message: TxMessage::Cq {
                     my_call: "K1ABC".to_string(),
+                    my_grid: None,
                 },
                 expected: "CQ K1ABC",
                 base_freq_hz: 650.0,
@@ -919,6 +920,30 @@ mod tests {
                 },
                 expected: "W1XYZ K1ABC 73",
                 base_freq_hz: 2_150.0,
+            },
+            Case {
+                message: TxMessage::FieldDay {
+                    first_call: "WA9XYZ".to_string(),
+                    second_call: "KA1ABC".to_string(),
+                    acknowledge: true,
+                    transmitter_count: 16,
+                    class: 'A',
+                    section: "EMA".to_string(),
+                },
+                expected: "WA9XYZ KA1ABC R 16A EMA",
+                base_freq_hz: 2_300.0,
+            },
+            Case {
+                message: TxMessage::RttyContest {
+                    tu: true,
+                    first_call: "W9XYZ".to_string(),
+                    second_call: "K1ABC".to_string(),
+                    acknowledge: true,
+                    report: 579,
+                    exchange: TxRttyExchange::Multiplier("MA".to_string()),
+                },
+                expected: "TU; W9XYZ K1ABC R 579 MA",
+                base_freq_hz: 2_450.0,
             },
         ];
 
@@ -1013,6 +1038,58 @@ mod tests {
                 .iter()
                 .any(|text| *text == "HF19NY K1ABC R-07"),
             "expected resolved hashed partner in {resolved_texts:?}"
+        );
+    }
+
+    #[test]
+    fn dxpedition_compound_message_round_trips_with_hash10_resolution() {
+        let synthesized = synthesize_tx_message(
+            &TxMessage::DxpeditionCompound {
+                finished_call: "K1ABC".to_string(),
+                next_call: "W9XYZ".to_string(),
+                my_call: "KH1/KH7Z".to_string(),
+                report_db: -11,
+            },
+            &WaveformOptions {
+                base_freq_hz: 1_550.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("synthesize dxpedition");
+        let options = DecodeOptions {
+            max_candidates: 8,
+            max_successes: 2,
+            ..DecodeOptions::default()
+        };
+
+        let (unresolved, _) =
+            decode_pcm_with_state(&synthesized.audio, &options, None).expect("decode unresolved");
+        let unresolved_texts: Vec<_> = unresolved
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
+        assert!(
+            unresolved_texts
+                .iter()
+                .any(|text| *text == "K1ABC RR73; W9XYZ <...> -12"),
+            "expected unresolved dxpedition text in {unresolved_texts:?}"
+        );
+
+        let mut state = DecoderState::new();
+        state.insert_callsign("KH1/KH7Z");
+        let (resolved, _) = decode_pcm_with_state(&synthesized.audio, &options, Some(&state))
+            .expect("decode resolved");
+        let resolved_texts: Vec<_> = resolved
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
+        assert!(
+            resolved_texts
+                .iter()
+                .any(|text| *text == "K1ABC RR73; W9XYZ <KH1/KH7Z> -12"),
+            "expected resolved dxpedition text in {resolved_texts:?}"
         );
     }
 

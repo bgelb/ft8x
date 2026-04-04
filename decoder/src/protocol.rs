@@ -44,6 +44,50 @@ pub struct NonstandardMessageLayout {
     pub kind: BitField,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DxpeditionMessageLayout {
+    pub completed_call: BitField,
+    pub next_call: BitField,
+    pub hashed_call10: BitField,
+    pub report5: BitField,
+    pub subtype: BitField,
+    pub kind: BitField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldDayMessageLayout {
+    pub first_call: BitField,
+    pub second_call: BitField,
+    pub acknowledge: BitField,
+    pub transmitter_offset: BitField,
+    pub class: BitField,
+    pub section: BitField,
+    pub subtype: BitField,
+    pub kind: BitField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RttyContestMessageLayout {
+    pub tu: BitField,
+    pub first_call: BitField,
+    pub second_call: BitField,
+    pub acknowledge: BitField,
+    pub report: BitField,
+    pub exchange: BitField,
+    pub kind: BitField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EuVhfMessageLayout {
+    pub hashed_call12: BitField,
+    pub hashed_call22: BitField,
+    pub acknowledge: BitField,
+    pub report: BitField,
+    pub serial: BitField,
+    pub grid6: BitField,
+    pub kind: BitField,
+}
+
 /// Packed bit layout for standard FT8 messages inside the 77-bit payload.
 pub const FTX_STANDARD_LAYOUT: StandardMessageLayout = StandardMessageLayout {
     first_call: BitField { start: 0, len: 28 },
@@ -65,9 +109,55 @@ pub const FTX_NONSTANDARD_LAYOUT: NonstandardMessageLayout = NonstandardMessageL
     kind: BitField { start: 74, len: 3 },
 };
 
+/// Packed bit layout for FT8 DXpedition dual-call messages (i3=0, n3=1).
+pub const FTX_DXPEDITION_LAYOUT: DxpeditionMessageLayout = DxpeditionMessageLayout {
+    completed_call: BitField { start: 0, len: 28 },
+    next_call: BitField { start: 28, len: 28 },
+    hashed_call10: BitField { start: 56, len: 10 },
+    report5: BitField { start: 66, len: 5 },
+    subtype: BitField { start: 71, len: 3 },
+    kind: BitField { start: 74, len: 3 },
+};
+
+/// Packed bit layout for FT8 ARRL Field Day messages (i3=0, n3=3/4).
+pub const FTX_FIELD_DAY_LAYOUT: FieldDayMessageLayout = FieldDayMessageLayout {
+    first_call: BitField { start: 0, len: 28 },
+    second_call: BitField { start: 28, len: 28 },
+    acknowledge: BitField { start: 56, len: 1 },
+    transmitter_offset: BitField { start: 57, len: 4 },
+    class: BitField { start: 61, len: 3 },
+    section: BitField { start: 64, len: 7 },
+    subtype: BitField { start: 71, len: 3 },
+    kind: BitField { start: 74, len: 3 },
+};
+
+/// Packed bit layout for FT8 ARRL RTTY contest / TU messages (i3=3).
+pub const FTX_RTTY_CONTEST_LAYOUT: RttyContestMessageLayout = RttyContestMessageLayout {
+    tu: BitField { start: 0, len: 1 },
+    first_call: BitField { start: 1, len: 28 },
+    second_call: BitField { start: 29, len: 28 },
+    acknowledge: BitField { start: 57, len: 1 },
+    report: BitField { start: 58, len: 3 },
+    exchange: BitField { start: 61, len: 13 },
+    kind: BitField { start: 74, len: 3 },
+};
+
+/// Packed bit layout for FT8 hashed EU VHF contest messages (i3=5).
+pub const FTX_EU_VHF_LAYOUT: EuVhfMessageLayout = EuVhfMessageLayout {
+    hashed_call12: BitField { start: 0, len: 12 },
+    hashed_call22: BitField { start: 12, len: 22 },
+    acknowledge: BitField { start: 34, len: 1 },
+    report: BitField { start: 35, len: 3 },
+    serial: BitField { start: 38, len: 11 },
+    grid6: BitField { start: 49, len: 25 },
+    kind: BitField { start: 74, len: 3 },
+};
+
 pub const FTX_MESSAGE_KIND_STANDARD_SLASH_R: u8 = 1;
 pub const FTX_MESSAGE_KIND_STANDARD_SLASH_P: u8 = 2;
+pub const FTX_MESSAGE_KIND_RTTY_CONTEST: u8 = 3;
 pub const FTX_MESSAGE_KIND_NONSTANDARD: u8 = 4;
+pub const FTX_MESSAGE_KIND_EU_VHF: u8 = 5;
 pub const FTX_FREE_TEXT_FIELD: BitField = BitField { start: 0, len: 71 };
 pub const FTX_FREE_TEXT_SUBTYPE_FIELD: BitField = BitField { start: 71, len: 3 };
 /// AP templates constrain the first 29 packed bits plus the 3-bit message-kind field.
@@ -141,6 +231,31 @@ pub const CALL_NTOKENS: u32 = 2_063_592;
 pub const CALL_MAX22: u32 = 4_194_304;
 pub const CALL_STANDARD_BASE: u32 = CALL_NTOKENS + CALL_MAX22;
 pub const HASH_MULTIPLIER: u64 = 47_055_833_459;
+
+pub const FIELD_DAY_SECTIONS: &[&str] = &[
+    "AB", "AK", "AL", "AR", "AZ", "BC", "CO", "CT", "DE", "EB", "EMA", "ENY", "EPA", "EWA", "GA",
+    "GH", "IA", "ID", "IL", "IN", "KS", "KY", "LA", "LAX", "NS", "MB", "MDC", "ME", "MI", "MN",
+    "MO", "MS", "MT", "NC", "ND", "NE", "NFL", "NH", "NL", "NLI", "NM", "NNJ", "NNY", "TER", "NTX",
+    "NV", "OH", "OK", "ONE", "ONN", "ONS", "OR", "ORG", "PAC", "PR", "QC", "RI", "SB", "SC", "SCV",
+    "SD", "SDG", "SF", "SFL", "SJV", "SK", "SNJ", "STX", "SV", "TN", "UT", "VA", "VI", "VT", "WCF",
+    "WI", "WMA", "WNY", "WPA", "WTX", "WV", "WWA", "WY", "DX", "PE", "NB",
+];
+
+pub const RTTY_MULTIPLIERS: &[&str] = &[
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS",
+    "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY",
+    "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
+    "WI", "WY", "NB", "NS", "QC", "ON", "MB", "SK", "AB", "BC", "NWT", "NF", "LB", "NU", "YT",
+    "PEI", "DC", "DR", "FR", "GD", "GR", "OV", "ZH", "ZL", "X01", "X02", "X03", "X04", "X05",
+    "X06", "X07", "X08", "X09", "X10", "X11", "X12", "X13", "X14", "X15", "X16", "X17", "X18",
+    "X19", "X20", "X21", "X22", "X23", "X24", "X25", "X26", "X27", "X28", "X29", "X30", "X31",
+    "X32", "X33", "X34", "X35", "X36", "X37", "X38", "X39", "X40", "X41", "X42", "X43", "X44",
+    "X45", "X46", "X47", "X48", "X49", "X50", "X51", "X52", "X53", "X54", "X55", "X56", "X57",
+    "X58", "X59", "X60", "X61", "X62", "X63", "X64", "X65", "X66", "X67", "X68", "X69", "X70",
+    "X71", "X72", "X73", "X74", "X75", "X76", "X77", "X78", "X79", "X80", "X81", "X82", "X83",
+    "X84", "X85", "X86", "X87", "X88", "X89", "X90", "X91", "X92", "X93", "X94", "X95", "X96",
+    "X97", "X98", "X99",
+];
 
 const ALPHABET_10: &[u8] = b"0123456789";
 const ALPHABET_27: &[u8] = b" ABCDEFGHIJKLMNOPQRSTUVWXYZ";

@@ -4794,7 +4794,6 @@ impl Drop for AtomicFlagGuard {
         self.flag.store(self.value, Ordering::Release);
     }
 }
-
 fn extract_slot_capture(
     capture: &SampleStream,
     slot_start: SystemTime,
@@ -5408,6 +5407,89 @@ fn decode_columns(decode: &DecodedMessage) -> (String, String, String, String) {
             };
             ("nonstd".to_string(), field1, field2, info)
         }
+        StructuredMessage::Dxpedition {
+            completed_call,
+            next_call,
+            hashed_call10,
+            report_db,
+            ..
+        } => (
+            "dxped".to_string(),
+            structured_call_text(completed_call),
+            structured_call_text(next_call),
+            format!(
+                "RR73; {} {report_db:+03}",
+                hashed_call10
+                    .resolved_callsign
+                    .as_ref()
+                    .map(|callsign| format!("<{callsign}>"))
+                    .unwrap_or_else(|| "<...>".to_string())
+            ),
+        ),
+        StructuredMessage::FieldDay {
+            first,
+            second,
+            acknowledge,
+            transmitter_count,
+            class,
+            section,
+            ..
+        } => (
+            "fday".to_string(),
+            structured_call_text(first),
+            structured_call_text(second),
+            if *acknowledge {
+                format!("R {transmitter_count}{class} {section}")
+            } else {
+                format!("{transmitter_count}{class} {section}")
+            },
+        ),
+        StructuredMessage::RttyContest {
+            tu,
+            first,
+            second,
+            acknowledge,
+            report,
+            exchange,
+            ..
+        } => (
+            "rtty".to_string(),
+            if *tu {
+                format!("TU; {}", structured_call_text(first))
+            } else {
+                structured_call_text(first)
+            },
+            structured_call_text(second),
+            format!(
+                "{}{:03} {}",
+                if *acknowledge { "R " } else { "" },
+                report,
+                match exchange {
+                    ft8_decoder::StructuredRttyExchange::Multiplier { value } => value.clone(),
+                    ft8_decoder::StructuredRttyExchange::Serial { value } => format!("{value:04}"),
+                }
+            ),
+        ),
+        StructuredMessage::EuVhf {
+            hashed_call12,
+            hashed_call22,
+            acknowledge,
+            report,
+            serial,
+            grid6,
+            ..
+        } => (
+            "euvhf".to_string(),
+            hashed_call_text(hashed_call12),
+            hashed22_call_text(hashed_call22),
+            format!(
+                "{}{:02}{:04} {}",
+                if *acknowledge { "R " } else { "" },
+                report,
+                serial,
+                grid6
+            ),
+        ),
         StructuredMessage::FreeText { .. } => (
             "free".to_string(),
             String::new(),
@@ -5441,6 +5523,12 @@ fn semantic_sender_call(message: &StructuredMessage) -> Option<String> {
                 Some(plain_call.callsign.clone())
             }
         }
+        StructuredMessage::Dxpedition { hashed_call10, .. } => {
+            hashed_call10.resolved_callsign.clone()
+        }
+        StructuredMessage::FieldDay { second, .. }
+        | StructuredMessage::RttyContest { second, .. } => structured_call_station_name(second),
+        StructuredMessage::EuVhf { hashed_call22, .. } => hashed_call22.resolved_callsign.clone(),
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
     }
 }
@@ -5463,6 +5551,12 @@ fn semantic_first_call_display_call(message: &StructuredMessage) -> Option<Strin
                 hashed_call.resolved_callsign.clone()
             }
         }
+        StructuredMessage::Dxpedition { completed_call, .. } => {
+            structured_call_station_name(completed_call)
+        }
+        StructuredMessage::FieldDay { first, .. }
+        | StructuredMessage::RttyContest { first, .. } => structured_call_station_name(first),
+        StructuredMessage::EuVhf { hashed_call12, .. } => hashed_call12.resolved_callsign.clone(),
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
     }
 }
@@ -5502,6 +5596,43 @@ fn message_related_calls(message: &StructuredMessage) -> Vec<String> {
                 }
             }
         }
+        StructuredMessage::Dxpedition {
+            completed_call,
+            next_call,
+            hashed_call10,
+            ..
+        } => {
+            if let Some(call) = structured_call_station_name(completed_call) {
+                related.insert(call);
+            }
+            if let Some(call) = structured_call_station_name(next_call) {
+                related.insert(call);
+            }
+            if let Some(call) = &hashed_call10.resolved_callsign {
+                related.insert(call.clone());
+            }
+        }
+        StructuredMessage::FieldDay { first, second, .. }
+        | StructuredMessage::RttyContest { first, second, .. } => {
+            if let Some(call) = structured_call_station_name(first) {
+                related.insert(call);
+            }
+            if let Some(call) = structured_call_station_name(second) {
+                related.insert(call);
+            }
+        }
+        StructuredMessage::EuVhf {
+            hashed_call12,
+            hashed_call22,
+            ..
+        } => {
+            if let Some(call) = &hashed_call12.resolved_callsign {
+                related.insert(call.clone());
+            }
+            if let Some(call) = &hashed_call22.resolved_callsign {
+                related.insert(call.clone());
+            }
+        }
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {}
     }
     related.into_iter().collect()
@@ -5537,6 +5668,47 @@ fn bandmap_detail(message: &StructuredMessage) -> Option<String> {
             }
             (!parts.is_empty()).then(|| parts.join(" "))
         }
+        StructuredMessage::Dxpedition { report_db, .. } => Some(format!("RR73 {report_db:+03}")),
+        StructuredMessage::FieldDay {
+            acknowledge,
+            transmitter_count,
+            class,
+            section,
+            ..
+        } => Some(if *acknowledge {
+            format!("R {transmitter_count}{class} {section}")
+        } else {
+            format!("{transmitter_count}{class} {section}")
+        }),
+        StructuredMessage::RttyContest {
+            tu,
+            acknowledge,
+            report,
+            exchange,
+            ..
+        } => Some(format!(
+            "{}{}{:03} {}",
+            if *tu { "TU; " } else { "" },
+            if *acknowledge { "R " } else { "" },
+            report,
+            match exchange {
+                ft8_decoder::StructuredRttyExchange::Multiplier { value } => value.clone(),
+                ft8_decoder::StructuredRttyExchange::Serial { value } => format!("{value:04}"),
+            }
+        )),
+        StructuredMessage::EuVhf {
+            acknowledge,
+            report,
+            serial,
+            grid6,
+            ..
+        } => Some(format!(
+            "{}{:02}{:04} {}",
+            if *acknowledge { "R " } else { "" },
+            report,
+            serial,
+            grid6
+        )),
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
     }
 }
@@ -5573,6 +5745,14 @@ fn structured_call_text(field: &StructuredCallField) -> String {
 }
 
 fn hashed_call_text(field: &ft8_decoder::HashedCallField12) -> String {
+    field
+        .resolved_callsign
+        .as_ref()
+        .map(|callsign| format!("<{callsign}>"))
+        .unwrap_or_else(|| "<...>".to_string())
+}
+
+fn hashed22_call_text(field: &ft8_decoder::HashedCallField22) -> String {
     field
         .resolved_callsign
         .as_ref()
@@ -5830,6 +6010,23 @@ impl StationTracker {
                         .insert(hashed_call.raw, callsign.clone());
                 }
             }
+            StructuredMessage::Dxpedition { .. }
+            | StructuredMessage::FieldDay { .. }
+            | StructuredMessage::RttyContest { .. } => {}
+            StructuredMessage::EuVhf {
+                hashed_call12,
+                hashed_call22,
+                ..
+            } => {
+                if let Some(callsign) = &hashed_call12.resolved_callsign {
+                    self.hash12_resolutions
+                        .insert(hashed_call12.raw, callsign.clone());
+                }
+                if let Some(callsign) = &hashed_call22.resolved_callsign {
+                    self.hash22_resolutions
+                        .insert(hashed_call22.raw, callsign.clone());
+                }
+            }
             StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {}
         }
     }
@@ -6033,6 +6230,28 @@ fn qso_peer_from_first_field(
                 Some(tracker.resolve_peer(PeerRef::Hash12(hashed_call.raw)))
             }
         }
+        StructuredMessage::Dxpedition { completed_call, .. } => match &completed_call.value {
+            StructuredCallValue::StandardCall { callsign } => {
+                Some(PeerRef::Callsign(callsign.clone()))
+            }
+            StructuredCallValue::Hash22 { hash, .. } => {
+                Some(tracker.resolve_peer(PeerRef::Hash22(*hash)))
+            }
+            StructuredCallValue::Token { .. } => None,
+        },
+        StructuredMessage::FieldDay { first, .. }
+        | StructuredMessage::RttyContest { first, .. } => match &first.value {
+            StructuredCallValue::StandardCall { callsign } => {
+                Some(PeerRef::Callsign(callsign.clone()))
+            }
+            StructuredCallValue::Hash22 { hash, .. } => {
+                Some(tracker.resolve_peer(PeerRef::Hash22(*hash)))
+            }
+            StructuredCallValue::Token { .. } => None,
+        },
+        StructuredMessage::EuVhf { hashed_call12, .. } => {
+            Some(tracker.resolve_peer(PeerRef::Hash12(hashed_call12.raw)))
+        }
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
     }
 }
@@ -6052,6 +6271,10 @@ fn message_ends_qso(message: &StructuredMessage) -> bool {
             reply,
             ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree
         ),
+        StructuredMessage::Dxpedition { .. } => true,
+        StructuredMessage::FieldDay { .. }
+        | StructuredMessage::RttyContest { .. }
+        | StructuredMessage::EuVhf { .. } => false,
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => false,
     }
 }
@@ -6063,6 +6286,10 @@ fn message_is_cq(message: &StructuredMessage) -> bool {
             StructuredCallValue::Token { token } if token == "CQ" || token.starts_with("CQ ")
         ),
         StructuredMessage::Nonstandard { cq, .. } => *cq,
+        StructuredMessage::Dxpedition { .. }
+        | StructuredMessage::FieldDay { .. }
+        | StructuredMessage::RttyContest { .. }
+        | StructuredMessage::EuVhf { .. } => false,
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => false,
     }
 }
@@ -6089,6 +6316,10 @@ fn station_message_kind(message: &StructuredMessage) -> StationLastMessageKind {
             ft8_decoder::ReplyWord::SeventyThree => StationLastMessageKind::SeventyThree,
             _ => StationLastMessageKind::Other,
         },
+        StructuredMessage::Dxpedition { .. }
+        | StructuredMessage::FieldDay { .. }
+        | StructuredMessage::RttyContest { .. }
+        | StructuredMessage::EuVhf { .. } => StationLastMessageKind::Other,
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {
             StationLastMessageKind::Other
         }
@@ -6166,6 +6397,10 @@ fn direct_call_observation_from_decode(
                 }
             }
         }
+        StructuredMessage::Dxpedition { .. }
+        | StructuredMessage::FieldDay { .. }
+        | StructuredMessage::RttyContest { .. }
+        | StructuredMessage::EuVhf { .. } => return None,
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => return None,
     };
     Some(DirectCallObservation {
@@ -6594,6 +6829,7 @@ mod tests {
             logs[1].related_calls,
             vec!["B".to_string(), "C".to_string()]
         );
+        assert_eq!(logs[1].peer.as_deref(), Some("C"));
         assert_eq!(logs[1].peer.as_deref(), Some("C"));
         assert_eq!(logs[1].peer_before.as_deref(), Some("A"));
         assert_eq!(logs[1].peer_after.as_deref(), Some("C"));

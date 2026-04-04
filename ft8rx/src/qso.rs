@@ -1884,6 +1884,10 @@ fn classify_single_message(
                 SingleClass::Irrelevant
             }
         }
+        StructuredMessage::Dxpedition { .. }
+        | StructuredMessage::FieldDay { .. }
+        | StructuredMessage::RttyContest { .. }
+        | StructuredMessage::EuVhf { .. } => SingleClass::Freeform,
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {
             SingleClass::Freeform
         }
@@ -2144,6 +2148,10 @@ fn semantic_sender_call(message: &StructuredMessage) -> Option<String> {
                 Some(plain_call.callsign.clone())
             }
         }
+        StructuredMessage::Dxpedition { hashed_call10, .. } => hashed_call10.resolved_callsign.clone(),
+        StructuredMessage::FieldDay { second, .. }
+        | StructuredMessage::RttyContest { second, .. } => structured_call_station_name(second),
+        StructuredMessage::EuVhf { hashed_call22, .. } => hashed_call22.resolved_callsign.clone(),
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
     }
 }
@@ -2166,6 +2174,12 @@ fn semantic_first_call_display_call(message: &StructuredMessage) -> Option<Strin
                 hashed_call.resolved_callsign.clone()
             }
         }
+        StructuredMessage::FieldDay { first, .. }
+        | StructuredMessage::RttyContest { first, .. } => structured_call_station_name(first),
+        StructuredMessage::Dxpedition { completed_call, .. } => {
+            structured_call_station_name(completed_call)
+        }
+        StructuredMessage::EuVhf { hashed_call12, .. } => hashed_call12.resolved_callsign.clone(),
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => None,
     }
 }

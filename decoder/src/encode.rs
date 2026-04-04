@@ -9,11 +9,13 @@ use crate::message::{GridReport, ReplyWord, hash_callsign};
 use crate::modes::ft8::{FT8_GEOMETRY, FT8_MESSAGE_SYMBOLS, FT8_SAMPLE_RATE, FT8_SYMBOL_SAMPLES};
 use crate::modes::populate_channel_symbols;
 use crate::protocol::{
-    CALL_NTOKENS, CALL_STANDARD_BASE, FTX_CODEWORD_BITS, FTX_DATA_SYMBOLS, FTX_INFO_BITS,
-    FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_STANDARD_SLASH_R,
-    FTX_NONSTANDARD_LAYOUT, FTX_STANDARD_LAYOUT, alphabet27_index, alphabet36_index,
-    alphabet37_index, alphabet38_index, digit10_index, gray_decode_tone3, gray_encode_3bits,
-    write_bit_field,
+    CALL_NTOKENS, CALL_STANDARD_BASE, FIELD_DAY_SECTIONS, FTX_CODEWORD_BITS, FTX_DATA_SYMBOLS,
+    FTX_DXPEDITION_LAYOUT, FTX_EU_VHF_LAYOUT, FTX_FIELD_DAY_LAYOUT, FTX_INFO_BITS,
+    FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_EU_VHF, FTX_MESSAGE_KIND_NONSTANDARD,
+    FTX_MESSAGE_KIND_RTTY_CONTEST, FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT,
+    FTX_RTTY_CONTEST_LAYOUT, FTX_STANDARD_LAYOUT, RTTY_MULTIPLIERS, alphabet27_index,
+    alphabet36_index, alphabet37_index, alphabet38_index, digit10_index, gray_decode_tone3,
+    gray_encode_3bits, write_bit_field,
 };
 use crate::wave::{AudioBuffer, DecoderError, write_wav};
 
@@ -66,6 +68,42 @@ pub enum TxMessage {
         peer_call: String,
         payload: TxDirectedPayload,
     },
+    DxpeditionCompound {
+        finished_call: String,
+        next_call: String,
+        my_call: String,
+        report_db: i16,
+    },
+    FieldDay {
+        first_call: String,
+        second_call: String,
+        acknowledge: bool,
+        transmitter_count: u8,
+        class: char,
+        section: String,
+    },
+    RttyContest {
+        tu: bool,
+        first_call: String,
+        second_call: String,
+        acknowledge: bool,
+        report: u16,
+        exchange: TxRttyExchange,
+    },
+    EuVhf {
+        first_hashed_call: String,
+        second_hashed_call: String,
+        acknowledge: bool,
+        report: u8,
+        serial: u16,
+        grid6: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum TxRttyExchange {
+    Multiplier(String),
+    Serial(u16),
 }
 
 impl Default for WaveformOptions {
@@ -132,14 +170,315 @@ pub fn synthesize_tx_message(
     message: &TxMessage,
     options: &WaveformOptions,
 ) -> Result<SynthesizedTxMessage, EncodeError> {
-    let (first, second, acknowledge, info, rendered_text) = tx_message_fields(message);
-    let frame = encode_standard_message(&first, &second, acknowledge, &info)?;
+    let (frame, rendered_text) = match message {
+        TxMessage::DxpeditionCompound {
+            finished_call,
+            next_call,
+            my_call,
+            report_db,
+        } => (
+            encode_dxpedition_message(finished_call, next_call, my_call, *report_db)?,
+            format!(
+                "{} RR73; {} <{}> {:+03}",
+                finished_call.trim().to_uppercase(),
+                next_call.trim().to_uppercase(),
+                my_call.trim().to_uppercase(),
+                report_db
+            ),
+        ),
+        TxMessage::FieldDay {
+            first_call,
+            second_call,
+            acknowledge,
+            transmitter_count,
+            class,
+            section,
+        } => (
+            encode_field_day_message(
+                first_call,
+                second_call,
+                *acknowledge,
+                *transmitter_count,
+                *class,
+                section,
+            )?,
+            render_field_day_message(
+                first_call,
+                second_call,
+                *acknowledge,
+                *transmitter_count,
+                *class,
+                section,
+            ),
+        ),
+        TxMessage::RttyContest {
+            tu,
+            first_call,
+            second_call,
+            acknowledge,
+            report,
+            exchange,
+        } => (
+            encode_rtty_contest_message(
+                *tu,
+                first_call,
+                second_call,
+                *acknowledge,
+                *report,
+                exchange,
+            )?,
+            render_rtty_contest_message(
+                *tu,
+                first_call,
+                second_call,
+                *acknowledge,
+                *report,
+                exchange,
+            ),
+        ),
+        TxMessage::EuVhf {
+            first_hashed_call,
+            second_hashed_call,
+            acknowledge,
+            report,
+            serial,
+            grid6,
+        } => (
+            encode_eu_vhf_message(
+                first_hashed_call,
+                second_hashed_call,
+                *acknowledge,
+                *report,
+                *serial,
+                grid6,
+            )?,
+            render_eu_vhf_message(
+                first_hashed_call,
+                second_hashed_call,
+                *acknowledge,
+                *report,
+                *serial,
+                grid6,
+            ),
+        ),
+        _ => {
+            let (first, second, acknowledge, info, rendered_text) = tx_message_fields(message);
+            (
+                encode_standard_message(&first, &second, acknowledge, &info)?,
+                rendered_text,
+            )
+        }
+    };
     let audio = synthesize_rectangular_waveform(&frame, options)?;
     Ok(SynthesizedTxMessage {
         frame,
         audio,
         rendered_text,
     })
+}
+
+pub fn encode_dxpedition_message(
+    finished_call: &str,
+    next_call: &str,
+    my_call: &str,
+    report_db: i16,
+) -> Result<EncodedFrame, EncodeError> {
+    let mut message_bits = [0u8; MESSAGE_BITS];
+    write_bit_field(
+        &mut message_bits,
+        FTX_DXPEDITION_LAYOUT.completed_call,
+        u64::from(encode_c28(finished_call)?),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_DXPEDITION_LAYOUT.next_call,
+        u64::from(encode_c28(next_call)?),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_DXPEDITION_LAYOUT.hashed_call10,
+        hash_callsign(&my_call.trim().to_uppercase(), 10),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_DXPEDITION_LAYOUT.report5,
+        dxpedition_report_bits(report_db) as u64,
+    );
+    write_bit_field(&mut message_bits, FTX_DXPEDITION_LAYOUT.subtype, 1);
+    write_bit_field(&mut message_bits, FTX_DXPEDITION_LAYOUT.kind, 0);
+    build_frame(message_bits)
+}
+
+pub fn encode_field_day_message(
+    first_call: &str,
+    second_call: &str,
+    acknowledge: bool,
+    transmitter_count: u8,
+    class: char,
+    section: &str,
+) -> Result<EncodedFrame, EncodeError> {
+    if !(1..=32).contains(&transmitter_count) {
+        return Err(EncodeError::UnsupportedInfo(format!(
+            "field day transmitters: {transmitter_count}"
+        )));
+    }
+    let class_upper = class.to_ascii_uppercase();
+    if !('A'..='H').contains(&class_upper) {
+        return Err(EncodeError::UnsupportedInfo(format!(
+            "field day class: {class}"
+        )));
+    }
+    let section_index = FIELD_DAY_SECTIONS
+        .iter()
+        .position(|candidate| *candidate == section.trim().to_uppercase())
+        .ok_or_else(|| EncodeError::UnsupportedInfo(section.to_string()))?;
+
+    let mut message_bits = [0u8; MESSAGE_BITS];
+    write_bit_field(
+        &mut message_bits,
+        FTX_FIELD_DAY_LAYOUT.first_call,
+        u64::from(encode_c28(first_call)?),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_FIELD_DAY_LAYOUT.second_call,
+        u64::from(encode_c28(second_call)?),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_FIELD_DAY_LAYOUT.acknowledge,
+        acknowledge as u64,
+    );
+    let (subtype, transmitter_offset) = if transmitter_count <= 16 {
+        (3u64, u64::from(transmitter_count - 1))
+    } else {
+        (4u64, u64::from(transmitter_count - 17))
+    };
+    write_bit_field(
+        &mut message_bits,
+        FTX_FIELD_DAY_LAYOUT.transmitter_offset,
+        transmitter_offset,
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_FIELD_DAY_LAYOUT.class,
+        u64::from(class_upper as u8 - b'A'),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_FIELD_DAY_LAYOUT.section,
+        u64::try_from(section_index + 1).expect("section fits"),
+    );
+    write_bit_field(&mut message_bits, FTX_FIELD_DAY_LAYOUT.subtype, subtype);
+    write_bit_field(&mut message_bits, FTX_FIELD_DAY_LAYOUT.kind, 0);
+    build_frame(message_bits)
+}
+
+pub fn encode_rtty_contest_message(
+    tu: bool,
+    first_call: &str,
+    second_call: &str,
+    acknowledge: bool,
+    report: u16,
+    exchange: &TxRttyExchange,
+) -> Result<EncodedFrame, EncodeError> {
+    let report_bits = encode_rtty_report_bits(report);
+    let exchange_bits = match exchange {
+        TxRttyExchange::Multiplier(value) => {
+            let index = RTTY_MULTIPLIERS
+                .iter()
+                .position(|candidate| *candidate == value.trim().to_uppercase())
+                .ok_or_else(|| EncodeError::UnsupportedInfo(value.clone()))?;
+            u16::try_from(8001 + index).expect("rtty multiplier fits")
+        }
+        TxRttyExchange::Serial(value) => *value,
+    };
+
+    let mut message_bits = [0u8; MESSAGE_BITS];
+    write_bit_field(&mut message_bits, FTX_RTTY_CONTEST_LAYOUT.tu, tu as u64);
+    write_bit_field(
+        &mut message_bits,
+        FTX_RTTY_CONTEST_LAYOUT.first_call,
+        u64::from(encode_c28(first_call)?),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_RTTY_CONTEST_LAYOUT.second_call,
+        u64::from(encode_c28(second_call)?),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_RTTY_CONTEST_LAYOUT.acknowledge,
+        acknowledge as u64,
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_RTTY_CONTEST_LAYOUT.report,
+        u64::from(report_bits),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_RTTY_CONTEST_LAYOUT.exchange,
+        u64::from(exchange_bits),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_RTTY_CONTEST_LAYOUT.kind,
+        u64::from(FTX_MESSAGE_KIND_RTTY_CONTEST),
+    );
+    build_frame(message_bits)
+}
+
+pub fn encode_eu_vhf_message(
+    first_hashed_call: &str,
+    second_hashed_call: &str,
+    acknowledge: bool,
+    report: u8,
+    serial: u16,
+    grid6: &str,
+) -> Result<EncodedFrame, EncodeError> {
+    if !(52..=59).contains(&report) {
+        return Err(EncodeError::UnsupportedInfo(format!(
+            "eu vhf report: {report}"
+        )));
+    }
+    let mut message_bits = [0u8; MESSAGE_BITS];
+    write_bit_field(
+        &mut message_bits,
+        FTX_EU_VHF_LAYOUT.hashed_call12,
+        hash_callsign(&strip_hash_wrapper(first_hashed_call), 12),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_EU_VHF_LAYOUT.hashed_call22,
+        hash_callsign(&strip_hash_wrapper(second_hashed_call), 22),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_EU_VHF_LAYOUT.acknowledge,
+        acknowledge as u64,
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_EU_VHF_LAYOUT.report,
+        u64::from(report - 52),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_EU_VHF_LAYOUT.serial,
+        u64::from(serial.min(2047)),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_EU_VHF_LAYOUT.grid6,
+        u64::from(encode_grid6(grid6, false)?),
+    );
+    write_bit_field(
+        &mut message_bits,
+        FTX_EU_VHF_LAYOUT.kind,
+        u64::from(FTX_MESSAGE_KIND_EU_VHF),
+    );
+    build_frame(message_bits)
 }
 
 pub fn encode_nonstandard_message(
@@ -385,6 +724,12 @@ fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, 
                 rendered,
             )
         }
+        TxMessage::DxpeditionCompound { .. }
+        | TxMessage::FieldDay { .. }
+        | TxMessage::RttyContest { .. }
+        | TxMessage::EuVhf { .. } => {
+            panic!("specialized FT8 messages bypass standard field rendering")
+        }
     }
 }
 
@@ -440,6 +785,84 @@ fn render_standard_info(acknowledge: bool, info: &GridReport) -> String {
         GridReport::Reply(ReplyWord::Rrr) => "RRR".to_string(),
         GridReport::Reply(ReplyWord::Rr73) => "RR73".to_string(),
         GridReport::Reply(ReplyWord::SeventyThree) => "73".to_string(),
+    }
+}
+
+fn render_field_day_message(
+    first_call: &str,
+    second_call: &str,
+    acknowledge: bool,
+    transmitter_count: u8,
+    class: char,
+    section: &str,
+) -> String {
+    if acknowledge {
+        format!(
+            "{} {} R {}{} {}",
+            first_call.trim(),
+            second_call.trim(),
+            transmitter_count,
+            class.to_ascii_uppercase(),
+            section.trim().to_uppercase()
+        )
+    } else {
+        format!(
+            "{} {} {}{} {}",
+            first_call.trim(),
+            second_call.trim(),
+            transmitter_count,
+            class.to_ascii_uppercase(),
+            section.trim().to_uppercase()
+        )
+    }
+}
+
+fn render_rtty_contest_message(
+    tu: bool,
+    first_call: &str,
+    second_call: &str,
+    acknowledge: bool,
+    report: u16,
+    exchange: &TxRttyExchange,
+) -> String {
+    let mut parts = Vec::new();
+    if tu {
+        parts.push("TU;".to_string());
+    }
+    parts.push(first_call.trim().to_uppercase());
+    parts.push(second_call.trim().to_uppercase());
+    if acknowledge {
+        parts.push("R".to_string());
+    }
+    parts.push(format!("{report:03}"));
+    parts.push(match exchange {
+        TxRttyExchange::Multiplier(value) => value.trim().to_uppercase(),
+        TxRttyExchange::Serial(value) => format!("{value:04}"),
+    });
+    parts.join(" ")
+}
+
+fn render_eu_vhf_message(
+    first_hashed_call: &str,
+    second_hashed_call: &str,
+    acknowledge: bool,
+    report: u8,
+    serial: u16,
+    grid6: &str,
+) -> String {
+    let first = format!("<{}>", strip_hash_wrapper(first_hashed_call));
+    let second = format!("<{}>", strip_hash_wrapper(second_hashed_call));
+    let exchange = format!("{report:02}{:04}", serial.min(2047));
+    if acknowledge {
+        format!(
+            "{first} {second} R {exchange} {}",
+            grid6.trim().to_uppercase()
+        )
+    } else {
+        format!(
+            "{first} {second} {exchange} {}",
+            grid6.trim().to_uppercase()
+        )
     }
 }
 
@@ -622,6 +1045,63 @@ fn encode_r2(reply: ReplyWord) -> u8 {
     }
 }
 
+fn dxpedition_report_bits(report_db: i16) -> u8 {
+    (((i32::from(report_db) + 30) / 2).clamp(0, 31)) as u8
+}
+
+fn encode_rtty_report_bits(report: u16) -> u8 {
+    (((i32::from(report) - 509) / 10) - 2).clamp(0, 7) as u8
+}
+
+fn encode_grid6(grid6: &str, allow_blank_tail: bool) -> Result<u32, EncodeError> {
+    let mut normalized = grid6.trim().to_uppercase();
+    if normalized.len() == 4 && allow_blank_tail {
+        normalized.push_str("  ");
+    }
+    let chars: Vec<char> = normalized.chars().collect();
+    let base = if allow_blank_tail { 25u32 } else { 24u32 };
+    if chars.len() != 6
+        || !matches!(chars[0], 'A'..='R')
+        || !matches!(chars[1], 'A'..='R')
+        || !chars[2].is_ascii_digit()
+        || !chars[3].is_ascii_digit()
+    {
+        return Err(EncodeError::UnsupportedInfo(grid6.to_string()));
+    }
+    let encode_tail = |ch: char| -> Option<u32> {
+        if allow_blank_tail && ch == ' ' {
+            Some(24)
+        } else if ('A'..='X').contains(&ch) {
+            Some((ch as u8 - b'A') as u32)
+        } else {
+            None
+        }
+    };
+    let tail1 =
+        encode_tail(chars[4]).ok_or_else(|| EncodeError::UnsupportedInfo(grid6.to_string()))?;
+    let tail2 =
+        encode_tail(chars[5]).ok_or_else(|| EncodeError::UnsupportedInfo(grid6.to_string()))?;
+    Ok(
+        (((((chars[0] as u32 - 'A' as u32) * 18 + (chars[1] as u32 - 'A' as u32)) * 10
+            + (chars[2] as u32 - '0' as u32))
+            * 10
+            + (chars[3] as u32 - '0' as u32))
+            * base
+            + tail1)
+            * base
+            + tail2,
+    )
+}
+
+fn strip_hash_wrapper(callsign: &str) -> String {
+    let trimmed = callsign.trim();
+    if trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.len() >= 3 {
+        trimmed[1..trimmed.len() - 1].trim().to_uppercase()
+    } else {
+        trimmed.to_uppercase()
+    }
+}
+
 fn encode_c58(text: &str) -> Result<u128, EncodeError> {
     let mut normalized = text.trim().to_uppercase();
     if normalized.len() > 11 {
@@ -660,6 +1140,7 @@ fn is_grid4(grid: &str) -> bool {
 mod tests {
     use super::*;
     use crate::DecodeOptions;
+    use crate::crc::crc14_ft8;
     use crate::decode_pcm;
     use crate::ldpc::ParityMatrix;
     use crate::message::{
@@ -713,6 +1194,157 @@ mod tests {
         resolver.insert_callsign("A41ZZ");
         let rendered = payload.to_message(&resolver);
         assert_eq!(rendered.to_text(), "YO7CGS A41ZZ -11");
+    }
+
+    #[test]
+    fn encodes_dxpedition_rr73_message() {
+        let frame = encode_dxpedition_message("K1ABC", "W9XYZ", "KH1/KH7Z", -11).expect("encode");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let unresolved = payload.to_message(&HashResolver::default());
+        assert_eq!(unresolved.to_text(), "K1ABC RR73; W9XYZ <...> -12");
+
+        let mut resolver = HashResolver::default();
+        resolver.insert_callsign("KH1/KH7Z");
+        let resolved = payload.to_message(&resolver);
+        assert_eq!(resolved.to_text(), "K1ABC RR73; W9XYZ <KH1/KH7Z> -12");
+    }
+
+    #[test]
+    fn encodes_field_day_message() {
+        let frame = encode_field_day_message("WA9XYZ", "KA1ABC", true, 16, 'A', "EMA")
+            .expect("encode field day");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let rendered = payload.to_message(&HashResolver::default());
+        assert_eq!(rendered.to_text(), "WA9XYZ KA1ABC R 16A EMA");
+    }
+
+    #[test]
+    fn encodes_rtty_contest_tu_message() {
+        let frame = encode_rtty_contest_message(
+            true,
+            "W9XYZ",
+            "K1ABC",
+            true,
+            579,
+            &TxRttyExchange::Multiplier("MA".to_string()),
+        )
+        .expect("encode rtty");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let rendered = payload.to_message(&HashResolver::default());
+        assert_eq!(rendered.to_text(), "TU; W9XYZ K1ABC R 579 MA");
+    }
+
+    #[test]
+    fn encodes_eu_vhf_hashed_message() {
+        let frame = encode_eu_vhf_message("<PA3XYZ>", "<G4ABC/P>", true, 59, 3, "IO91NP")
+            .expect("encode eu vhf");
+        let payload = unpack_message(&frame.codeword_bits).expect("payload");
+        let unresolved = payload.to_message(&HashResolver::default());
+        assert_eq!(unresolved.to_text(), "<...> <...> R 590003 IO91NP");
+
+        let mut resolver = HashResolver::default();
+        resolver.insert_callsign("PA3XYZ");
+        resolver.insert_callsign("G4ABC/P");
+        let resolved = payload.to_message(&resolver);
+        assert_eq!(resolved.to_text(), "<PA3XYZ> <G4ABC/P> R 590003 IO91NP");
+    }
+
+    #[test]
+    fn wsjtx_reference_vectors_match_special_message_payloads() {
+        let dxped = encode_dxpedition_message("K1ABC", "W9XYZ", "KH1/KH7Z", -11)
+            .expect("encode dxpedition");
+        assert_eq!(
+            bits_to_string(&dxped.message_bits),
+            "00001001101111011110001101010000110000101001001110111000001100100101001001000"
+        );
+        let dxped_payload = payload_from_message_bits(&dxped.message_bits);
+        let mut dxped_resolver = HashResolver::default();
+        dxped_resolver.insert_callsign("KH1/KH7Z");
+        assert_eq!(
+            dxped_payload.to_message(&dxped_resolver).to_text(),
+            "K1ABC RR73; W9XYZ <KH1/KH7Z> -12"
+        );
+
+        let field_day_16 =
+            encode_field_day_message("WA9XYZ", "KA1ABC", true, 16, 'A', "EMA").expect("fd16");
+        assert_eq!(
+            bits_to_string(&field_day_16.message_bits),
+            "11100111000010000110110111001001010111000110010100100001111110000001011011000"
+        );
+        assert_eq!(
+            payload_from_message_bits(&field_day_16.message_bits)
+                .to_message(&HashResolver::default())
+                .to_text(),
+            "WA9XYZ KA1ABC R 16A EMA"
+        );
+
+        let field_day_32 =
+            encode_field_day_message("WA9XYZ", "KA1ABC", true, 32, 'A', "EMA").expect("fd32");
+        assert_eq!(
+            bits_to_string(&field_day_32.message_bits),
+            "11100111000010000110110111001001010111000110010100100001111110000001011100000"
+        );
+        assert_eq!(
+            payload_from_message_bits(&field_day_32.message_bits)
+                .to_message(&HashResolver::default())
+                .to_text(),
+            "WA9XYZ KA1ABC R 32A EMA"
+        );
+
+        let rtty_tu = encode_rtty_contest_message(
+            true,
+            "W9XYZ",
+            "K1ABC",
+            true,
+            579,
+            &TxRttyExchange::Multiplier("MA".to_string()),
+        )
+        .expect("encode rtty tu");
+        assert_eq!(
+            bits_to_string(&rtty_tu.message_bits),
+            "10000110000101001001110111000000010011011110111100011010111011111101010101011"
+        );
+        assert_eq!(
+            payload_from_message_bits(&rtty_tu.message_bits)
+                .to_message(&HashResolver::default())
+                .to_text(),
+            "TU; W9XYZ K1ABC R 579 MA"
+        );
+
+        let rtty_serial = encode_rtty_contest_message(
+            false,
+            "W9XYZ",
+            "G8ABC",
+            true,
+            559,
+            &TxRttyExchange::Serial(13),
+        )
+        .expect("encode rtty serial");
+        assert_eq!(
+            bits_to_string(&rtty_serial.message_bits),
+            "00000110000101001001110111000000010010001111101001111001010110000000001101011"
+        );
+        assert_eq!(
+            payload_from_message_bits(&rtty_serial.message_bits)
+                .to_message(&HashResolver::default())
+                .to_text(),
+            "W9XYZ G8ABC R 559 0013"
+        );
+
+        let eu_vhf = encode_eu_vhf_message("<PA3XYZ>", "<G4ABC/P>", true, 59, 3, "IO91NP")
+            .expect("encode eu vhf");
+        assert_eq!(
+            bits_to_string(&eu_vhf.message_bits),
+            "11001000101111001000101111100100111111000000000110100010111010110000000111101"
+        );
+        let eu_vhf_payload = payload_from_message_bits(&eu_vhf.message_bits);
+        let mut eu_vhf_resolver = HashResolver::default();
+        eu_vhf_resolver.insert_callsign("PA3XYZ");
+        eu_vhf_resolver.insert_callsign("G4ABC/P");
+        assert_eq!(
+            eu_vhf_payload.to_message(&eu_vhf_resolver).to_text(),
+            "<PA3XYZ> <G4ABC/P> R 590003 IO91NP"
+        );
     }
 
     #[test]
@@ -809,5 +1441,18 @@ mod tests {
             value = (value << 1) | (*bit as u64);
         }
         value
+    }
+
+    fn bits_to_string(bits: &[u8]) -> String {
+        bits.iter()
+            .map(|bit| if *bit == 0 { '0' } else { '1' })
+            .collect()
+    }
+
+    fn payload_from_message_bits(message_bits: &[u8]) -> crate::message::Payload {
+        let mut codeword = Vec::with_capacity(91);
+        codeword.extend_from_slice(message_bits);
+        codeword.extend_from_slice(&crc14_ft8(message_bits));
+        unpack_message(&codeword).expect("payload")
     }
 }
