@@ -1161,6 +1161,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .value.small {
       font-size: 15px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+    .status-grid > div {
+      min-width: 0;
     }
     #waterfall {
       width: 100%;
@@ -1331,6 +1338,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       scrollbar-gutter: stable;
       scroll-padding-bottom: 18px;
     }
+    .queue-panel .scroll-surface,
+    .qso-panel .scroll-surface,
+    .direct-panel .scroll-surface,
+    .log-panel .scroll-surface {
+      flex: 1 1 auto;
+      display: flex;
+      min-height: 0;
+    }
     .activity-list {
       margin-top: 0;
       display: flex;
@@ -1353,7 +1368,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       height: 392px;
     }
     #direct-list {
-      height: 292px;
+      height: auto;
+      flex: 1 1 auto;
+      min-height: 0;
     }
     .activity-item {
       border: 1px solid rgba(143, 176, 192, 0.1);
@@ -1507,7 +1524,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 18px;
     }
     #qso-transcript {
-      height: 558px;
+      height: auto;
+      flex: 1 1 auto;
+      min-height: 0;
     }
     .qso-entry {
       border: 1px solid rgba(143, 176, 192, 0.1);
@@ -1565,7 +1584,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 18px;
     }
     #queue-list {
-      height: 382px;
+      height: auto;
+      flex: 1 1 auto;
+      min-height: 0;
     }
     .queue-item {
       display: grid;
@@ -1616,7 +1637,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height: 18px;
     }
     #qso-history-list {
-      height: 292px;
+      height: auto;
+      flex: 1 1 auto;
+      min-height: 0;
     }
     .history-row {
       display: grid;
@@ -2528,16 +2551,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const rigDir = data.rig_is_tx == null ? '?' : (data.rig_is_tx ? 'TX' : 'RX');
       const rigPower = data.rig_power_w == null ? '-' : `${data.rig_power_w.toFixed(1)}W`;
       const rigBg = data.rig_bargraph == null ? '-' : data.rig_bargraph;
-      document.getElementById('rig').textContent = `${freq}  ${data.rig_mode}  ${data.rig_band}  ${rigDir}  P=${rigPower}  BG=${rigBg}`;
+      document.getElementById('rig').textContent = `${freq} ${data.rig_mode} ${data.rig_band} ${rigDir} P=${rigPower} BG=${rigBg}`;
       document.getElementById('audio').textContent =
-        `latest=${data.audio_stats.latest_sample ?? '-'}  ch=${data.audio_stats.selected_channel}  L=${data.audio_stats.left_dbfs.toFixed(1)}  R=${data.audio_stats.right_dbfs.toFixed(1)}  all=${data.audio_stats.overall_dbfs.toFixed(1)} dBFS  rec=${data.audio_stats.recoveries}`;
+        `t=${data.audio_stats.latest_sample ?? '-'} ch=${data.audio_stats.selected_channel} L=${data.audio_stats.left_dbfs.toFixed(1)} R=${data.audio_stats.right_dbfs.toFixed(1)} all=${data.audio_stats.overall_dbfs.toFixed(1)} rec=${data.audio_stats.recoveries}`;
       document.getElementById('status').textContent = data.decode_status || '-';
       document.getElementById('slot').textContent =
-        `${data.current_slot}${data.last_done_slot ? `  last=${data.last_done_slot}` : ''}`;
+        `${data.current_slot}${data.last_done_slot ? ` last=${data.last_done_slot}` : ''}`;
       document.getElementById('times').textContent =
-        `early=${fmtSec(data.decode_times.early_seconds)}  mid=${fmtSec(data.decode_times.mid_seconds)}  late=${fmtSec(data.decode_times.late_seconds)}  tx_margin=${fmtSec(data.decode_times.tx_margin_seconds)}`;
+        `e=${fmtSec(data.decode_times.early_seconds)} m=${fmtSec(data.decode_times.mid_seconds)} l=${fmtSec(data.decode_times.late_seconds)} tx=${fmtSec(data.decode_times.tx_margin_seconds)}`;
       document.getElementById('dtstats').textContent =
-        `cur avg=${fmtSec(data.dt_stats.current_mean_seconds)}  med=${fmtSec(data.dt_stats.current_median_seconds)}  std=${fmtSec(data.dt_stats.current_stddev_seconds)}  n=${data.dt_stats.current_count}  10m avg=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}  med=${fmtSec(data.dt_stats.ten_minute_median_seconds)}  n=${data.dt_stats.ten_minute_count}`;
+        `cur=${fmtSec(data.dt_stats.current_mean_seconds)}/${fmtSec(data.dt_stats.current_median_seconds)} sd=${fmtSec(data.dt_stats.current_stddev_seconds)} n=${data.dt_stats.current_count} 10m=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}/${fmtSec(data.dt_stats.ten_minute_median_seconds)} n=${data.dt_stats.ten_minute_count}`;
       document.getElementById('count').textContent = `${data.decodes.length} visible`;
       renderWaterfall(data.waterfall);
       renderBandMap('even-map', data.bandmaps.even);
