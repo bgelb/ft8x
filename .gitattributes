@@ -1,0 +1,3 @@
+golden/**/report/index.html -diff linguist-generated=true
+golden/**/results/results.json -diff linguist-generated=true
+golden/**/results/raw/** -diff linguist-generated=true

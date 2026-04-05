@@ -1,0 +1,11 @@
+153830 -14  0.0  373 ~  G4RRA JA2QXP PM84                       
+153830 -12  0.0  870 ~  G0PQO JH1XYB RRR                        
+153830 -12 -0.0 1003 ~  G3YQA JH7DFZ 73                         
+153830  -3  0.1 1445 ~  FR5CB BG8NG -15                         
+153830 -14  1.0 1837 ~  CQ BG1LKL ON80                          
+153830  -7 -0.2 1983 ~  JA7JND BH8ESR RR73                      
+153830  -6 -0.5 2082 ~  MM0AMW RW0CF RR73                       
+153830 -10  1.5 2208 ~  UT4XU BD4SDY -15                        
+153830  -4  0.8 2632 ~  UA6CG BD4QA RR73                        
+153830 -16  0.0 1404 ~  CQ YF9FCO OI71                          
+<DecodeFinished>   0  10

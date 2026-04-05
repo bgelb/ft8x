@@ -1,0 +1,5 @@
+153930   0  0.0 1410 ~  FR5CB BG8NG -15                         
+153930 -13 -0.5 2047 ~  UT4XU RW0CF RR73                        
+153930  -9 -1.1 1976 ~  G0JHC BD2BN 73                          
+153930 -17 -0.1  968 ~  CQ JH7DFZ QM07                      ? a1
+<DecodeFinished>   0   4

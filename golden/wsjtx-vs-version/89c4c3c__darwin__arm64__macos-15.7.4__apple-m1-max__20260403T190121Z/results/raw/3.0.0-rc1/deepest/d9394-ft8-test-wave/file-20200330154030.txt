@@ -1,0 +1,6 @@
+154030  -8  0.4 2607 ~  IW3RQT BD4QA RR73                       
+<DecodeFinished>   0   1        0
+# stderr (4.395s)
+dyld[19291]: symbol '_iconv_close' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.
+dyld[19291]: symbol '_iconv_open' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.
+dyld[19291]: symbol '_iconv' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.

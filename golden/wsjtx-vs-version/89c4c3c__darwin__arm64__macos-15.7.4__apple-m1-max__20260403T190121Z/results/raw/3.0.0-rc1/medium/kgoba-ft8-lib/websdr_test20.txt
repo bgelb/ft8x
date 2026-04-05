@@ -1,0 +1,6 @@
+ EOF on input file /private/tmp/ft8-regr-main.7LfJvt/artifacts/samples/kgoba-ft8-lib/websdr_test20/websdr_test20.wav
+<DecodeFinished>   0   0        0
+# stderr (1.873s)
+dyld[19228]: symbol '_iconv_close' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.
+dyld[19228]: symbol '_iconv_open' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.
+dyld[19228]: symbol '_iconv' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.
