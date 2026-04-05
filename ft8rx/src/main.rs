@@ -588,6 +588,7 @@ struct LoggedDecode {
 struct WorkQueueState {
     auto_enabled: bool,
     our_call: String,
+    current_band: Option<String>,
     auto_add_direct_calls: bool,
     ignore_direct_calls_from_recently_worked: bool,
     cq_enabled: bool,
@@ -601,8 +602,14 @@ struct WorkQueueState {
     no_message_retry_delay: Duration,
     no_forward_retry_delay: Duration,
     entries: VecDeque<WorkQueueEntry>,
-    recent_worked: BTreeMap<String, SystemTime>,
+    recent_worked: BTreeMap<WorkedBandKey, SystemTime>,
     scheduler_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct WorkedBandKey {
+    callsign: String,
+    band: String,
 }
 
 #[derive(Debug, Clone)]
@@ -701,7 +708,7 @@ struct QsoJsonlCache {
     last_len: u64,
     history: Vec<WebQsoHistoryEntry>,
     direct_calls: Vec<WebDirectCallLog>,
-    recent_worked: BTreeMap<String, SystemTime>,
+    recent_worked: BTreeMap<WorkedBandKey, SystemTime>,
 }
 
 #[derive(Debug, Default)]
@@ -736,14 +743,26 @@ impl Default for StationTracker {
 }
 
 impl WorkQueueState {
+    fn set_current_band(&mut self, band: Option<String>) {
+        self.current_band = band;
+    }
+
+    fn worked_band_key(callsign: &str, band: &str) -> WorkedBandKey {
+        WorkedBandKey {
+            callsign: callsign.to_string(),
+            band: band.to_string(),
+        }
+    }
+
     fn new(
         config: &AppConfig,
         tx_freq_hz: f32,
-        recent_worked: BTreeMap<String, SystemTime>,
+        recent_worked: BTreeMap<WorkedBandKey, SystemTime>,
     ) -> Self {
         Self {
             auto_enabled: false,
             our_call: config.station.our_call.clone(),
+            current_band: None,
             auto_add_direct_calls: config.queue.auto_add_direct_calls_default,
             ignore_direct_calls_from_recently_worked: config
                 .queue
@@ -781,9 +800,9 @@ impl WorkQueueState {
             info!(callsign, "queue_add_rejected_own_call");
             return Err("cannot queue our own call".to_string());
         }
-        if self.was_worked_recently(callsign, now) {
+        if self.was_worked_recently_on_current_band(callsign, now) {
             info!(callsign, "queue_add_rejected_recently_worked");
-            return Err("station worked in last 24h".to_string());
+            return Err("station worked on this band in last 24h".to_string());
         }
         if self.entries.iter().any(|entry| entry.callsign == callsign) {
             info!(callsign, "queue_add_ignored_duplicate");
@@ -823,13 +842,13 @@ impl WorkQueueState {
             return Err("cannot queue our own call".to_string());
         }
         if self.ignore_direct_calls_from_recently_worked
-            && self.was_worked_recently(&observation.callsign, now)
+            && self.was_worked_recently_on_current_band(&observation.callsign, now)
         {
             info!(
                 callsign = observation.callsign,
                 "queue_direct_rejected_recently_worked"
             );
-            return Err("direct caller worked in last 24h".to_string());
+            return Err("direct caller worked on this band in last 24h".to_string());
         }
         if let Some(entry) = self
             .entries
@@ -1055,42 +1074,69 @@ impl WorkQueueState {
         );
     }
 
-    fn sync_recent_worked(&mut self, recent_worked: BTreeMap<String, SystemTime>) {
-        for (callsign, worked_at) in recent_worked {
-            match self.recent_worked.get(&callsign).copied() {
+    fn sync_recent_worked(&mut self, recent_worked: BTreeMap<WorkedBandKey, SystemTime>) {
+        for (key, worked_at) in recent_worked {
+            match self.recent_worked.get(&key).copied() {
                 Some(existing) if existing >= worked_at => {}
                 _ => {
-                    self.recent_worked.insert(callsign, worked_at);
+                    self.recent_worked.insert(key, worked_at);
                 }
             }
         }
     }
 
     fn prune_recent_worked(&mut self, now: SystemTime) {
-        self.recent_worked.retain(|callsign, worked_at| {
+        self.recent_worked.retain(|key, worked_at| {
             let keep =
                 now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION;
             if !keep {
-                info!(callsign, worked_at = %format_time(*worked_at), "recent_worked_expired");
+                info!(
+                    callsign = key.callsign,
+                    band = key.band,
+                    worked_at = %format_time(*worked_at),
+                    "recent_worked_expired"
+                );
             }
             keep
         });
     }
 
-    fn mark_worked(&mut self, callsign: &str, worked_at: SystemTime) {
-        self.recent_worked.insert(callsign.to_string(), worked_at);
-        info!(callsign, worked_at = %format_time(worked_at), "recent_worked_updated");
+    fn mark_worked(&mut self, callsign: &str, band: &str, worked_at: SystemTime) {
+        self.recent_worked
+            .insert(Self::worked_band_key(callsign, band), worked_at);
+        info!(
+            callsign,
+            band,
+            worked_at = %format_time(worked_at),
+            "recent_worked_updated"
+        );
     }
 
-    fn was_worked_recently(&self, callsign: &str, now: SystemTime) -> bool {
-        self.recent_worked.get(callsign).is_some_and(|worked_at| {
+    fn was_worked_recently(
+        &self,
+        callsign: &str,
+        band: Option<&str>,
+        now: SystemTime,
+    ) -> bool {
+        let Some(band) = band else {
+            return false;
+        };
+        self.recent_worked
+            .get(&Self::worked_band_key(callsign, band))
+            .is_some_and(|worked_at| {
             now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
-        })
+            })
+    }
+
+    fn was_worked_recently_on_current_band(&self, callsign: &str, now: SystemTime) -> bool {
+        self.was_worked_recently(callsign, self.current_band.as_deref(), now)
     }
 
     fn handle_qso_outcome(&mut self, outcome: &QsoOutcome, tracker: &StationTracker) {
         if outcome.sent_terminal_73 {
-            self.mark_worked(&outcome.partner_call, outcome.finished_at);
+            if let Some(band) = outcome.rig_band.as_deref() {
+                self.mark_worked(&outcome.partner_call, band, outcome.finished_at);
+            }
             self.remove_station(&outcome.partner_call, "already_worked");
         }
         match outcome.exit_reason.as_str() {
@@ -1302,13 +1348,22 @@ impl WorkQueueState {
 
     fn prune_queue(&mut self, now: SystemTime, _tracker: &StationTracker) {
         let recent_worked = self.recent_worked.clone();
+        let current_band = self.current_band.clone();
         let ignore_direct = self.ignore_direct_calls_from_recently_worked;
         self.entries.retain(|entry| {
-            let worked_recently = recent_worked.get(&entry.callsign).is_some_and(|worked_at| {
-                now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
+            let worked_recently = current_band.as_deref().is_some_and(|band| {
+                recent_worked
+                    .get(&WorkQueueState::worked_band_key(&entry.callsign, band))
+                    .is_some_and(|worked_at| {
+                        now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
+                    })
             });
             if worked_recently && !(entry.direct_pending && !ignore_direct) {
-                info!(callsign = entry.callsign, "queue_remove_already_worked");
+                info!(
+                    callsign = entry.callsign,
+                    band = current_band.clone().unwrap_or_default(),
+                    "queue_remove_already_worked"
+                );
                 return false;
             }
             if now
@@ -1333,7 +1388,7 @@ impl WorkQueueState {
         tracker: &StationTracker,
         now: SystemTime,
     ) -> QueueEntryStatus {
-        if self.was_worked_recently(&entry.callsign, now)
+        if self.was_worked_recently_on_current_band(&entry.callsign, now)
             && !(entry.direct_pending && !self.ignore_direct_calls_from_recently_worked)
         {
             return QueueEntryStatus {
@@ -1341,7 +1396,7 @@ impl WorkQueueState {
                 last_heard_message: StationLastMessageKind::Other,
                 last_heard_slot_family: None,
                 ready: false,
-                status: "already worked in last 24h".to_string(),
+                status: "already worked on this band in last 24h".to_string(),
             };
         }
         if now < entry.ok_to_schedule_after {
@@ -1413,7 +1468,7 @@ impl WorkQueueState {
                 && now >= entry.ok_to_schedule_after
                 && entry.last_direct_slot_index == Some(slot_index)
                 && !(self.ignore_direct_calls_from_recently_worked
-                    && self.was_worked_recently(&entry.callsign, now))
+                    && self.was_worked_recently_on_current_band(&entry.callsign, now))
         })
     }
 
@@ -1508,7 +1563,7 @@ impl WorkQueueState {
             return None;
         }
         if self.ignore_direct_calls_from_recently_worked
-            && self.was_worked_recently(&entry.callsign, now)
+            && self.was_worked_recently_on_current_band(&entry.callsign, now)
         {
             return None;
         }
@@ -1588,7 +1643,7 @@ impl QsoJsonlCache {
 struct QsoJsonlScan {
     history: Vec<WebQsoHistoryEntry>,
     direct_calls: Vec<WebDirectCallLog>,
-    recent_worked: BTreeMap<String, SystemTime>,
+    recent_worked: BTreeMap<WorkedBandKey, SystemTime>,
 }
 
 #[derive(Debug)]
@@ -4045,7 +4100,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
     let mut active_keys = BTreeMap::<u64, QsoHistoryKey>::new();
     let mut next_ordinal = 1_u64;
     let mut direct_calls = Vec::<WebDirectCallLog>::new();
-    let mut recent_worked = BTreeMap::<String, SystemTime>::new();
+    let mut recent_worked = BTreeMap::<WorkedBandKey, SystemTime>::new();
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -4152,11 +4207,17 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         if event == "tx_launch" && matches!(state_before, "send_rr73" | "send_73" | "send_73_once")
         {
             session.reached_73 = true;
-            if now.duration_since(timestamp).unwrap_or_default() <= RECENT_WORKED_RETENTION {
-                match recent_worked.get(partner_call).copied() {
+            if now.duration_since(timestamp).unwrap_or_default() <= RECENT_WORKED_RETENTION
+                && !rig_band.is_empty()
+            {
+                let key = WorkedBandKey {
+                    callsign: partner_call.to_string(),
+                    band: rig_band.to_string(),
+                };
+                match recent_worked.get(&key).copied() {
                     Some(existing) if existing >= timestamp => {}
                     _ => {
-                        recent_worked.insert(partner_call.to_string(), timestamp);
+                        recent_worked.insert(key, timestamp);
                     }
                 }
             }
@@ -4437,6 +4498,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         display.rig.as_ref().map(|rig| rig.frequency_hz),
         display.rig.as_ref().map(|rig| rig.band.to_string()),
     );
+    work_queue.set_current_band(display.rig.as_ref().map(|rig| rig.band.to_string()));
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
@@ -4454,11 +4516,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             let current_band = display.rig.as_ref().map(|rig| rig.band.to_string());
             if previous_band != current_band {
                 clear_bandmaps(&mut bandmaps);
+                work_queue.clear("band_change");
             }
             qso_controller.update_rig_context(
                 display.rig.as_ref().map(|rig| rig.frequency_hz),
-                current_band,
+                current_band.clone(),
             );
+            work_queue.set_current_band(current_band);
             last_rig_poll = now;
         }
         qso_jsonl_cache.refresh(now);
@@ -4538,11 +4602,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         let current_band = display.rig.as_ref().map(|rig| rig.band.to_string());
                         if previous_band != current_band {
                             clear_bandmaps(&mut bandmaps);
+                            work_queue.clear("band_change");
                         }
                         qso_controller.update_rig_context(
                             display.rig.as_ref().map(|rig| rig.frequency_hz),
-                            current_band,
+                            current_band.clone(),
                         );
+                        work_queue.set_current_band(current_band);
                         last_rig_poll = now;
                     }
                 }
@@ -7134,7 +7200,8 @@ fn build_bandmap_grid(
                     callsign: entry.callsign.clone(),
                     detail: entry.detail.clone(),
                     age_slots,
-                    worked_recently: work_queue.was_worked_recently(&entry.callsign, now),
+                    worked_recently: work_queue
+                        .was_worked_recently_on_current_band(&entry.callsign, now),
                 },
             ));
         }
@@ -7638,11 +7705,13 @@ mod tests {
         tracker.ingest_decode(now, &cq_decode("K1ABC"));
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_band(Some("40m".to_string()));
         queue.handle_qso_outcome(
             &QsoOutcome {
                 partner_call: "K1ABC".to_string(),
                 exit_reason: "send_grid_no_msg_limit".to_string(),
                 finished_at: now,
+                rig_band: Some("40m".to_string()),
                 sent_terminal_73: false,
             },
             &tracker,
@@ -7663,11 +7732,13 @@ mod tests {
         tracker.ingest_decode(now, &cq_decode("K1ABC"));
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_band(Some("40m".to_string()));
         queue.handle_qso_outcome(
             &QsoOutcome {
                 partner_call: "K1ABC".to_string(),
                 exit_reason: "send_sig_no_fwd_limit".to_string(),
                 finished_at: now,
+                rig_band: Some("40m".to_string()),
                 sent_terminal_73: false,
             },
             &tracker,
@@ -7686,10 +7757,23 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
-        queue.mark_worked("K1ABC", now);
+        queue.set_current_band(Some("40m".to_string()));
+        queue.mark_worked("K1ABC", "40m", now);
         let added = queue.add_station("K1ABC", now, now);
         assert!(added.is_err());
         assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn queue_allows_recently_worked_station_on_different_band() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.mark_worked("K1ABC", "20m", now);
+        queue.set_current_band(Some("40m".to_string()));
+        let added = queue.add_station("K1ABC", now, now);
+        assert!(added.is_ok());
+        assert_eq!(queue.entries.len(), 1);
     }
 
     #[test]
@@ -7697,6 +7781,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_band(Some("40m".to_string()));
         assert!(queue.add_station("N1VF", now, now).is_err());
         assert!(queue.entries.is_empty());
         let observation = DirectCallObservation {

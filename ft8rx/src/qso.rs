@@ -66,6 +66,7 @@ pub struct QsoOutcome {
     pub partner_call: String,
     pub exit_reason: String,
     pub finished_at: SystemTime,
+    pub rig_band: Option<String>,
     pub sent_terminal_73: bool,
 }
 
@@ -1333,6 +1334,7 @@ impl QsoController {
             partner_call: session.partner_call,
             exit_reason: reason.to_string(),
             finished_at: now,
+            rig_band: session.rig_band,
             sent_terminal_73: session.sent_terminal_73,
         });
     }
