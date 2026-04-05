@@ -518,6 +518,7 @@ struct WebQsoHistoryEntry {
     band: String,
     sent_info: String,
     received_info: String,
+    got_roger: bool,
     got_reply: bool,
     reached_73: bool,
     exit_reason: String,
@@ -718,6 +719,7 @@ struct QsoJsonlSessionSummary {
     started_at: Option<SystemTime>,
     ended_at: Option<SystemTime>,
     last_seen_at: Option<SystemTime>,
+    got_roger: bool,
     got_reply: bool,
     reached_73: bool,
     sent_infos: Vec<String>,
@@ -1112,19 +1114,14 @@ impl WorkQueueState {
         );
     }
 
-    fn was_worked_recently(
-        &self,
-        callsign: &str,
-        band: Option<&str>,
-        now: SystemTime,
-    ) -> bool {
+    fn was_worked_recently(&self, callsign: &str, band: Option<&str>, now: SystemTime) -> bool {
         let Some(band) = band else {
             return false;
         };
         self.recent_worked
             .get(&Self::worked_band_key(callsign, band))
             .is_some_and(|worked_at| {
-            now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
+                now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
             })
     }
 
@@ -1355,7 +1352,8 @@ impl WorkQueueState {
                 recent_worked
                     .get(&WorkQueueState::worked_band_key(&entry.callsign, band))
                     .is_some_and(|worked_at| {
-                        now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
+                        now.duration_since(*worked_at).unwrap_or_default()
+                            <= RECENT_WORKED_RETENTION
                     })
             });
             if worked_recently && !(entry.direct_pending && !ignore_direct) {
@@ -2329,7 +2327,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .history-row {
       display: grid;
-      grid-template-columns: 132px 58px 72px 28px 24px 24px 74px 74px minmax(140px, 1fr);
+      grid-template-columns: 132px 58px 72px 28px 24px 24px 24px 74px 74px minmax(140px, 1fr);
       gap: 4px;
       align-items: baseline;
       padding: 2px 4px;
@@ -3300,6 +3298,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div>Ago</div>
           <div>Call</div>
           <div>Bd</div>
+          <div>R</div>
           <div>Rpl</div>
           <div>73</div>
           <div>Sent</div>
@@ -3318,6 +3317,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="history-cell muted">${escapeHtml(entry.age)}</div>
           <div class="history-cell">${renderCallValue(escapeHtml(entry.callsign), entry.callsign)}</div>
           <div class="history-cell muted">${escapeHtml(entry.band ?? '-')}</div>
+          <div class="history-cell muted">${entry.got_roger ? 'Y' : '-'}</div>
           <div class="history-cell muted">${entry.got_reply ? 'Y' : '-'}</div>
           <div class="history-cell muted">${entry.reached_73 ? 'Y' : '-'}</div>
           <div class="history-cell">${escapeHtml(entry.sent_info)}</div>
@@ -4207,6 +4207,12 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         if last_rx_event.starts_with("to_us_") {
             session.got_reply = true;
         }
+        if matches!(
+            last_rx_event,
+            "to_us_ack" | "to_us_reply_rrr" | "to_us_reply_rr73" | "to_us_reply_73"
+        ) {
+            session.got_roger = true;
+        }
         if matches!(state_before, "send_rr73" | "send_73" | "send_73_once")
             || matches!(state_after, "send_rr73" | "send_73" | "send_73_once")
         {
@@ -4281,6 +4287,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
                     } else {
                         session.received_infos.join(", ")
                     },
+                    got_roger: session.got_roger,
                     got_reply: session.got_reply,
                     reached_73: session.reached_73,
                     exit_reason: session
@@ -7952,5 +7959,18 @@ mod tests {
         assert_eq!(new.sent_info, "-07");
         assert_eq!(old.sent_info, "-");
         assert!(old.reached_73);
+    }
+
+    #[test]
+    fn qso_jsonl_scan_tracks_roger_responses_separately_from_any_reply() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":12,"partner_call":"K1ABC","state_before":"idle","state_after":"send_grid","last_rx_event":"start","rx_text":"","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":12,"partner_call":"K1ABC","state_before":"send_grid","state_after":"send_grid","last_rx_event":"to_us_report_like","rx_text":"N1VF K1ABC -08","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:30Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_early41","session_id":12,"partner_call":"K1ABC","state_before":"send_sig_ack","state_after":"send_sig_ack","last_rx_event":"to_us_ack","rx_text":"N1VF K1ABC R-07","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:45Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":12,"partner_call":"K1ABC","state_before":"send_sig_ack","state_after":"idle","last_rx_event":"stopped","rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert_eq!(scan.history.len(), 1);
+        assert!(scan.history[0].got_reply);
+        assert!(scan.history[0].got_roger);
     }
 }
