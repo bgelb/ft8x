@@ -1,0 +1,9 @@
+000000  -5  0.1  467 ~  N2CEP PA7ZZ JO22                        
+000000   3 -0.1  758 ~  CQ PA3GEG JO32                          
+000000  -1  0.1  986 ~  CQ EA3NW JN11                           
+000000  -9 -0.1 1308 ~  W5QI DM5TI RR73                         
+000000   9  1.2 1469 ~  IS0KNG ZB2IF 73                         
+000000  -8  0.1 1752 ~  K4BX G3RTE R-10                         
+000000 -13  0.1 1955 ~  CQ G3PXT JO02                         a1
+000000 -11  2.2 2404 ~  FG8OJ IV3VBM JN66                       
+<DecodeFinished>   0   8

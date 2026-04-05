@@ -1,0 +1,3 @@
+153930  -1  0.0 1410 ~  FR5CB BG8NG -15                         
+153930 -13 -0.5 2047 ~  UT4XU RW0CF RR73                        
+<DecodeFinished>   0   2        0

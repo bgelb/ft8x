@@ -1,0 +1,2 @@
+ EOF on input file /home/bgelb/ft8x/artifacts/samples/kgoba-ft8-lib/websdr_test20/websdr_test20.wav
+<DecodeFinished>   0   0

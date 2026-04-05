@@ -1,0 +1,19 @@
+000000   2  1.4 1495 ~  CQ IT9PQO JM78                          
+000000   8  1.1  309 ~  SP4FCA G4CUS R+13                       
+000000 -11  1.1  389 ~  S9CT 9A4ZM -04                          
+000000 -10  1.8  458 ~  S9CT F4HPY JN28                         
+000000   0  1.2  598 ~  DC8VA LZ1CWK R-09                       
+000000  -4  1.1  638 ~  4F3OM F6GGA JN37                        
+000000 -11  1.8  895 ~  CQ SV1GN KM17                           
+000000  -1  0.4 1109 ~  IK4LZH 9A9TT JN76                       
+000000  -4  1.1 1188 ~  UR4MSF E75C R+10                        
+000000  14  1.1 1430 ~  LA9XBA F6CAM JO10                       
+000000 -11  1.4 1642 ~  OH3KAV 2M0OGG RR73                      
+000000   3  1.7 1706 ~  CQ LZ2II KN22                           
+000000  -8  1.1 2016 ~  A41ZZ YO7CGS R-18                       
+000000   1  1.2 2267 ~  EA1ABT I8LWL JN70                       
+000000 -24  1.6 2344 ~  S9CT EW8KT KO42                         
+000000 -24  1.1 2393 ~  HA8RC R4OF 73                           
+000000 -12  1.0 2597 ~  UA9CJM ON8BB -20                        
+000000  -9  2.1 2672 ~  CQ 2E0VDS JO02                          
+<DecodeFinished>   0  18

@@ -1,0 +1,16 @@
+000000   4 -0.0 1881 ~  CQ PD1ECA JO32                          
+000000  12  0.1 1653 ~  CQ HA1RB JN86                           
+000000  15  0.1  903 ~  CQ IK4LZH JN54                          
+000000  -8  0.1 1125 ~  CQ SV2FPI KN10                          
+000000  -7 -0.0 1544 ~  PD3JO IZ2ODN JN55                       
+000000   1 -1.2 2601 ~  K2DSW IU8LLZ R-16                       
+000000  10  0.3 2830 ~  CQ F8IJV/P IN97                         
+000000  -8  0.2 1320 ~  R7EL VE9FI FN75                         
+000000   3 -0.2  734 ~  OE4RWD NU2Q RR73                        
+000000  -7 -0.0 1955 ~  CQ PY1SX GG87                           
+000000 -10  0.0 1432 ~  CQ 9A7DA JN86                           
+000000   8  1.5 2198 ~  F4DFQ F5LOW IN95                        
+000000 -16 -2.3 2480 ~  K4VBM HA8EK RR73                        
+000000 -13  0.1  609 ~  CQ N2BJ EN61                            
+000000 -20  0.1 1220 ~  KC8MUE V51MA RRR                        
+<DecodeFinished>   0  15

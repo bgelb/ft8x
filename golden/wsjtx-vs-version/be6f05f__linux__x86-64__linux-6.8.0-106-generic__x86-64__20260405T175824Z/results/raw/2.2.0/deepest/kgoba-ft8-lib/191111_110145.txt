@@ -1,0 +1,3 @@
+110145  10  1.0 1234 ~  GJ0KYZ RK9AX MO05                       
+110145 -17  1.0  322 ~  <...> RY8CAA                            
+<DecodeFinished>   0   2

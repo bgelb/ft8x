@@ -1,0 +1,10 @@
+000000  25  1.1 1110 ~  9A9TT IK4LZH -10                        
+000000  18  0.6 2315 ~  2M0OGG RA6ABO KN96                      
+000000  16  1.0 2535 ~  CQ IZ3XJM JN55                          
+000000  12  2.0  587 ~  LZ1LZ G4UJS IO83                        
+000000  11  1.1 1909 ~  R2EA IZ4OUL 73                          
+000000  -1  1.1  809 ~  SQ5FBI G3NDC R-04                       
+000000  -8  1.1 1813 ~  CQ EA5OL IM99                           
+000000  -8  1.0  528 ~  VK3EVE SQ3MZM RR73                      
+000000 -12 -0.5  309 ~  G4CUS SP4FCA RRR                        
+<DecodeFinished>   0   9        0
