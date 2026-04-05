@@ -9,7 +9,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import defaultdict
 from datetime import datetime, timezone
+from html import escape
+from os.path import relpath
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +106,22 @@ def git_default_ref() -> str:
 def git_default_commit() -> str:
     commit = optional_command(["git", "rev-parse", "--short=7", "HEAD"])
     return commit or "unknown"
+
+
+def git_repo_web_url() -> str | None:
+    remote = optional_command(["git", "remote", "get-url", "origin"])
+    if not remote:
+        return None
+    remote = remote.strip()
+    if remote.startswith("git@github.com:"):
+        path = remote.removeprefix("git@github.com:")
+        if path.endswith(".git"):
+            path = path[:-4]
+        return f"https://github.com/{path}"
+    if remote.startswith("https://github.com/"):
+        url = remote[:-4] if remote.endswith(".git") else remote
+        return url
+    return None
 
 
 def payload_profile_ids(payload: dict[str, Any]) -> list[str]:
@@ -214,6 +233,376 @@ def copy_snapshot(
         raise
 
 
+def parse_timestamp(value: str | None) -> datetime:
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def relative_href(base_dir: Path, target: Path) -> str:
+    return Path(relpath(target, start=base_dir)).as_posix()
+
+
+def format_list(values: list[str]) -> str:
+    return ", ".join(values) if values else "n/a"
+
+
+def load_snapshot_entries(golden_root: Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for metadata_path in sorted(golden_root.glob("*/*/metadata.json")):
+        snapshot_root = metadata_path.parent
+        metadata = json.loads(metadata_path.read_text())
+        results_source = metadata.get("results_source", {})
+        runner = metadata.get("runner", {})
+        entries.append(
+            {
+                "snapshot_kind": metadata.get("snapshot_kind", snapshot_root.parent.name),
+                "snapshot_root": snapshot_root,
+                "metadata_path": metadata_path,
+                "report_path": snapshot_root / "report" / "index.html",
+                "summary_path": snapshot_root / "results" / "summary.csv",
+                "results_path": snapshot_root / "results" / "results.json",
+                "source_commit": str(results_source.get("commit", "unknown")),
+                "source_ref": str(results_source.get("ref", "unknown")),
+                "run_id": str(results_source.get("run_id", snapshot_root.name)),
+                "generated_at": str(results_source.get("generated_at", "")),
+                "profiles": [str(value) for value in results_source.get("profiles", [])],
+                "datasets": [str(value) for value in results_source.get("datasets", [])],
+                "release_count": results_source.get("release_count"),
+                "run_count": results_source.get("run_count"),
+                "platform_type": str(runner.get("platform_type", "unknown")),
+                "os_name": str(runner.get("os_name", "unknown")),
+                "os_version": str(runner.get("os_version", "unknown")),
+                "cpu_arch": str(runner.get("cpu_arch", "unknown")),
+                "cpu_brand": str(runner.get("cpu_brand", "unknown")),
+            }
+        )
+    entries.sort(
+        key=lambda item: (
+            item["snapshot_kind"],
+            parse_timestamp(item["generated_at"]),
+            item["run_id"],
+        ),
+        reverse=True,
+    )
+    return entries
+
+
+def render_toc(entries: list[dict[str, Any]], base_dir: Path) -> str:
+    if not entries:
+        return "<p class=\"empty\">No saved golden snapshots yet.</p>"
+    items: list[str] = []
+    for entry in entries:
+        if not entry["report_path"].exists():
+            continue
+        href = relative_href(base_dir, entry["report_path"])
+        label = f"{entry['snapshot_kind']} / {entry['run_id']}"
+        detail = (
+            f"{entry['source_commit']} on {entry['platform_type']} "
+            f"{entry['cpu_arch']} {entry['os_name']} {entry['os_version']}"
+        )
+        items.append(
+            f"<li><a href=\"{escape(href)}\">{escape(label)}</a>"
+            f"<span>{escape(detail)}</span></li>"
+        )
+    if not items:
+        return "<p class=\"empty\">No saved golden snapshots with reports yet.</p>"
+    return "<ol class=\"toc-list\">\n" + "\n".join(items) + "\n</ol>"
+
+
+def render_snapshot_tables(entries: list[dict[str, Any]], base_dir: Path) -> str:
+    if not entries:
+        return ""
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in entries:
+        grouped[entry["snapshot_kind"]].append(entry)
+
+    sections: list[str] = []
+    for snapshot_kind in sorted(grouped):
+        rows: list[str] = []
+        for entry in grouped[snapshot_kind]:
+            report_link = (
+                f"<a href=\"{escape(relative_href(base_dir, entry['report_path']))}\">report</a>"
+                if entry["report_path"].exists()
+                else "n/a"
+            )
+            summary_link = (
+                f"<a href=\"{escape(relative_href(base_dir, entry['summary_path']))}\">summary.csv</a>"
+                if entry["summary_path"].exists()
+                else "n/a"
+            )
+            results_link = (
+                f"<a href=\"{escape(relative_href(base_dir, entry['results_path']))}\">results.json</a>"
+                if entry["results_path"].exists()
+                else "n/a"
+            )
+            metadata_link = f"<a href=\"{escape(relative_href(base_dir, entry['metadata_path']))}\">metadata.json</a>"
+            host = (
+                f"{entry['platform_type']} / {entry['cpu_arch']} / "
+                f"{entry['os_name']} {entry['os_version']} / {entry['cpu_brand']}"
+            )
+            rows.append(
+                "<tr>"
+                f"<td><code>{escape(entry['run_id'])}</code></td>"
+                f"<td><code>{escape(entry['source_commit'])}</code><br><span class=\"subtle\">{escape(entry['source_ref'])}</span></td>"
+                f"<td>{escape(entry['generated_at'] or 'n/a')}</td>"
+                f"<td>{escape(format_list(entry['profiles']))}</td>"
+                f"<td>{escape(format_list(entry['datasets']))}</td>"
+                f"<td>{escape(host)}</td>"
+                f"<td>{entry['release_count'] if entry['release_count'] is not None else 'n/a'}</td>"
+                f"<td>{entry['run_count'] if entry['run_count'] is not None else 'n/a'}</td>"
+                f"<td>{report_link} | {summary_link} | {results_link} | {metadata_link}</td>"
+                "</tr>"
+            )
+        sections.append(
+            "<section class=\"snapshot-section\">"
+            f"<h2>{escape(snapshot_kind)}</h2>"
+            "<div class=\"table-wrap\">"
+            "<table>"
+            "<thead><tr>"
+            "<th>Run ID</th>"
+            "<th>Source</th>"
+            "<th>Generated At</th>"
+            "<th>Profiles</th>"
+            "<th>Datasets</th>"
+            "<th>Host</th>"
+            "<th>Releases</th>"
+            "<th>Jobs</th>"
+            "<th>Artifacts</th>"
+            "</tr></thead>"
+            "<tbody>"
+            + "".join(rows)
+            + "</tbody></table></div></section>"
+        )
+    return "\n".join(sections)
+
+
+def render_index_page(
+    *,
+    title: str,
+    heading: str,
+    intro: str,
+    entries: list[dict[str, Any]],
+    base_dir: Path,
+    extra_links: list[tuple[str, str]],
+) -> str:
+    nav_links = " ".join(
+        f"<a href=\"{escape(href)}\">{escape(label)}</a>" for label, href in extra_links
+    )
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{
+      --bg: #f6f1e8;
+      --panel: #fffaf2;
+      --ink: #18222b;
+      --muted: #5f6a72;
+      --line: #d8cdc0;
+      --accent: #0d6b57;
+      --accent-soft: #d8efe8;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, #fff7d6 0, transparent 28rem),
+        linear-gradient(180deg, #f2eadf 0%, var(--bg) 55%, #efe6d8 100%);
+      color: var(--ink);
+    }}
+    main {{
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 3rem 1.25rem 4rem;
+    }}
+    .hero {{
+      background: rgba(255, 250, 242, 0.9);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 2rem;
+      box-shadow: 0 18px 50px rgba(24, 34, 43, 0.08);
+    }}
+    h1, h2 {{ margin: 0 0 0.8rem; }}
+    h1 {{
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+    }}
+    h2 {{
+      font-size: 1.2rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    p {{
+      margin: 0 0 1rem;
+      line-height: 1.55;
+      max-width: 70ch;
+    }}
+    .nav {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.9rem;
+      margin-top: 1.25rem;
+    }}
+    .nav a, .toc-list a, table a {{
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 700;
+    }}
+    .nav a:hover, .toc-list a:hover, table a:hover {{
+      text-decoration: underline;
+    }}
+    .panel {{
+      background: rgba(255, 250, 242, 0.86);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 1.5rem;
+      margin-top: 1.25rem;
+    }}
+    .toc-list {{
+      margin: 0;
+      padding-left: 1.4rem;
+    }}
+    .toc-list li {{
+      margin: 0 0 0.8rem;
+      line-height: 1.45;
+    }}
+    .toc-list span {{
+      display: block;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }}
+    .table-wrap {{
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 920px;
+    }}
+    th, td {{
+      text-align: left;
+      vertical-align: top;
+      padding: 0.85rem 0.9rem;
+      border-bottom: 1px solid var(--line);
+    }}
+    th {{
+      background: var(--accent-soft);
+      color: #10342b;
+      font-size: 0.9rem;
+      letter-spacing: 0.02em;
+    }}
+    tbody tr:nth-child(even) td {{
+      background: rgba(216, 239, 232, 0.22);
+    }}
+    code {{
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 0.92em;
+    }}
+    .subtle, .empty, footer {{
+      color: var(--muted);
+    }}
+    footer {{
+      margin-top: 2rem;
+      font-size: 0.95rem;
+    }}
+    @media (max-width: 720px) {{
+      main {{ padding-top: 1.5rem; }}
+      .hero, .panel {{ padding: 1.2rem; border-radius: 18px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>{heading}</h1>
+      <p>{intro}</p>
+      <nav class="nav">{nav_links}</nav>
+    </section>
+    <section class="panel">
+      <h2>Report TOC</h2>
+      {toc}
+    </section>
+    <section class="panel">
+      <h2>Snapshot Details</h2>
+      {tables}
+    </section>
+    <footer>Generated from checked-in <code>golden</code> snapshots by <code>scripts/archive_golden_run.py</code>.</footer>
+  </main>
+</body>
+</html>
+""".format(
+        title=escape(title),
+        heading=escape(heading),
+        intro=escape(intro),
+        nav_links=nav_links,
+        toc=render_toc(entries, base_dir),
+        tables=render_snapshot_tables(entries, base_dir),
+    )
+
+
+def write_text_if_changed(path: Path, contents: str) -> None:
+    if path.exists() and path.read_text() == contents:
+        return
+    path.write_text(contents)
+
+
+def refresh_site_indexes(golden_root: Path) -> list[Path]:
+    entries = load_snapshot_entries(golden_root)
+    written: list[Path] = []
+    repo_web_url = git_repo_web_url()
+
+    golden_root.mkdir(parents=True, exist_ok=True)
+    golden_index_path = golden_root / "index.html"
+    golden_index_contents = render_index_page(
+        title="FT8X Golden Snapshot Index",
+        heading="Golden Regression Snapshot Index",
+        intro="Saved regression runs checked into the repository, with direct links to every archived report, summary, results payload, and metadata file.",
+        entries=entries,
+        base_dir=golden_root,
+        extra_links=[
+            ("GitHub README", f"{repo_web_url}#readme" if repo_web_url else relative_href(golden_root, REPO_ROOT / "README.md")),
+            ("Site Home", relative_href(golden_root, REPO_ROOT / "index.html")),
+        ],
+    )
+    write_text_if_changed(golden_index_path, golden_index_contents)
+    written.append(golden_index_path)
+
+    if golden_root.resolve() == DEFAULT_GOLDEN_ROOT.resolve():
+        root_index_path = REPO_ROOT / "index.html"
+        root_index_contents = render_index_page(
+            title="FT8X Regression Reports",
+            heading="FT8X Regression Reports",
+            intro="Landing page for the checked-in golden regression runs. Use the report TOC below to jump straight from GitHub Pages to any archived WSJT-X regression summary page.",
+            entries=entries,
+            base_dir=REPO_ROOT,
+            extra_links=[
+                ("GitHub README", f"{repo_web_url}#readme" if repo_web_url else "README.md"),
+                ("Golden Snapshot Index", "golden/index.html"),
+                ("GitHub Repo", repo_web_url or "https://github.com/bgelb/ft8x"),
+            ],
+        )
+        write_text_if_changed(root_index_path, root_index_contents)
+        written.append(root_index_path)
+
+    return written
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Archive a regression run into the tracked golden snapshot layout."
@@ -286,11 +675,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace an existing snapshot directory if it already exists.",
     )
+    parser.add_argument(
+        "--refresh-indexes-only",
+        action="store_true",
+        help="Regenerate the golden snapshot landing pages without copying a snapshot.",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    golden_root = Path(args.golden_root).expanduser().resolve()
+
+    if args.refresh_indexes_only:
+        written = refresh_site_indexes(golden_root)
+        for path in written:
+            print(path)
+        return 0
 
     results_dir = resolve_dir(args.results_path, "results.json")
     results_json_path = results_dir / "results.json"
@@ -332,7 +733,6 @@ def main() -> int:
         include_report=report_dir is not None,
     )
 
-    golden_root = Path(args.golden_root).expanduser().resolve()
     snapshot_root = (
         golden_root
         / args.snapshot_kind
@@ -351,6 +751,7 @@ def main() -> int:
         metadata=metadata,
         force=args.force,
     )
+    refresh_site_indexes(golden_root)
     print(snapshot_root)
     return 0
 
