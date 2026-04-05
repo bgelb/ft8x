@@ -6860,8 +6860,20 @@ fn direct_call_observation_from_decode(
                 }
             }
         }
-        StructuredMessage::Dxpedition { .. }
-        | StructuredMessage::FieldDay { .. }
+        StructuredMessage::Dxpedition {
+            completed_call,
+            next_call,
+            ..
+        } => {
+            if structured_call_station_name(completed_call).as_deref() == Some(our_call) {
+                return None;
+            }
+            if structured_call_station_name(next_call).as_deref() != Some(our_call) {
+                return None;
+            }
+            (QsoState::SendSigAck, false)
+        }
+        StructuredMessage::FieldDay { .. }
         | StructuredMessage::RttyContest { .. }
         | StructuredMessage::EuVhf { .. } => return None,
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => return None,
@@ -7375,6 +7387,35 @@ mod tests {
         }
     }
 
+    fn dxpedition_direct_decode(
+        sender: &str,
+        completed: &str,
+        next: &str,
+        report_db: i16,
+    ) -> DecodedMessage {
+        let message = StructuredMessage::Dxpedition {
+            i3: 0,
+            n3: 1,
+            completed_call: standard_call(completed),
+            next_call: standard_call(next),
+            hashed_call10: ft8_decoder::HashedCallField10 {
+                raw: 0,
+                resolved_callsign: Some(sender.to_string()),
+            },
+            report_db,
+        };
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -10,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: message.to_text(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message,
+        }
+    }
+
     #[derive(Default)]
     struct NoopTxBackend;
 
@@ -7483,6 +7524,17 @@ mod tests {
             .expect("duplicate stage add");
         let entry = queue.entries.front().expect("queued entry");
         assert_eq!(entry.direct_count, 1);
+    }
+
+    #[test]
+    fn dxpedition_direct_to_us_starts_as_send_sig_ack() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let decode = dxpedition_direct_decode("PY7ZZ", "SP4MCH", "N1VF", -18);
+        let observation =
+            direct_call_observation_from_decode(&decode, "N1VF", now).expect("direct observation");
+        assert_eq!(observation.callsign, "PY7ZZ");
+        assert_eq!(observation.start_state, QsoState::SendSigAck);
+        assert!(!observation.compound_eligible);
     }
 
     #[test]

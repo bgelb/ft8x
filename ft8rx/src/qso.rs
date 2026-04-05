@@ -699,10 +699,10 @@ impl QsoController {
                         } => {
                             let completed_compound =
                                 matches!(*state, QsoState::SendRR73 | QsoState::Send73Once)
-                                && session
-                                    .pending_compound_handoff
-                                    .as_ref()
-                                    .is_some_and(|handoff| handoff.tx_text == *message_text);
+                                    && session
+                                        .pending_compound_handoff
+                                        .as_ref()
+                                        .is_some_and(|handoff| handoff.tx_text == *message_text);
                             session.in_flight_tx = None;
                             Self::push_transcript(
                                 session,
@@ -2178,8 +2178,31 @@ fn classify_single_message(
                 SingleClass::Irrelevant
             }
         }
-        StructuredMessage::Dxpedition { .. }
-        | StructuredMessage::FieldDay { .. }
+        StructuredMessage::Dxpedition {
+            completed_call,
+            next_call,
+            ..
+        } => {
+            let completed_target = structured_call_station_name(completed_call);
+            let next_target = structured_call_station_name(next_call);
+            if completed_target.as_deref() == Some(our_call) {
+                SingleClass::ToUs(ToUsEvent::Reply(ReplyWord::Rr73))
+            } else if next_target.as_deref() == Some(our_call) {
+                SingleClass::ToUs(ToUsEvent::ReportLike)
+            } else if completed_target.is_some() || next_target.is_some() {
+                if matches!(
+                    state,
+                    QsoState::Send73 | QsoState::SendRR73 | QsoState::SendRRR
+                ) {
+                    SingleClass::ToOther
+                } else {
+                    SingleClass::Irrelevant
+                }
+            } else {
+                SingleClass::Irrelevant
+            }
+        }
+        StructuredMessage::FieldDay { .. }
         | StructuredMessage::RttyContest { .. }
         | StructuredMessage::EuVhf { .. } => SingleClass::Freeform,
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {
@@ -2519,9 +2542,9 @@ mod tests {
         TxConfig,
     };
     use ft8_decoder::{
-        DecodeOptions, DecodeProfile, DecodedMessage, DecoderSession, StructuredCallField,
-        StructuredCallValue, StructuredInfoField, TxDirectedPayload, TxMessage, WaveformOptions,
-        synthesize_tx_message,
+        DecodeOptions, DecodeProfile, DecodedMessage, DecoderSession, HashedCallField10,
+        StructuredCallField, StructuredCallValue, StructuredInfoField, TxDirectedPayload,
+        TxMessage, WaveformOptions, synthesize_tx_message,
     };
 
     #[derive(Default)]
@@ -2731,6 +2754,47 @@ mod tests {
                     value: StructuredInfoValue::Blank,
                 },
             },
+        }
+    }
+
+    fn dxpedition_decode(
+        sender: &str,
+        completed: &str,
+        next: &str,
+        report_db: i16,
+    ) -> DecodedMessage {
+        let message = StructuredMessage::Dxpedition {
+            i3: 0,
+            n3: 1,
+            completed_call: StructuredCallField {
+                raw: 0,
+                value: StructuredCallValue::StandardCall {
+                    callsign: completed.to_string(),
+                },
+                modifier: None,
+            },
+            next_call: StructuredCallField {
+                raw: 0,
+                value: StructuredCallValue::StandardCall {
+                    callsign: next.to_string(),
+                },
+                modifier: None,
+            },
+            hashed_call10: HashedCallField10 {
+                raw: 0,
+                resolved_callsign: Some(sender.to_string()),
+            },
+            report_db,
+        };
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -7,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: message.to_text(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message,
         }
     }
 
@@ -3024,6 +3088,36 @@ mod tests {
     }
 
     #[test]
+    fn send_sig_ack_dxpedition_rr73_to_us_transitions_to_send_73_once() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("PY7ZZ", 1000.0),
+            Some(StationStartInfo {
+                callsign: "PY7ZZ".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
+            }),
+            now,
+        );
+        if let Some(session) = controller.session.as_mut() {
+            session.state = QsoState::SendSigAck;
+        }
+        controller.on_full_decode(
+            now + Duration::from_secs(15),
+            &[dxpedition_decode("PY7ZZ", "N1VF", "SP4MCH", -18)],
+            now + Duration::from_secs(15),
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_73_once");
+        assert_eq!(snapshot.last_rx_event.as_deref(), Some("to_us_reply_rr73"));
+    }
+
+    #[test]
     fn compound_rr73_handoff_reuses_rr73_slot_and_starts_follow_on_qso() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
@@ -3090,7 +3184,11 @@ mod tests {
         controller.session.as_mut().expect("session").state = QsoState::SendSigAck;
         controller.on_full_decode(
             rx_slot_start,
-            &[directed_decode("K1ABC", "N1VF", ToUsEvent::Reply(ReplyWord::Rr73))],
+            &[directed_decode(
+                "K1ABC",
+                "N1VF",
+                ToUsEvent::Reply(ReplyWord::Rr73),
+            )],
             rx_slot_start + Duration::from_secs(15),
         );
         assert_eq!(controller.snapshot(now).state, "send_73_once");
