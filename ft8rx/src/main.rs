@@ -5318,7 +5318,7 @@ fn decode_stage_from_samples(
         write_mono_wav(raw_path, sample_rate_hz, samples)?;
     }
     let options = DecodeOptions {
-        profile: DecodeProfile::Medium,
+        profile: DecodeProfile::Deepest,
         min_freq_hz: 200.0,
         max_freq_hz: 3_500.0,
         ..DecodeOptions::default()
@@ -5348,7 +5348,7 @@ fn decode_slot_from_samples(
     slot_start: SystemTime,
 ) -> Result<DecodeSummary, AppError> {
     let options = DecodeOptions {
-        profile: DecodeProfile::Medium,
+        profile: DecodeProfile::Deepest,
         min_freq_hz: 200.0,
         max_freq_hz: 3_500.0,
         ..DecodeOptions::default()
