@@ -1,13 +1,13 @@
 # FT8 WSJT-X Regression Prototype
 
-This repository now contains a prototype benchmark harness for historical FT8 decoding across official WSJT-X macOS releases.
+This repository now contains a prototype benchmark harness for historical FT8 decoding across official WSJT-X release binaries for the current host platform.
 
 What it does:
 
-- discovers official WSJT-X releases from SourceForge and targets the official macOS DMGs
-- downloads and extracts `wsjtx.app`, then runs `jt9 -8`
+- discovers official WSJT-X releases from SourceForge and targets host-appropriate artifacts
+- downloads and extracts release binaries, then runs `jt9 -8`
 - records the actual `jt9` binary architecture for each release
-- records whether each run is native or Rosetta-translated on Apple Silicon
+- records whether each run is native, Rosetta-translated, or incompatible on the current host
 - benchmarks all configured decode-depth profiles:
   - `quick` = `-d 1`
   - `medium` = `-d 2`
@@ -120,6 +120,9 @@ This development machine is `arm64`. The official macOS releases inspected so fa
 ## Known gaps
 
 - release verification is lightweight and happens at download time
-- DMG extraction currently copies the full app bundle for each release
+- release extraction is platform-specific:
+  - macOS copies the full app bundle from the DMG
+  - Linux currently extracts Debian packages and can vendor `libgfortran4` locally for older releases
 - scoring does not yet support fuzzy frequency matching or duplicate-message handling
 - only official WSJT-X is included for now
+- SourceForge does not currently provide a Linux release artifact for `2.5.3`, so Linux regression runs skip that version

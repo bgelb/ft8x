@@ -23,6 +23,10 @@ from typing import Any
 
 TIMEOUT_SECONDS = 60
 USER_AGENT = "ft8-regr-prototype/0.1"
+LINUX_COMPAT_LIBGFORTRAN4_URL = (
+    "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-7/"
+    "libgfortran4_7.5.0-3ubuntu1~18.04_amd64.deb"
+)
 VERSION_PATTERN = re.compile(r"^(?P<core>\d+\.\d+\.\d+)(?:-(?P<tag>rc)(?P<tag_number>\d+))?$")
 ROOT_RELEASE_ROW_PATTERN = re.compile(
     r'<tr title="(?P<release>wsjtx-(?P<version>\d+\.\d+\.\d+(?:-rc\d+)?))" class="folder "\s*>.*?<abbr title="(?P<timestamp>[^"]+)"',
@@ -210,6 +214,7 @@ def parse_truth_file(path: Path) -> list[dict[str, Any]]:
 def discover_releases(paths: Paths, verify: bool = False) -> dict[str, Any]:
     config = load_config(paths)
     source = config["release_source"]
+    target_platform = host_release_platform()
     minimum_version = source["minimum_version"]
     include_prerelease_major_min = source.get("include_prerelease_major_min")
     html_text = fetch_text(source["index_url"])
@@ -230,16 +235,17 @@ def discover_releases(paths: Paths, verify: bool = False) -> dict[str, Any]:
         version = release_id.removeprefix("wsjtx-")
         release_page = f"{source['index_url'].rstrip('/')}/{release_id}/"
         release_files = discover_release_files(release_page)
-        mac_artifact = select_macos_artifact(release_files)
+        artifact = select_host_artifact(release_files)
         entry = {
             "version": version,
             "release_id": release_id,
             "release_page": release_page,
             "released_at": released_at,
-            "platform": "macos",
-            "artifact_name": mac_artifact["name"] if mac_artifact else None,
-            "download_url": mac_artifact["download_url"] if mac_artifact else None,
-            "macos_available": mac_artifact is not None,
+            "platform": target_platform,
+            "artifact_name": artifact["name"] if artifact else None,
+            "artifact_kind": artifact["kind"] if artifact else None,
+            "download_url": artifact["download_url"] if artifact else None,
+            "host_available": artifact is not None,
         }
         if verify and entry["download_url"]:
             entry["download_verified"] = verify_download(entry["download_url"])
@@ -282,7 +288,55 @@ def select_macos_artifact(release_files: dict[str, dict[str, Any]]) -> dict[str,
     if not candidates:
         return None
     candidates.sort(key=lambda item: item.get("name", ""))
-    return candidates[0]
+    return {**candidates[0], "kind": "dmg"}
+
+
+def host_release_platform() -> str:
+    system = platform.system().lower()
+    if system == "darwin":
+        return "macos"
+    if system == "linux":
+        return "linux"
+    return system
+
+
+def host_linux_arch_suffixes() -> list[tuple[str, str]]:
+    machine = platform.machine().lower()
+    if machine in {"x86_64", "amd64"}:
+        return [("_amd64.deb", "deb"), (".x86_64.rpm", "rpm")]
+    if machine in {"aarch64", "arm64"}:
+        return [("_arm64.deb", "deb"), (".aarch64.rpm", "rpm")]
+    if machine in {"armv7l", "armhf"}:
+        return [("_armhf.deb", "deb"), (".armv7hl.rpm", "rpm")]
+    return []
+
+
+def select_linux_artifact(release_files: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    downloadable = [
+        file_info
+        for file_info in release_files.values()
+        if file_info.get("downloadable") and file_info.get("name")
+    ]
+    wanted_suffixes = host_linux_arch_suffixes()
+    for suffix, kind in wanted_suffixes:
+        matches = [
+            file_info
+            for file_info in downloadable
+            if file_info.get("name", "").lower().endswith(suffix)
+        ]
+        if matches:
+            matches.sort(key=lambda item: item.get("name", ""))
+            return {**matches[0], "kind": kind}
+    return None
+
+
+def select_host_artifact(release_files: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    release_platform = host_release_platform()
+    if release_platform == "macos":
+        return select_macos_artifact(release_files)
+    if release_platform == "linux":
+        return select_linux_artifact(release_files)
+    return None
 
 
 def discover_datasets(paths: Paths) -> dict[str, Any]:
@@ -384,13 +438,23 @@ def download(url: str, destination: Path) -> None:
     if destination.exists():
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp_destination = destination.with_suffix(destination.suffix + ".part")
-    with urllib.request.urlopen(
-        urllib.request.Request(url, headers={"User-Agent": USER_AGENT}),
-        timeout=TIMEOUT_SECONDS,
-    ) as response, tmp_destination.open("wb") as handle:
-        shutil.copyfileobj(response, handle)
-    tmp_destination.replace(destination)
+    with tempfile.NamedTemporaryFile(
+        prefix=destination.name + ".",
+        suffix=".part",
+        dir=destination.parent,
+        delete=False,
+    ) as handle:
+        tmp_destination = Path(handle.name)
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(url, headers={"User-Agent": USER_AGENT}),
+                timeout=TIMEOUT_SECONDS,
+            ) as response:
+                shutil.copyfileobj(response, handle)
+            tmp_destination.replace(destination)
+        finally:
+            if tmp_destination.exists():
+                tmp_destination.unlink()
 
 
 def sync_releases(paths: Paths, version_filter: set[str] | None = None) -> dict[str, Any]:
@@ -405,19 +469,22 @@ def sync_releases(paths: Paths, version_filter: set[str] | None = None) -> dict[
                 {
                     "version": version,
                     "available": False,
-                    "reason": "no_macos_artifact",
+                    "reason": "no_host_artifact",
                 }
             )
             continue
-        app_path = ensure_release_app(paths, release)
-        metadata = describe_release_app(app_path)
+        install_path = ensure_release_install(paths, release)
+        metadata = describe_release_install(paths, install_path, release["platform"])
         synced.append(
             {
                 "version": version,
-                "app_path": str(app_path),
-                "available": True,
+                "platform": release["platform"],
+                "install_path": str(install_path),
+                "available": metadata.get("runnable", True),
                 "artifact_name": release.get("artifact_name"),
+                "artifact_kind": release.get("artifact_kind"),
                 "jt9_arches": metadata["jt9_arches"],
+                "missing_shared_libraries": metadata.get("missing_shared_libraries", []),
                 "host_arch": host_arch(),
                 "execution_mode": execution_mode(metadata["jt9_arches"], host_arch()),
             }
@@ -428,6 +495,14 @@ def sync_releases(paths: Paths, version_filter: set[str] | None = None) -> dict[
     }
     write_json(paths.discovery / "synced_releases.json", payload)
     return payload
+
+
+def ensure_release_install(paths: Paths, release: dict[str, Any]) -> Path:
+    if release["platform"] == "macos":
+        return ensure_release_app(paths, release)
+    if release["platform"] == "linux":
+        return ensure_linux_release_root(paths, release)
+    raise RuntimeError(f"Unsupported release platform: {release['platform']}")
 
 
 def ensure_release_app(paths: Paths, release: dict[str, Any]) -> Path:
@@ -461,19 +536,71 @@ def ensure_release_app(paths: Paths, release: dict[str, Any]) -> Path:
         shutil.copytree(source_app, app_path)
     finally:
         subprocess.run(["hdiutil", "detach", mount_point], check=False)
-    write_json(release_dir / "metadata.json", describe_release_app(app_path))
+    write_json(release_dir / "metadata.json", describe_release_install(paths, app_path, "macos"))
     return app_path
 
 
-def describe_release_app(app_path: Path) -> dict[str, Any]:
-    jt9_path = app_path / "Contents" / "MacOS" / "jt9"
+def ensure_linux_release_root(paths: Paths, release: dict[str, Any]) -> Path:
+    version = release["version"]
+    release_dir = paths.releases / version
+    root_path = release_dir / "root"
+    if (root_path / "usr" / "bin" / "jt9").exists():
+        return root_path
+
+    release_dir.mkdir(parents=True, exist_ok=True)
+    artifact_name = release.get("artifact_name") or f"wsjtx_{version}_amd64.deb"
+    artifact_path = release_dir / artifact_name
+    download(release["download_url"], artifact_path)
+
+    if release.get("artifact_kind") != "deb":
+        raise RuntimeError(f"Unsupported Linux artifact kind: {release.get('artifact_kind')}")
+    if shutil.which("dpkg-deb") is None:
+        raise RuntimeError("dpkg-deb is required to extract Linux WSJT-X .deb packages")
+
+    if root_path.exists():
+        shutil.rmtree(root_path)
+    root_path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["dpkg-deb", "-x", str(artifact_path), str(root_path)], check=True)
+    write_json(release_dir / "metadata.json", describe_release_install(paths, root_path, "linux"))
+    return root_path
+
+
+def describe_release_install(paths: Paths, install_path: Path, release_platform: str) -> dict[str, Any]:
+    if release_platform == "macos":
+        executable_path = install_path / "Contents" / "MacOS"
+        jt9_path = executable_path / "jt9"
+        data_path = install_path / "Contents" / "Resources"
+        compat_library_dirs: list[str] = []
+        missing_libraries: list[str] = []
+    elif release_platform == "linux":
+        executable_path = install_path / "usr" / "bin"
+        jt9_path = executable_path / "jt9"
+        data_path = install_path / "usr" / "share" / "wsjtx"
+        initial_missing_libraries = missing_shared_libraries(jt9_path)
+        compat_library_dirs = [
+            str(path)
+            for path in ensure_linux_compat_lib_dirs(paths, initial_missing_libraries)
+        ]
+        missing_libraries = missing_shared_libraries(
+            jt9_path,
+            extra_library_dirs=[Path(path) for path in compat_library_dirs],
+        )
+    else:
+        raise RuntimeError(f"Unsupported release platform: {release_platform}")
+
     arches = inspect_binary_arches(jt9_path)
     payload = {
-        "app_path": str(app_path),
+        "platform": release_platform,
+        "install_path": str(install_path),
         "jt9_path": str(jt9_path),
+        "executable_path": str(executable_path),
+        "data_path": str(data_path) if data_path.exists() else None,
         "jt9_arches": arches,
+        "compat_library_dirs": compat_library_dirs,
+        "missing_shared_libraries": missing_libraries,
+        "runnable": bool(jt9_path.exists()) and not missing_libraries,
     }
-    metadata_path = app_path.parent / "metadata.json"
+    metadata_path = install_path.parent / "metadata.json"
     write_json(metadata_path, payload)
     return payload
 
@@ -518,12 +645,73 @@ def inspect_binary_arches(binary_path: Path) -> list[str]:
         text=True,
         check=True,
     )
-    output = completed.stdout
+    output = completed.stdout.lower()
     detected: list[str] = []
-    for arch in ("arm64", "x86_64"):
-        if arch in output:
+    arch_markers = {
+        "arm64": ("arm64", "aarch64"),
+        "x86_64": ("x86_64", "x86-64", "amd64"),
+    }
+    for arch, markers in arch_markers.items():
+        if any(marker in output for marker in markers):
             detected.append(arch)
     return detected or ["unknown"]
+
+
+def missing_shared_libraries(
+    binary_path: Path,
+    extra_library_dirs: list[Path] | None = None,
+) -> list[str]:
+    if not binary_path.exists():
+        return ["missing-jt9"]
+    try:
+        env = os.environ.copy()
+        if extra_library_dirs:
+            env["LD_LIBRARY_PATH"] = ":".join(str(path) for path in extra_library_dirs)
+        completed = subprocess.run(
+            ["ldd", str(binary_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError:
+        return []
+    missing: list[str] = []
+    for line in completed.stdout.splitlines():
+        if "=> not found" not in line:
+            continue
+        library = line.split("=>", 1)[0].strip()
+        if library:
+            missing.append(library)
+    return missing
+
+
+def ensure_linux_compat_lib_dirs(paths: Paths, missing_libraries: list[str]) -> list[Path]:
+    compat_dirs: list[Path] = []
+    if "libgfortran.so.4" in missing_libraries:
+        compat_dirs.append(ensure_vendored_libgfortran4(paths))
+    return compat_dirs
+
+
+def ensure_vendored_libgfortran4(paths: Paths) -> Path:
+    runtime_root = paths.cache / "linux-runtime" / "libgfortran4-ubuntu18.04-amd64"
+    lib_dir = runtime_root / "usr" / "lib" / "x86_64-linux-gnu"
+    soname_path = lib_dir / "libgfortran.so.4"
+    if soname_path.exists():
+        return lib_dir
+
+    if shutil.which("dpkg-deb") is None:
+        raise RuntimeError("dpkg-deb is required to extract vendored Linux runtime libraries")
+
+    package_path = runtime_root.parent / "libgfortran4_7.5.0-3ubuntu1~18.04_amd64.deb"
+    download(LINUX_COMPAT_LIBGFORTRAN4_URL, package_path)
+    if runtime_root.exists():
+        shutil.rmtree(runtime_root)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["dpkg-deb", "-x", str(package_path), str(runtime_root)], check=True)
+    if not soname_path.exists():
+        raise RuntimeError(f"Vendored libgfortran4 missing expected soname: {soname_path}")
+    return lib_dir
 
 
 def host_arch() -> str:
@@ -565,16 +753,25 @@ def run_benchmarks(
     sync_releases(paths, version_filter or None)
     sync_samples(paths, dataset_filter or None, sample_limit)
 
-    selected_releases = [
+    candidate_releases = [
         release
         for release in release_payload["releases"]
         if (not version_filter or release["version"] in version_filter)
-        and release.get("macos_available", True)
+        and release.get("host_available", True)
     ]
     release_metadata = {
-        release["version"]: describe_release_app(paths.releases / release["version"] / "wsjtx.app")
-        for release in selected_releases
+        release["version"]: describe_release_install(
+            paths,
+            ensure_release_install(paths, release),
+            release["platform"],
+        )
+        for release in candidate_releases
     }
+    selected_releases = [
+        release
+        for release in candidate_releases
+        if release_metadata[release["version"]].get("runnable", True)
+    ]
     selected_datasets = [
         dataset
         for dataset in dataset_payload["datasets"]
@@ -600,8 +797,11 @@ def run_benchmarks(
 
     job_specs: list[dict[str, Any]] = []
     for release in selected_releases:
-        app_path = paths.releases / release["version"] / "wsjtx.app"
-        jt9_path = app_path / "Contents" / "MacOS" / "jt9"
+        install_path = ensure_release_install(paths, release)
+        metadata = release_metadata[release["version"]]
+        jt9_path = Path(metadata["jt9_path"])
+        executable_path = Path(metadata["executable_path"])
+        compat_library_dirs = [Path(path) for path in metadata.get("compat_library_dirs", [])]
         for profile in selected_profiles:
             for dataset in selected_datasets:
                 sample_entries = dataset["samples"]
@@ -616,8 +816,11 @@ def run_benchmarks(
                             "dataset": dataset,
                             "sample": sample,
                             "sample_dir": sample_dir,
-                            "app_path": app_path,
+                            "install_path": install_path,
                             "jt9_path": jt9_path,
+                            "executable_path": executable_path,
+                            "compat_library_dirs": compat_library_dirs,
+                            "release_platform": release["platform"],
                             "run_id": run_id,
                         }
                     )
@@ -689,6 +892,14 @@ def run_benchmarks(
             {
                 "version": release["version"],
                 "jt9_arches": release_metadata[release["version"]]["jt9_arches"],
+                "missing_shared_libraries": release_metadata[release["version"]].get(
+                    "missing_shared_libraries",
+                    [],
+                ),
+                "compat_library_dirs": release_metadata[release["version"]].get(
+                    "compat_library_dirs",
+                    [],
+                ),
                 "execution_mode": execution_mode(
                     release_metadata[release["version"]]["jt9_arches"],
                     host_arch(),
@@ -721,7 +932,9 @@ def run_benchmarks(
 
 def invoke_decoder(
     jt9_path: Path,
-    app_path: Path,
+    executable_path: Path,
+    compat_library_dirs: list[Path],
+    release_platform: str,
     sample_path: Path,
     depth: int,
     work_root: Path,
@@ -730,19 +943,32 @@ def invoke_decoder(
     run_temp = Path(tempfile.mkdtemp(prefix="jt9-", dir=work_root))
     stdout_path = run_temp / "stdout.txt"
     stderr_path = run_temp / "stderr.txt"
-    macos_dir = app_path / "Contents" / "MacOS"
-    frameworks_dir = app_path / "Contents" / "Frameworks"
     env = os.environ.copy()
-    env["DYLD_LIBRARY_PATH"] = ":".join(
-        str(path) for path in (macos_dir, frameworks_dir) if path.exists()
-    )
+    if release_platform == "macos":
+        frameworks_dir = executable_path.parent / "Frameworks"
+        env["DYLD_LIBRARY_PATH"] = ":".join(
+            str(path) for path in (executable_path, frameworks_dir) if path.exists()
+        )
+    elif release_platform == "linux":
+        lib_dirs = [
+            path
+            for path in (
+                executable_path.parent / "lib",
+                executable_path.parent.parent / "lib",
+                executable_path.parent.parent / "lib64",
+                *compat_library_dirs,
+            )
+            if path.exists()
+        ]
+        if lib_dirs:
+            env["LD_LIBRARY_PATH"] = ":".join(str(path) for path in lib_dirs)
     command = [
         str(jt9_path),
         "-8",
         "-d",
         str(depth),
         "-e",
-        str(macos_dir),
+        str(executable_path),
         "-a",
         str(run_temp),
         "-t",
@@ -818,7 +1044,9 @@ def run_decode_job(
     else:
         result = invoke_decoder(
             jt9_path=job_spec["jt9_path"],
-            app_path=job_spec["app_path"],
+            executable_path=job_spec["executable_path"],
+            compat_library_dirs=job_spec.get("compat_library_dirs", []),
+            release_platform=job_spec["release_platform"],
             sample_path=wav_path,
             depth=profile["depth"],
             work_root=paths.temp / "runs" / job_spec["run_id"],
