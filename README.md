@@ -86,6 +86,12 @@ Static saved copies of notable full regression runs can be checked into:
 
 - `golden/wsjtx-vs-version/`
 
+Archive a run into that tracked layout with:
+
+```bash
+python3 scripts/archive_golden_run.py --snapshot-kind wsjtx-vs-version
+```
+
 ## Current scoring rule
 
 The prototype uses `unique-message` matching for scored datasets. That is intentionally conservative for a first pass because:

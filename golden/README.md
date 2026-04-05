@@ -17,3 +17,18 @@ Each snapshot contains:
 - `report/` copied from `artifacts/reports/<run-id>/`
 
 These snapshots are intended to be immutable once checked in.
+
+Create a new snapshot with:
+
+```bash
+python3 scripts/archive_golden_run.py --snapshot-kind wsjtx-vs-version
+```
+
+Useful flags:
+
+- `results_path`: archive a specific `artifacts/results/<run-id>` directory instead of `latest`
+- `--report-path`: point at a matching report directory when it is not the default sibling path
+- `--golden-root`: write snapshots somewhere else for verification before copying into the repo
+- `--source-ref` / `--source-commit`: record the branch and commit when the results came from a different checkout or worktree
+- `--dry-run`: print the resolved snapshot path and metadata without copying files
+- `--force`: replace an existing snapshot directory
