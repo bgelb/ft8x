@@ -36,6 +36,8 @@ pub struct QueueConfig {
     pub cq_enabled_default: bool,
     pub cq_percent_default: u8,
     pub use_compound_rr73_handoff_default: bool,
+    pub use_compound_73_once_handoff_default: bool,
+    pub use_compound_for_direct_signal_callers_default: bool,
     pub no_message_retry_delay_seconds_default: u64,
     pub no_forward_retry_delay_seconds_default: u64,
 }
