@@ -3298,8 +3298,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div>Ago</div>
           <div>Call</div>
           <div>Bd</div>
-          <div>R</div>
           <div>Rpl</div>
+          <div>R</div>
           <div>73</div>
           <div>Sent</div>
           <div>Recv</div>
@@ -3317,8 +3317,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="history-cell muted">${escapeHtml(entry.age)}</div>
           <div class="history-cell">${renderCallValue(escapeHtml(entry.callsign), entry.callsign)}</div>
           <div class="history-cell muted">${escapeHtml(entry.band ?? '-')}</div>
-          <div class="history-cell muted">${entry.got_roger ? 'Y' : '-'}</div>
           <div class="history-cell muted">${entry.got_reply ? 'Y' : '-'}</div>
+          <div class="history-cell muted">${entry.got_roger ? 'Y' : '-'}</div>
           <div class="history-cell muted">${entry.reached_73 ? 'Y' : '-'}</div>
           <div class="history-cell">${escapeHtml(entry.sent_info)}</div>
           <div class="history-cell">${escapeHtml(entry.received_info)}</div>
