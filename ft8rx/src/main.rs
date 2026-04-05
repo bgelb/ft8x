@@ -251,6 +251,9 @@ enum QueueCommand {
     SetCompound73OnceHandoff {
         enabled: bool,
     },
+    SetCompoundForDirectSignalCallers {
+        enabled: bool,
+    },
     ToggleNextCqParity,
 }
 
@@ -480,6 +483,7 @@ struct WebQueueSnapshot {
     cq_percent: u8,
     use_compound_rr73_handoff: bool,
     use_compound_73_once_handoff: bool,
+    use_compound_for_direct_signal_callers: bool,
     next_cq_parity_flipped: bool,
     even_tx_freq_hz: f32,
     odd_tx_freq_hz: f32,
@@ -590,6 +594,7 @@ struct WorkQueueState {
     cq_percent: u8,
     use_compound_rr73_handoff: bool,
     use_compound_73_once_handoff: bool,
+    use_compound_for_direct_signal_callers: bool,
     next_cq_parity_flipped: bool,
     even_tx_freq_hz: f32,
     odd_tx_freq_hz: f32,
@@ -747,6 +752,9 @@ impl WorkQueueState {
             cq_percent: config.queue.cq_percent_default.min(100),
             use_compound_rr73_handoff: config.queue.use_compound_rr73_handoff_default,
             use_compound_73_once_handoff: config.queue.use_compound_73_once_handoff_default,
+            use_compound_for_direct_signal_callers: config
+                .queue
+                .use_compound_for_direct_signal_callers_default,
             next_cq_parity_flipped: false,
             even_tx_freq_hz: tx_freq_hz,
             odd_tx_freq_hz: tx_freq_hz,
@@ -998,6 +1006,11 @@ impl WorkQueueState {
     fn set_use_compound_73_once_handoff(&mut self, enabled: bool) {
         self.use_compound_73_once_handoff = enabled;
         info!(enabled, "queue_compound_73_once_handoff_changed");
+    }
+
+    fn set_use_compound_for_direct_signal_callers(&mut self, enabled: bool) {
+        self.use_compound_for_direct_signal_callers = enabled;
+        info!(enabled, "queue_compound_direct_signal_changed");
     }
 
     fn use_compound_73_once_handoff(&self) -> bool {
@@ -1266,6 +1279,7 @@ impl WorkQueueState {
             cq_percent: self.cq_percent,
             use_compound_rr73_handoff: self.use_compound_rr73_handoff,
             use_compound_73_once_handoff: self.use_compound_73_once_handoff,
+            use_compound_for_direct_signal_callers: self.use_compound_for_direct_signal_callers,
             next_cq_parity_flipped: self.next_cq_parity_flipped,
             even_tx_freq_hz: self.even_tx_freq_hz,
             odd_tx_freq_hz: self.odd_tx_freq_hz,
@@ -1439,7 +1453,10 @@ impl WorkQueueState {
         }
         let index = self.best_priority_direct_index_excluding(now, excluded_callsign)?;
         let entry = self.entries.get(index)?;
-        if !entry.direct_compound_eligible {
+        let eligible = entry.direct_compound_eligible
+            || (self.use_compound_for_direct_signal_callers
+                && entry.direct_start_state == Some(QsoState::SendSigAck));
+        if !eligible {
             return None;
         }
         Some(self.direct_dispatch_from_entry(entry, now))
@@ -2433,6 +2450,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <label class="toggle-row"><input id="queue-cq-enabled" type="checkbox"> Enable CQ</label>
           <label class="toggle-row"><input id="queue-compound-rr73" type="checkbox"> Use compound RR73 handoff</label>
           <label class="toggle-row"><input id="queue-compound-73-once" type="checkbox"> Use compound 73-once handoff</label>
+          <label class="toggle-row"><input id="queue-compound-direct-signal" type="checkbox"> Use compound for direct signal callers</label>
         </div>
         </div>
         <div class="detail-block">
@@ -2742,6 +2760,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function updateQueueCompound73OnceHandoff(enabled) {
       await postJson('/api/queue/compound-73-once-handoff', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueCompoundForDirectSignal(enabled) {
+      await postJson('/api/queue/compound-direct-signal', { enabled });
       scheduleRefresh(10);
     }
     async function updateQueueCqPercent(percent) {
@@ -3106,6 +3128,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const cqEnabled = document.getElementById('queue-cq-enabled');
       const compoundRr73 = document.getElementById('queue-compound-rr73');
       const compound73Once = document.getElementById('queue-compound-73-once');
+      const compoundDirectSignal = document.getElementById('queue-compound-direct-signal');
       const cqPercent = document.getElementById('queue-cq-percent');
       const nextCqParity = document.getElementById('queue-next-cq-parity');
       const clearButton = document.getElementById('queue-clear');
@@ -3118,6 +3141,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       cqEnabled.checked = !!queue.cq_enabled;
       compoundRr73.checked = !!queue.use_compound_rr73_handoff;
       compound73Once.checked = !!queue.use_compound_73_once_handoff;
+      compoundDirectSignal.checked = !!queue.use_compound_for_direct_signal_callers;
       cqPercent.value = String(queue.cq_percent ?? 80);
       nextCqParity.textContent = queue.next_cq_parity_flipped ? 'Next CQ Parity Flipped' : 'Flip Next CQ Parity';
       if (
@@ -3407,6 +3431,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById('queue-compound-73-once').addEventListener('change', (event) => {
       updateQueueCompound73OnceHandoff(event.currentTarget.checked).catch((error) => console.error(error));
     });
+    document.getElementById('queue-compound-direct-signal').addEventListener('change', (event) => {
+      updateQueueCompoundForDirectSignal(event.currentTarget.checked).catch((error) => console.error(error));
+    });
     document.getElementById('queue-cq-percent').addEventListener('change', (event) => {
       updateQueueCqPercent(Number(event.currentTarget.value)).catch((error) => console.error(error));
     });
@@ -3479,6 +3506,10 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route(
                     "/api/queue/compound-73-once-handoff",
                     post(api_queue_compound_73_once_handoff_handler),
+                )
+                .route(
+                    "/api/queue/compound-direct-signal",
+                    post(api_queue_compound_direct_signal_handler),
                 )
                 .route(
                     "/api/queue/next-cq-parity",
@@ -3716,6 +3747,24 @@ async fn api_queue_compound_73_once_handoff_handler(
         Json(ApiStatus {
             ok: true,
             message: "compound 73 once handoff updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_compound_direct_signal_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetCompoundForDirectSignalCallers {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "compound direct signal callers updated".to_string(),
         }),
     )
 }
@@ -4471,6 +4520,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 }
                 QueueCommand::SetCompound73OnceHandoff { enabled } => {
                     work_queue.set_use_compound_73_once_handoff(enabled)
+                }
+                QueueCommand::SetCompoundForDirectSignalCallers { enabled } => {
+                    work_queue.set_use_compound_for_direct_signal_callers(enabled)
                 }
                 QueueCommand::ToggleNextCqParity => work_queue.toggle_next_cq_parity(),
             }
@@ -7135,7 +7187,8 @@ mod tests {
                 cq_enabled_default: false,
                 cq_percent_default: 80,
                 use_compound_rr73_handoff_default: true,
-                use_compound_73_once_handoff_default: true,
+                use_compound_73_once_handoff_default: false,
+                use_compound_for_direct_signal_callers_default: false,
                 no_message_retry_delay_seconds_default: 35,
                 no_forward_retry_delay_seconds_default: 300,
             },
@@ -7437,6 +7490,40 @@ mod tests {
                 .peek_compound_handoff_candidate(now + Duration::from_secs(1), None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn compound_handoff_candidate_can_include_signal_direct_when_enabled() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_use_compound_for_direct_signal_callers(true);
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        queue
+            .add_direct_observation(
+                DirectCallObservation {
+                    callsign: "SIG".to_string(),
+                    observed_at: now,
+                    slot_index: slot_index(now),
+                    slot_family: qso::slot_family(now),
+                    snr_db: -2,
+                    start_state: QsoState::SendSigAck,
+                    compound_eligible: false,
+                    text: "N1VF SIG -02".to_string(),
+                    structured_json: "{}".to_string(),
+                },
+                now,
+            )
+            .expect("signal direct");
+        let candidate = queue
+            .peek_compound_handoff_candidate(now + Duration::from_secs(1), None)
+            .expect("compound candidate");
+        assert_eq!(candidate.callsign, "SIG");
+        match candidate.kind {
+            QueueDispatchKind::Station { initial_state, .. } => {
+                assert_eq!(initial_state, QsoState::SendSigAck);
+            }
+            QueueDispatchKind::Cq { .. } => panic!("expected station dispatch"),
+        }
     }
 
     #[test]

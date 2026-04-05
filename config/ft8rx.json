@@ -18,7 +18,8 @@
     "cq_enabled_default": false,
     "cq_percent_default": 80,
     "use_compound_rr73_handoff_default": true,
-    "use_compound_73_once_handoff_default": true,
+    "use_compound_73_once_handoff_default": false,
+    "use_compound_for_direct_signal_callers_default": false,
     "no_message_retry_delay_seconds_default": 35,
     "no_forward_retry_delay_seconds_default": 300
   },
