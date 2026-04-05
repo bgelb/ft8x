@@ -1,0 +1,9 @@
+150900  -2  0.7  604 ~  FR5CB JH1XYB -15                        
+150900 -14  1.1 1247 ~  FR5CB JA0PE PM97                        
+150900 -12  0.3  777 ~  HS6VW BG5HKI 73                         
+150900  -9  0.8 2703 ~  LA3DV HS0ZIV OK17                       
+150900 -17  0.8 2019 ~  OH2MDN JA6JNF R-17                      
+150900 -16  0.8 2125 ~  UA9OMM UA0LBF PN53                      
+150900 -16  1.0 1381 ~  CQ JA7GKP/P QM05                        
+150900 -18  0.5 1795 ~  HL2IDT JA1LZB -17                       
+<DecodeFinished>   0   8

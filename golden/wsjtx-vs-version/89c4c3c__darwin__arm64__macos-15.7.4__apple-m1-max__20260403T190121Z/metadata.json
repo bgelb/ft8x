@@ -1,0 +1,33 @@
+{
+  "snapshot_kind": "wsjtx-vs-version",
+  "results_source": {
+    "ref": "origin/main",
+    "commit": "89c4c3c",
+    "run_id": "20260403T190121Z",
+    "generated_at": "2026-04-03T19:08:23+00:00",
+    "command": "PYTHONPATH=src python3 -m ft8_regr.cli run --profiles medium deepest --jobs 10",
+    "profiles": [
+      "medium",
+      "deepest"
+    ],
+    "datasets": [
+      "kgoba-ft8-lib",
+      "d9394-ft8-test-wave"
+    ],
+    "release_count": 20,
+    "run_count": 1680
+  },
+  "runner": {
+    "platform_type": "Darwin",
+    "os_name": "macOS",
+    "os_version": "15.7.4",
+    "os_build": "24G517",
+    "cpu_arch": "arm64",
+    "cpu_brand": "Apple M1 Max"
+  },
+  "snapshot_contents": {
+    "results_dir": "results",
+    "report_dir": "report"
+  },
+  "archived_at": "2026-04-05T16:47:42Z"
+}

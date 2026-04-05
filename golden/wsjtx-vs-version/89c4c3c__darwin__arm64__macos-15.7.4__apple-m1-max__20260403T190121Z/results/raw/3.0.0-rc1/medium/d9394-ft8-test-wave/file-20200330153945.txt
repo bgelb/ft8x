@@ -1,0 +1,11 @@
+153945 -10 -0.2 1500 ~  SM7BHH DS4NPL RR73                      
+153945  -9  1.4  845 ~  CQ BD5HST PM00                          
+153945  -5  0.1 2210 ~  CQ BD7BS OL69                           
+153945 -11  0.0  460 ~  MW0ZZK JA0HWF PM85                      
+153945 -11  0.0  523 ~  DK7LE JH4GXE PM64                       
+153945 -15 -0.4 1578 ~  R2AL R0JD PO30                          
+<DecodeFinished>   0   6        0
+# stderr (2.174s)
+dyld[19245]: symbol '_iconv_close' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.
+dyld[19245]: symbol '_iconv_open' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.
+dyld[19245]: symbol '_iconv' missing from root that overrides /usr/lib/libiconv.2.dylib. Use of that symbol in /usr/lib/libcups.2.dylib is being set to 0xBAD4007.

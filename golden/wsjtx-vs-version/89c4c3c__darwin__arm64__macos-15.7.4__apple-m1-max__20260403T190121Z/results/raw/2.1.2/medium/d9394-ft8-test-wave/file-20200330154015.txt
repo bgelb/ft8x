@@ -1,0 +1,4 @@
+154015 -14  0.0 1881 ~  UA0STR JH4GXE PM64                      
+154015  -6 -0.1 2205 ~  CQ BD7BS OL69                           
+154015 -14 -0.1 2589 ~  BG1LKL BG5TLD OL96                      
+<DecodeFinished>   0   3

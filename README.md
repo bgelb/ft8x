@@ -82,6 +82,10 @@ The main outputs land under:
 - `artifacts/results/latest/`
 - `artifacts/reports/latest/index.html`
 
+Static saved copies of notable full regression runs can be checked into:
+
+- `golden/wsjtx-vs-version/`
+
 ## Current scoring rule
 
 The prototype uses `unique-message` matching for scored datasets. That is intentionally conservative for a first pass because:
