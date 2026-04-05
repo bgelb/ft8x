@@ -1953,6 +1953,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .qso-panel {
       height: 760px;
     }
+    .queue-panel {
+      display: grid;
+      grid-template-rows: auto auto auto auto minmax(0, 1fr);
+      align-content: stretch;
+    }
     .direct-panel,
     .log-panel {
       height: 380px;
@@ -1977,6 +1982,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       display: flex;
       flex-direction: column;
       min-height: 0;
+    }
+    .queue-panel .detail-block:last-child {
+      overflow: hidden;
     }
     .detail-lines {
       color: var(--ink);
