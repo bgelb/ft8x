@@ -1,0 +1,6 @@
+154015 -13 -0.3 1494 ~  SM7BHH DS4NPL RR73                      
+154015 -14 -0.0 1881 ~  UA0STR JH4GXE PM64                      
+154015  -6 -0.1 2205 ~  CQ BD7BS OL69                           
+154015 -14 -0.1 2589 ~  BG1LKL BG5TLD OL96                      
+154015 -11  0.0  455 ~  MW0ZZK JA0HWF R-16                      
+<DecodeFinished>   0   5        0

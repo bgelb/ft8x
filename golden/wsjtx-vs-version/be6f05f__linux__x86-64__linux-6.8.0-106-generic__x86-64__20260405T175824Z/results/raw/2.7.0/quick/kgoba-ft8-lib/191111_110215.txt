@@ -1,0 +1,4 @@
+110215   5  0.9 1235 ~  GJ0KYZ RK9AX MO05                       
+110215  -8  1.0  323 ~  <...> RY8CAA R-10                       
+110215 -10  0.1  996 ~  GJ0KYZ UA6HI -15                        
+<DecodeFinished>   0   3        0

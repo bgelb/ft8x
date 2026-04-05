@@ -1,0 +1,8 @@
+153315  -3  0.2 2241 ~  G7TYT BD7BS OL69                        
+153315 -13  0.3 2584 ~  PC3M JF8QNF RR73                        
+153315 -13  0.3 1699 ~  R9YQ JJ1QQT QM06                        
+153315  -9  0.3 2855 ~  MW0ZZK JR1WYW QM05                      
+153315 -14  0.0 1763 ~  CQ JG1BBD PM95                          
+153315 -15  0.1 1530 ~  CQ DS4NPL PM35                          
+153315 -15  0.2 1791 ~  ON3BEN JH1CMW -19                       
+<DecodeFinished>   0   7        0

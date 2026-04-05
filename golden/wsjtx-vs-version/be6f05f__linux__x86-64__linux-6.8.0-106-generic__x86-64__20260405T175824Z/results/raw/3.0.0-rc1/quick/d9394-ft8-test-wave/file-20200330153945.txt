@@ -1,0 +1,6 @@
+153945 -11 -0.2 1500 ~  SM7BHH DS4NPL RR73                      
+153945  -9  1.4  845 ~  CQ BD5HST PM00                          
+153945  -5  0.1 2210 ~  CQ BD7BS OL69                           
+153945 -12  0.0  461 ~  MW0ZZK JA0HWF PM85                      
+153945 -16 -0.4 1578 ~  R2AL R0JD PO30                          
+<DecodeFinished>   0   5        0
