@@ -85,12 +85,19 @@ The main outputs land under:
 Static saved copies of notable full regression runs can be checked into:
 
 - `golden/wsjtx-vs-version/`
+- GitHub Pages landing page: [bgelb.github.io/ft8x](https://bgelb.github.io/ft8x/)
+- Generated snapshot index: [golden/index.html](golden/index.html)
 
 Archive a run into that tracked layout with:
 
 ```bash
 python3 scripts/archive_golden_run.py --snapshot-kind wsjtx-vs-version
 ```
+
+That script also refreshes the tracked landing pages:
+
+- [index.html](index.html)
+- [golden/index.html](golden/index.html)
 
 ## Current scoring rule
 
