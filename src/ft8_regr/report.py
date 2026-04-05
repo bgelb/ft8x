@@ -249,7 +249,7 @@ def render_report(payload: dict[str, Any]) -> str:
   <main>
     <header>
       <h1>WSJT-X FT8 Historical Regression</h1>
-      <p>Prototype benchmark for official macOS Intel WSJT-X releases using the command-line <span class="mono">jt9 -8</span> decoder across depth profiles and mixed scored/unscored FT8 sample sets.</p>
+      <p>Prototype benchmark for official WSJT-X release binaries for the current host platform using the command-line <span class="mono">jt9 -8</span> decoder across depth profiles and mixed scored/unscored FT8 sample sets.</p>
       <div class="meta">
         <span class="pill">Run: {payload["run_id"]}</span>
         <span class="pill">Generated: {payload["generated_at"]}</span>
