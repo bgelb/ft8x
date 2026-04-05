@@ -28,6 +28,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            decoder -> decoder/target
+            audiolib -> audiolib/target
+            rigctl -> rigctl/target
+            ft8rx -> ft8rx/target
 
       - uses: actions/setup-python@v5
         with:

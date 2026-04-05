@@ -73,7 +73,7 @@ class RegressionCoreTests(unittest.TestCase):
             (compat_root / "libgfortran.so.4").write_text("stub")
             paths = patch_default_paths(Path(tmpdir))
             compat_dirs = ensure_linux_compat_lib_dirs(paths, ["libgfortran.so.4"])
-        self.assertEqual(compat_dirs, [compat_root])
+        self.assertEqual([path.resolve() for path in compat_dirs], [compat_root.resolve()])
 
     def test_selects_macos_dmg_for_macos_host(self) -> None:
         release_files = {
