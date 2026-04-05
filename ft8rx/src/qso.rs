@@ -1072,6 +1072,11 @@ impl QsoController {
         };
         let reason = match (session.start_mode, session.state, session.partner_rx_count) {
             (QsoStartMode::Normal, QsoState::SendGrid, 0) => Some("send_grid_no_msg_limit"),
+            (_, QsoState::SendSig, 0)
+                if session.last_tx_slot.is_some() && session.no_msg_count > 0 =>
+            {
+                Some("send_sig_no_msg_limit")
+            }
             (QsoStartMode::Cq, QsoState::SendCq, _) => Some("send_cq_direct_preempt"),
             _ => None,
         };
@@ -3574,6 +3579,57 @@ mod tests {
                 .iter()
                 .any(|entry| entry.text.contains("fresh RX superseded queued transition"))
         );
+    }
+
+    #[test]
+    fn send_sig_can_preempt_after_tx_and_empty_rx_when_partner_not_engaged() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1225.0,
+                initial_state: QsoState::SendSig,
+                start_mode: QsoStartMode::Direct,
+                tx_slot_family_override: Some(SlotFamily::Even),
+            },
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        let session = controller.session.as_mut().expect("session");
+        session.last_tx_slot = Some(now);
+        session.no_msg_count = 1;
+        session.partner_rx_count = 0;
+
+        assert!(controller.preempt_for_priority_direct(now + Duration::from_secs(1)));
+        let outcomes = controller.drain_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].exit_reason, "send_sig_no_msg_limit");
+    }
+
+    #[test]
+    fn send_sig_does_not_preempt_before_first_empty_rx_cycle() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1225.0,
+                initial_state: QsoState::SendSig,
+                start_mode: QsoStartMode::Direct,
+                tx_slot_family_override: Some(SlotFamily::Even),
+            },
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        let session = controller.session.as_mut().expect("session");
+        session.last_tx_slot = Some(now);
+        session.no_msg_count = 0;
+        session.partner_rx_count = 0;
+
+        assert!(!controller.preempt_for_priority_direct(now + Duration::from_secs(1)));
     }
 
     #[test]
