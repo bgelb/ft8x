@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
+import os
 import random
 import re
 import shlex
@@ -18,7 +20,8 @@ from typing import Iterable
 
 
 DECODE_PATTERN = re.compile(
-    r"^(?P<utc>\d{6})\s+(?P<snr>-?\d+)\s+(?P<dt>-?\d+(?:\.\d+)?)\s+(?P<freq>\d+)\s+(?:~|\+)\s+(?P<message>.+?)\s*$"
+    r"^(?:(?P<utc>(?:\d{6}(?:_\d{9})?|\*{6}))\s+)?(?P<snr>-?\d+)\s+(?P<dt>-?\d+(?:\.\d+)?)\s+(?P<freq>\d+)\s+(?:~|\+|RX)\s+(?P<message>.+?)(?:\s+-?\d+\s+-?\d+\s+-?\d+)?\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -35,6 +38,11 @@ class SpecCase:
     total_seconds: float
     expected_message: str
     wav_path: str
+
+
+def write_manifest(path: Path, payload: dict) -> Path:
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    return path
 
 
 def parse_decode_lines(text: str) -> list[str]:
@@ -184,6 +192,36 @@ def write_generated_waveform(
     total_seconds: float,
     output_path: Path,
 ) -> None:
+    sample_rate_hz, samples, _ = generate_case_waveform(
+        generator_source=generator_source,
+        decoder_binary=decoder_binary,
+        reference_generators=reference_generators,
+        mode=mode,
+        first=first,
+        second=second,
+        info=info,
+        acknowledge=acknowledge,
+        freq_hz=freq_hz,
+        start_seconds=start_seconds,
+        total_seconds=total_seconds,
+    )
+    write_wav_i16(output_path, sample_rate_hz, samples)
+
+
+def generate_case_waveform(
+    *,
+    generator_source: str,
+    decoder_binary: Path,
+    reference_generators: dict[str, Path | None],
+    mode: str,
+    first: str,
+    second: str,
+    info: str,
+    acknowledge: bool,
+    freq_hz: float,
+    start_seconds: float,
+    total_seconds: float,
+) -> tuple[int, list[int], str]:
     rendered = render_expected_message(first, second, info, acknowledge)
     if generator_source == "reference":
         generator = reference_generators[mode]
@@ -204,7 +242,7 @@ def write_generated_waveform(
             start_seconds,
             total_seconds,
         )
-    write_wav_i16(output_path, sample_rate_hz, samples)
+    return sample_rate_hz, samples, rendered
 
 
 def build_spec_corpus(args: argparse.Namespace) -> int:
@@ -261,20 +299,17 @@ def build_spec_corpus(args: argparse.Namespace) -> int:
             )
 
     manifest_path = output_root / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "kind": "spec",
-                "generator": (
-                    "reference"
-                    if args.generator_source == "reference"
-                    else str(decoder_binary)
-                ),
-                "cases": [asdict(case) for case in cases],
-            },
-            indent=2,
-        )
-        + "\n"
+    write_manifest(
+        manifest_path,
+        {
+            "kind": "spec",
+            "generator": (
+                "reference"
+                if args.generator_source == "reference"
+                else str(decoder_binary)
+            ),
+            "cases": [asdict(case) for case in cases],
+        },
     )
     print(manifest_path)
     return 0
@@ -297,85 +332,143 @@ def build_synth_corpus(args: argparse.Namespace) -> int:
         total_seconds = args.total_seconds or default_total_seconds(mode)
         sample_rate_hz = 12_000
         total_samples = round(total_seconds * sample_rate_hz)
-        for index in range(args.count_per_mode):
-            signal_count = rng.randint(1, args.max_signals)
-            mixed = [0.0] * total_samples
-            expected = []
-            signals = []
-            for signal_index in range(signal_count):
-                first, second, info, acknowledge = rng.choice(builtin_messages())
-                freq_hz = rng.choice([650.0, 900.0, 1150.0, 1400.0, 1650.0, 1900.0])
-                start_seconds = rng.choice([0.0, 0.05, 0.1, 0.2, 0.35])
-                rendered = render_expected_message(first, second, info, acknowledge)
-                expected.append(rendered)
-                signals.append(
+        if args.single_count_per_mode is not None or args.mixed_count_per_mode is not None:
+            single_count = args.single_count_per_mode or 0
+            mixed_count = args.mixed_count_per_mode or 0
+        else:
+            single_count = 0
+            mixed_count = args.count_per_mode
+        for cohort, cohort_count in (("single", single_count), ("mixed", mixed_count)):
+            for index in range(cohort_count):
+                signal_count = 1 if cohort == "single" else rng.randint(2, max(2, args.max_signals))
+                mixed = [0.0] * total_samples
+                expected = []
+                signals = []
+                for signal_index in range(signal_count):
+                    first, second, info, acknowledge = rng.choice(builtin_messages())
+                    freq_hz = rng.choice([650.0, 900.0, 1150.0, 1400.0, 1650.0, 1900.0])
+                    start_seconds = rng.choice([0.0, 0.05, 0.1, 0.2, 0.35])
+                    _, samples, rendered = generate_case_waveform(
+                        generator_source=args.generator_source,
+                        decoder_binary=decoder_binary,
+                        reference_generators=reference_generators,
+                        mode=mode,
+                        first=first,
+                        second=second,
+                        info=info,
+                        acknowledge=acknowledge,
+                        freq_hz=freq_hz,
+                        start_seconds=start_seconds,
+                        total_seconds=total_seconds,
+                    )
+                    expected.append(rendered)
+                    signals.append(
+                        {
+                            "first": first,
+                            "second": second,
+                            "info": info,
+                            "acknowledge": acknowledge,
+                            "freq_hz": freq_hz,
+                            "start_seconds": start_seconds,
+                        }
+                    )
+                    gain = 10 ** (rng.uniform(args.signal_db_min, args.signal_db_max) / 20.0)
+                    for i, sample in enumerate(samples):
+                        mixed[i] += gain * (sample / 32768.0)
+
+                noise_sigma = 10 ** (args.noise_dbfs / 20.0)
+                for i in range(total_samples):
+                    mixed[i] += rng.gauss(0.0, noise_sigma)
+
+                peak = max(1.0, max(abs(value) for value in mixed) / 0.8)
+                pcm = [max(-32767, min(32767, round((value / peak) * 32767.0))) for value in mixed]
+                case_id = f"{mode}-{cohort}-{index:05d}"
+                wav_path = mode_dir / f"{case_id}.wav"
+                write_wav_i16(wav_path, sample_rate_hz, pcm)
+                cases.append(
                     {
-                        "first": first,
-                        "second": second,
-                        "info": info,
-                        "acknowledge": acknowledge,
-                        "freq_hz": freq_hz,
-                        "start_seconds": start_seconds,
+                        "id": case_id,
+                        "mode": mode,
+                        "cohort": cohort,
+                        "wav_path": str(wav_path),
+                        "expected_messages": sorted(set(expected)),
+                        "signals": signals,
+                        "noise_dbfs": args.noise_dbfs,
                     }
                 )
-                if args.generator_source == "reference":
-                    generator = reference_generators[mode]
-                    if generator is None:
-                        raise SystemExit(f"missing reference generator for mode {mode}")
-                    _, samples = generate_reference_samples(
-                        generator, rendered, freq_hz, start_seconds, total_seconds
-                    )
-                else:
-                    _, samples = generate_rust_samples(
-                        decoder_binary,
-                        mode,
-                        first,
-                        second,
-                        info,
-                        acknowledge,
-                        freq_hz,
-                        start_seconds,
-                        total_seconds,
-                    )
-                gain = 10 ** (rng.uniform(args.signal_db_min, args.signal_db_max) / 20.0)
-                for i, sample in enumerate(samples):
-                    mixed[i] += gain * (sample / 32768.0)
-
-            noise_sigma = 10 ** (args.noise_dbfs / 20.0)
-            for i in range(total_samples):
-                mixed[i] += rng.gauss(0.0, noise_sigma)
-
-            peak = max(1.0, max(abs(value) for value in mixed) / 0.8)
-            pcm = [max(-32767, min(32767, round((value / peak) * 32767.0))) for value in mixed]
-            case_id = f"{mode}-mix-{index:04d}"
-            wav_path = mode_dir / f"{case_id}.wav"
-            write_wav_i16(wav_path, sample_rate_hz, pcm)
-            cases.append(
-                {
-                    "id": case_id,
-                    "mode": mode,
-                    "wav_path": str(wav_path),
-                    "expected_messages": sorted(set(expected)),
-                    "signals": signals,
-                    "noise_dbfs": args.noise_dbfs,
-                }
-            )
 
     manifest_path = output_root / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "kind": "synthetic",
-                "generator": args.generator_source,
-                "seed": args.seed,
-                "cases": cases,
-            },
-            indent=2,
-        )
-        + "\n"
+    write_manifest(
+        manifest_path,
+        {
+            "kind": "synthetic",
+            "generator": args.generator_source,
+            "seed": args.seed,
+            "cases": cases,
+        },
     )
     print(manifest_path)
     return 0
+
+
+def build_replay_manifest(args: argparse.Namespace) -> int:
+    output_root = Path(args.output_root).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    cases = []
+    for index, sample_spec in enumerate(args.sample):
+        mode, raw_path = sample_spec.split(":", 1)
+        wav_path = Path(raw_path).resolve()
+        if not wav_path.exists():
+            raise SystemExit(f"missing replay sample: {wav_path}")
+        reference_command = command_from_template(args.reference_cmd, wav=str(wav_path), mode=mode)
+        reference_output = subprocess.run(
+            reference_command, check=True, capture_output=True, text=True
+        )
+        cases.append(
+            {
+                "id": f"{mode}-replay-{index:03d}",
+                "mode": mode,
+                "cohort": "replay",
+                "wav_path": str(wav_path),
+                "expected_messages": parse_decode_lines(reference_output.stdout),
+                "reference_stdout": reference_output.stdout,
+            }
+        )
+    manifest_path = output_root / "manifest.json"
+    write_manifest(
+        manifest_path,
+        {
+            "kind": "replay",
+            "reference_cmd": args.reference_cmd,
+            "cases": cases,
+        },
+    )
+    print(manifest_path)
+    return 0
+
+
+def compare_case(case: dict, rust_template: str, reference_template: str | None) -> dict:
+    wav = case["wav_path"]
+    rust_command = command_from_template(rust_template, wav=wav, mode=case["mode"])
+    rust_output = subprocess.run(rust_command, check=True, capture_output=True, text=True)
+    rust_messages = parse_decode_lines(rust_output.stdout)
+    if reference_template is not None:
+        reference_command = command_from_template(reference_template, wav=wav, mode=case["mode"])
+        reference_output = subprocess.run(
+            reference_command, check=True, capture_output=True, text=True
+        )
+        reference_messages = parse_decode_lines(reference_output.stdout)
+    else:
+        reference_messages = sorted(set(case.get("expected_messages", [])))
+    return {
+        "id": case["id"],
+        "mode": case["mode"],
+        "cohort": case.get("cohort"),
+        "wav_path": wav,
+        "rust_messages": rust_messages,
+        "reference_messages": reference_messages,
+        "match": rust_messages == reference_messages,
+    }
 
 
 def compare_corpus(args: argparse.Namespace) -> int:
@@ -383,28 +476,17 @@ def compare_corpus(args: argparse.Namespace) -> int:
     cases = manifest["cases"]
     results = []
     mismatches = 0
-    for case in cases:
-        wav = case["wav_path"]
-        rust_command = command_from_template(args.rust_cmd, wav=wav, mode=case["mode"])
-        reference_command = command_from_template(args.reference_cmd, wav=wav, mode=case["mode"])
-        rust_output = subprocess.run(rust_command, check=True, capture_output=True, text=True)
-        reference_output = subprocess.run(
-            reference_command, check=True, capture_output=True, text=True
-        )
-        rust_messages = parse_decode_lines(rust_output.stdout)
-        reference_messages = parse_decode_lines(reference_output.stdout)
-        mismatch = rust_messages != reference_messages
-        mismatches += int(mismatch)
-        results.append(
-            {
-                "id": case["id"],
-                "mode": case["mode"],
-                "wav_path": wav,
-                "rust_messages": rust_messages,
-                "reference_messages": reference_messages,
-                "match": not mismatch,
-            }
-        )
+    jobs = args.jobs or os.cpu_count() or 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = [
+            executor.submit(compare_case, case, args.rust_cmd, args.reference_cmd)
+            for case in cases
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            mismatches += int(not result["match"])
+            results.append(result)
+    results.sort(key=lambda item: item["id"])
 
     payload = {
         "manifest": str(Path(args.manifest).resolve()),
@@ -451,10 +533,24 @@ def parse_args() -> argparse.Namespace:
     )
     compare.add_argument(
         "--reference-cmd",
+        help="Shell-style command template with {wav} and optional {mode}. Omit to use frozen expected_messages in the manifest.",
+    )
+    compare.add_argument("--jobs", type=int, help="Parallel decode jobs. Defaults to the host CPU count.")
+    compare.add_argument("--output", help="Optional JSON output path.")
+
+    build_replay = subparsers.add_parser("build-replay", help="Freeze stock outputs for sample WAVs")
+    build_replay.add_argument("--output-root", default="artifacts/mode-parity/replay")
+    build_replay.add_argument(
+        "--sample",
+        action="append",
+        required=True,
+        help="Replay sample in MODE:/absolute/path.wav form. May be repeated.",
+    )
+    build_replay.add_argument(
+        "--reference-cmd",
         required=True,
         help="Shell-style command template with {wav} and optional {mode}.",
     )
-    compare.add_argument("--output", help="Optional JSON output path.")
 
     build_synth = subparsers.add_parser("build-synth", help="Generate a deterministic synthetic corpus")
     build_synth.add_argument(
@@ -473,6 +569,16 @@ def parse_args() -> argparse.Namespace:
     build_synth.add_argument("--output-root", default="artifacts/mode-parity/synthetic")
     build_synth.add_argument("--modes", nargs="+", default=["ft4", "ft2"])
     build_synth.add_argument("--count-per-mode", type=int, default=32)
+    build_synth.add_argument(
+        "--single-count-per-mode",
+        type=int,
+        help="If set, emit exactly this many single-signal cases per mode.",
+    )
+    build_synth.add_argument(
+        "--mixed-count-per-mode",
+        type=int,
+        help="If set, emit exactly this many mixed-signal cases per mode.",
+    )
     build_synth.add_argument("--seed", type=int, default=12345)
     build_synth.add_argument("--max-signals", type=int, default=3)
     build_synth.add_argument("--signal-db-min", type=float, default=-9.0)
@@ -489,6 +595,8 @@ def main() -> int:
         return build_spec_corpus(args)
     if args.command == "compare":
         return compare_corpus(args)
+    if args.command == "build-replay":
+        return build_replay_manifest(args)
     if args.command == "build-synth":
         return build_synth_corpus(args)
     raise AssertionError(f"unsupported command {args.command}")

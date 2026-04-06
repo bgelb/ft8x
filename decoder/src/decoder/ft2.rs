@@ -183,6 +183,7 @@ pub(super) fn decode_ft2(
         }
     }
 
+    let accepted = decodes.len();
     Ok(DecodeReport {
         sample_rate_hz: audio.sample_rate_hz,
         duration_seconds: audio.samples.len() as f32 / audio.sample_rate_hz as f32,
@@ -191,9 +192,9 @@ pub(super) fn decode_ft2(
             frame_count: FT2_NHSYM,
             usable_bins: FT2_NH1,
             examined_candidates: candidates.len(),
-            accepted_candidates: 0,
-            ldpc_codewords: 0,
-            parsed_payloads: 0,
+            accepted_candidates: accepted,
+            ldpc_codewords: accepted,
+            parsed_payloads: accepted,
             top_candidates: candidates,
         },
     })
@@ -250,18 +251,24 @@ fn collect_candidates(samples: &[f32], options: &DecodeOptions) -> Vec<DecodeCan
         *value /= xn;
     }
 
-    let mut raw = Vec::new();
-    for i in nfa..=nfb {
-        raw.push(DecodeCandidate {
+    let mut imax = None;
+    let mut xmax = f32::NEG_INFINITY;
+    for i in (nfa.max(1))..=(nfb.min(FT2_NH1 - 2)) {
+        if savsm[i] > savsm[i - 1] && savsm[i] > savsm[i + 1] && savsm[i] > xmax {
+            xmax = savsm[i];
+            imax = Some(i);
+        }
+    }
+    if let Some(i) = imax.filter(|_| xmax > 1.2) {
+        vec![DecodeCandidate {
             start_seconds: 0.0,
             dt_seconds: 0.0,
-            freq_hz: i as f32 * df,
-            score: savsm[i],
-        });
+            freq_hz: (i as f32 + 1.0) * df,
+            score: xmax,
+        }]
+    } else {
+        Vec::new()
     }
-    raw.sort_by(|left, right| right.score.total_cmp(&left.score));
-    raw.truncate(options.max_candidates.min(128));
-    raw
 }
 
 fn decode_candidate(samples: &[f32], candidate: &DecodeCandidate) -> Option<DecodedMessage> {
@@ -369,6 +376,27 @@ fn decode_candidate(samples: &[f32], candidate: &DecodeCandidate) -> Option<Deco
                 message,
             });
             break;
+        }
+        if nseq == 5 {
+            if let Some((codeword, iterations)) = decoder.decode_relaxed(&llrs) {
+                if codeword[..77].iter().all(|bit| *bit == 0) {
+                    continue;
+                }
+                let payload = unpack_message_for_mode(Mode::Ft2, &codeword)?;
+                let message = payload.to_message(&HashResolver::default());
+                best_decode = Some(DecodedMessage {
+                    utc: "000000".to_string(),
+                    snr_db: (10.0 * (best_sync * best_sync).max(1e-12).log10() - 115.0).round()
+                        as i32,
+                    dt_seconds: best_ibest as f32 / 750.0,
+                    freq_hz: candidate.freq_hz + best_df as f32,
+                    text: message.to_text(),
+                    candidate_score: best_sync,
+                    ldpc_iterations: iterations,
+                    message,
+                });
+                break;
+            }
         }
     }
     best_decode
@@ -611,6 +639,75 @@ impl Ft2ParityMatrix {
             }
         }
         None
+    }
+
+    fn decode_relaxed(&self, llrs: &[f32]) -> Option<(Vec<u8>, usize)> {
+        if llrs.len() != FT2_COLUMNS {
+            return None;
+        }
+
+        let mut tov = [[0.0f32; 3]; FT2_COLUMNS];
+        let mut toc = [[0.0f32; 11]; FT2_ROWS];
+        let mut tanhtoc = [[0.0f32; 11]; FT2_ROWS];
+        let mut zn = [0.0f32; FT2_COLUMNS];
+        let mut best_hard = None;
+        let mut best_ncheck = usize::MAX;
+        let mut best_iteration = 0usize;
+
+        for (row_index, columns) in self.row_columns.iter().enumerate() {
+            for (slot, &column) in columns.iter().enumerate() {
+                toc[row_index][slot] = llrs[column];
+            }
+        }
+
+        for iteration in 0..=FT2_BP_MAX_ITERS {
+            for column in 0..FT2_COLUMNS {
+                zn[column] = llrs[column] + tov[column][0] + tov[column][1] + tov[column][2];
+            }
+
+            let hard: [u8; FT2_COLUMNS] = std::array::from_fn(|index| u8::from(zn[index] > 0.0));
+            let ncheck = self
+                .row_columns
+                .iter()
+                .filter(|row| row.iter().fold(0u8, |acc, &column| acc ^ hard[column]) != 0)
+                .count();
+            if ncheck < best_ncheck && hard[..77].iter().any(|bit| *bit != 0) {
+                best_ncheck = ncheck;
+                best_hard = Some(hard.to_vec());
+                best_iteration = iteration;
+            }
+
+            for (row_index, columns) in self.row_columns.iter().enumerate() {
+                for (slot, &column) in columns.iter().enumerate() {
+                    let column_slot = self.row_column_slots[row_index][slot];
+                    toc[row_index][slot] = zn[column] - tov[column][column_slot];
+                }
+            }
+
+            for (row_index, columns) in self.row_columns.iter().enumerate() {
+                for slot in 0..columns.len() {
+                    tanhtoc[row_index][slot] = (-toc[row_index][slot] / 2.0).tanh();
+                }
+            }
+
+            for column in 0..FT2_COLUMNS {
+                for (slot, &row_index) in FT2_COLUMN_ROWS[column].iter().enumerate() {
+                    let mut product = 1.0f32;
+                    for (row_slot, &other_column) in self.row_columns[row_index].iter().enumerate()
+                    {
+                        if other_column == column {
+                            continue;
+                        }
+                        product *= tanhtoc[row_index][row_slot];
+                    }
+                    tov[column][slot] = 2.0 * atanh_clamped(-product);
+                }
+            }
+        }
+
+        best_hard
+            .filter(|_hard| best_ncheck <= 8)
+            .map(|hard| (hard, best_iteration))
     }
 }
 

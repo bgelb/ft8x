@@ -108,7 +108,7 @@ program ft2_ref_decode
        character(len=61), intent(out) :: line
      end subroutine ft2_decode
   end interface
-  character(len=256) :: wav_path
+  character(len=256) :: wav_path, replay_line
   character(len=17) :: stamp
   character(len=61) :: line
   integer*2 iwave(30000)
@@ -126,6 +126,8 @@ program ft2_ref_decode
   nthreads = 1
   iret = fftwf_init_threads()
   call fftwf_plan_with_nthreads(1)
+  open(24, file='all_ft2.txt', status='replace')
+  close(24)
 
   call get_command_argument(1, wav_path)
   open(10, file=trim(wav_path), status='old', access='stream', iostat=ios)
@@ -136,8 +138,16 @@ program ft2_ref_decode
   read(10) iwave(1:nsamp)
   close(10)
   call ft2_decode(stamp, nfqso, iwave, ndecodes, mycall, hiscall, nrx, line)
-  if (ndecodes .ge. 1) then
-     print '(a)', trim(line)
+  open(24, file='all_ft2.txt', status='old', iostat=ios)
+  if (ios .eq. 0) then
+     do
+        read(24, '(a)', iostat=ios) replay_line
+        if (ios .ne. 0) exit
+        if (replay_line(1:17) .eq. stamp) then
+           print '(a)', trim(replay_line(19:))
+        endif
+     end do
+     close(24)
   endif
 end program ft2_ref_decode
 """
