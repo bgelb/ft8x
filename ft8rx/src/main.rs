@@ -7115,7 +7115,7 @@ fn direct_call_observation_from_decode(
                 }
                 StructuredInfoValue::SignalReport { .. } => {
                     if *acknowledge {
-                        (QsoState::Send73, false)
+                        (QsoState::SendRR73, false)
                     } else {
                         (QsoState::SendSigAck, false)
                     }
@@ -7887,6 +7887,35 @@ mod tests {
             direct_call_observation_from_decode(&decode, "N1VF", now).expect("direct observation");
         assert_eq!(observation.callsign, "PY7ZZ");
         assert_eq!(observation.start_state, QsoState::SendSigAck);
+        assert!(!observation.compound_eligible);
+    }
+
+    #[test]
+    fn acknowledged_signal_direct_to_us_starts_as_send_rr73() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let decode = DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: 2,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: "N1VF JA1IST R-21".to_string(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message: StructuredMessage::Standard {
+                i3: 0,
+                first: standard_call("N1VF"),
+                second: standard_call("JA1IST"),
+                acknowledge: true,
+                info: StructuredInfoField {
+                    raw: 0,
+                    value: StructuredInfoValue::SignalReport { db: -21 },
+                },
+            },
+        };
+        let observation =
+            direct_call_observation_from_decode(&decode, "N1VF", now).expect("direct observation");
+        assert_eq!(observation.callsign, "JA1IST");
+        assert_eq!(observation.start_state, QsoState::SendRR73);
         assert!(!observation.compound_eligible);
     }
 
