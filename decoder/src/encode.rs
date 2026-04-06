@@ -687,6 +687,17 @@ pub fn synthesize_channel_reference_for_mode(
     }
 }
 
+pub(crate) fn synthesize_subtraction_reference_for_mode(
+    mode: Mode,
+    channel_symbols: &[u8],
+    base_freq_hz: f32,
+) -> Vec<Complex32> {
+    match mode {
+        Mode::Ft4 => synthesize_ft4_subtraction_reference(channel_symbols, base_freq_hz),
+        Mode::Ft8 | Mode::Ft2 => synthesize_channel_reference_for_mode(mode, channel_symbols, base_freq_hz),
+    }
+}
+
 pub fn synthesize_channel_reference(
     channel_symbols: &[u8],
     base_freq_hz: f32,
@@ -729,6 +740,44 @@ fn synthesize_gfsk_reference(mode: Mode, channel_symbols: &[u8], base_freq_hz: f
         let tail_index = reference.len() - ramp_samples + offset;
         reference[tail_index] *= end_gain;
     }
+    reference
+}
+
+fn synthesize_ft4_subtraction_reference(
+    channel_symbols: &[u8],
+    base_freq_hz: f32,
+) -> Vec<Complex32> {
+    let spec = Mode::Ft4.spec();
+    let nsym = channel_symbols.len();
+    let nsps = spec.geometry.symbol_samples;
+    let pulse = gfsk_frequency_pulse(1.0, nsps);
+    let mut dphi = vec![0.0f32; (nsym + 2) * nsps];
+    let dphi_peak = 2.0 * std::f32::consts::PI / nsps as f32;
+    for (symbol_index, tone) in channel_symbols.iter().copied().enumerate() {
+        let start = symbol_index * nsps;
+        for offset in 0..(3 * nsps) {
+            dphi[start + offset] += dphi_peak * pulse[offset] * tone as f32;
+        }
+    }
+
+    let mut phase = 0.0f32;
+    let carrier_step =
+        2.0 * std::f32::consts::PI * base_freq_hz / spec.geometry.sample_rate_hz as f32;
+    let mut reference = vec![Complex32::new(0.0, 0.0); (nsym + 2) * nsps];
+    for (index, sample) in reference.iter_mut().enumerate() {
+        *sample = Complex32::new(phase.cos(), phase.sin());
+        phase = (phase + carrier_step + dphi[index]).rem_euclid(2.0 * std::f32::consts::PI);
+    }
+
+    for offset in 0..nsps {
+        let phase = std::f32::consts::PI * offset as f32 / nsps as f32;
+        let start_gain = (1.0 - phase.cos()) * 0.5;
+        let end_gain = (1.0 + phase.cos()) * 0.5;
+        reference[offset] *= start_gain;
+        let tail_index = (nsym + 1) * nsps + offset;
+        reference[tail_index] *= end_gain;
+    }
+
     reference
 }
 

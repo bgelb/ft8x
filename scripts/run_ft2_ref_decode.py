@@ -3,32 +3,28 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
-import tempfile
 from pathlib import Path
 
+from mode_reference import locate_ft2_ref_binary
+from run_stock_decode import run_ft2_ref
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the transient FT2 reference decoder in an isolated cwd.")
     parser.add_argument("wav", help="Input WAV path")
     parser.add_argument(
         "--binary",
-        default="/private/tmp/mode-refs-test/ft2/ft2-ref-decode",
         help="Path to the FT2 reference decoder helper.",
+    )
+    parser.add_argument(
+        "--profile",
+        default="medium",
+        choices=["medium", "deepest"],
+        help="Accepted for interface compatibility; FT2 stock helper ignores this today.",
     )
     args = parser.parse_args()
 
-    binary = Path(args.binary).resolve()
-    wav = Path(args.wav).resolve()
-    with tempfile.TemporaryDirectory(prefix="ft2-ref-decode-") as tmpdir:
-        completed = subprocess.run(
-            [str(binary), str(wav)],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=tmpdir,
-        )
-    print(completed.stdout, end="")
+    binary = locate_ft2_ref_binary("decode", args.binary)
+    print(run_ft2_ref(Path(args.wav).resolve(), str(binary)), end="")
     return 0
 
 

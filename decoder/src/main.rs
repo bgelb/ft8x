@@ -5,8 +5,8 @@ use clap::{ArgAction, Parser, Subcommand};
 use ft8_decoder::{
     DecodeOptions, DecodeProfile, GridReport, Mode, WaveformOptions,
     debug_candidate_truth_wav_file, debug_candidate_wav_file, decode_wav_file,
-    encode_standard_message, encode_standard_message_for_mode, parse_standard_info,
-    write_rectangular_standard_wav,
+    encode_rtty_contest_message, encode_standard_message, encode_standard_message_for_mode,
+    parse_standard_info, write_rectangular_standard_wav, TxRttyExchange,
 };
 
 #[derive(Debug, Parser)]
@@ -48,6 +48,9 @@ enum Command {
         mode: String,
 
         #[arg(long, action = ArgAction::SetTrue)]
+        no_subtraction: bool,
+
+        #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
     },
     DebugCandidate {
@@ -81,6 +84,40 @@ enum Command {
 
         #[arg(long)]
         message: String,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugRttyContestCandidate {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, default_value_t = false)]
+        tu: bool,
+
+        #[arg(long)]
+        first: String,
+
+        #[arg(long)]
+        second: String,
+
+        #[arg(long, default_value_t = false)]
+        acknowledge: bool,
+
+        #[arg(long)]
+        report: u16,
+
+        #[arg(long)]
+        exchange: String,
 
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
@@ -131,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             search_passes,
             profile,
             mode,
+            no_subtraction,
             pretty,
         } => {
             let profile = profile.parse::<DecodeProfile>().map_err(|message| {
@@ -147,6 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_candidates,
                 max_successes,
                 search_passes,
+                disable_subtraction: no_subtraction,
                 ..DecodeOptions::default()
             };
 
@@ -203,6 +242,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|error| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
                 })?;
+            let report = debug_candidate_truth_wav_file(
+                &wav,
+                mode,
+                dt_seconds,
+                freq_hz,
+                &frame.codeword_bits,
+            )?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugRttyContestCandidate {
+            wav,
+            mode,
+            dt_seconds,
+            freq_hz,
+            tu,
+            first,
+            second,
+            acknowledge,
+            report,
+            exchange,
+            pretty,
+        } => {
+            let mode = mode.parse::<Mode>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let exchange = if let Ok(serial) = exchange.parse::<u16>() {
+                TxRttyExchange::Serial(serial)
+            } else {
+                TxRttyExchange::Multiplier(exchange)
+            };
+            let frame = encode_rtty_contest_message(
+                tu,
+                &first,
+                &second,
+                acknowledge,
+                report,
+                &exchange,
+            )
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+            })?;
             let report = debug_candidate_truth_wav_file(
                 &wav,
                 mode,

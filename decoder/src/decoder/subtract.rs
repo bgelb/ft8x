@@ -1,4 +1,5 @@
 use super::*;
+use crate::encode::synthesize_subtraction_reference_for_mode;
 
 #[derive(Debug, Clone, Copy)]
 struct OverlapWindow {
@@ -27,13 +28,18 @@ pub(super) fn subtract_candidate_with_dt_refinement(
         return;
     };
     let spec = success.mode.spec();
-    let start_sample = spec.start_sample_from_dt(success.candidate.dt_seconds);
     let reference =
-        synthesize_channel_reference_for_mode(
+        synthesize_subtraction_reference_for_mode(
             success.mode,
             &channel_symbols,
             success.candidate.freq_hz,
         );
+    let start_sample = match success.mode {
+        Mode::Ft4 => {
+            spec.start_sample_from_dt(success.candidate.dt_seconds) - spec.geometry.symbol_samples as isize
+        }
+        Mode::Ft8 | Mode::Ft2 => spec.start_sample_from_dt(success.candidate.dt_seconds),
+    };
     let offset_samples = if refine_dt {
         let Some(offset_samples) = refined_subtraction_offset(
             audio,
@@ -103,6 +109,9 @@ fn overlapping_window(
 }
 
 fn edge_correction(plan: &SubtractionPlan, frame_len: usize, offset: usize) -> f32 {
+    if plan.spec.mode == Mode::Ft4 {
+        return 1.0;
+    }
     // Compensate for the truncated subtraction filter near the beginning and end of the overlap.
     let edge = offset.min(frame_len - 1 - offset);
     if edge < plan.edge_correction.len() {
@@ -298,7 +307,8 @@ mod tests {
             },
         )
         .expect("audio");
-        let reference = synthesize_channel_reference_for_mode(mode, &frame.channel_symbols, 1_234.0);
+        let reference =
+            crate::encode::synthesize_channel_reference_for_mode(mode, &frame.channel_symbols, 1_234.0);
         let start_sample = mode.spec().start_sample_from_dt(0.0);
 
         assert_eq!(

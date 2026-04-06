@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+from mode_reference import DEFAULT_FT2_REF_GEN
 
 DECODE_PATTERN = re.compile(
     r"^(?:(?P<utc>(?:\d{6}(?:_\d{9})?|\*{6}))\s+)?(?P<snr>-?\d+)\s+(?P<dt>-?\d+(?:\.\d+)?)\s+(?P<freq>\d+)\s+(?:~|\+|RX)\s+(?P<message>.+?)(?:\s+-?\d+\s+-?\d+\s+-?\d+)?\s*$",
@@ -45,15 +46,36 @@ def write_manifest(path: Path, payload: dict) -> Path:
     return path
 
 
-def parse_decode_lines(text: str) -> list[str]:
-    messages: list[str] = []
+def parse_decode_records(text: str) -> list[dict]:
+    records: list[dict] = []
     for line in text.splitlines():
         match = DECODE_PATTERN.match(line.strip())
         if not match:
             continue
-        message = re.sub(r"\s+", " ", match.group("message").strip().upper())
-        messages.append(message)
-    return sorted(set(messages))
+        records.append(
+            {
+                "utc": match.group("utc") or "",
+                "snr_db": int(match.group("snr")),
+                "dt_seconds": float(match.group("dt")),
+                "freq_hz": float(match.group("freq")),
+                "message": re.sub(r"\s+", " ", match.group("message").strip().upper()),
+            }
+        )
+    records.sort(key=lambda record: (record["freq_hz"], record["message"], record["dt_seconds"]))
+    return records
+
+
+def parse_decode_lines(text: str) -> list[str]:
+    return sorted({record["message"] for record in parse_decode_records(text)})
+
+
+def truth_messages_for_case(case: dict) -> list[str]:
+    if "expected_messages" in case:
+        return sorted(set(case.get("expected_messages", [])))
+    expected_message = case.get("expected_message")
+    if expected_message:
+        return [re.sub(r"\s+", " ", expected_message.strip().upper())]
+    return []
 
 
 def command_from_template(template: str, **replacements: str) -> list[str]:
@@ -61,6 +83,11 @@ def command_from_template(template: str, **replacements: str) -> list[str]:
     for key, value in replacements.items():
         rendered = rendered.replace("{" + key + "}", value)
     return shlex.split(rendered)
+
+
+def default_stock_reference_template(profile: str) -> str:
+    script = Path(__file__).resolve().with_name("run_stock_decode.py")
+    return f"python3 {shlex.quote(str(script))} {{wav}} {{mode}} --profile {shlex.quote(profile)}"
 
 
 def render_expected_message(first: str, second: str, info: str, acknowledge: bool) -> str:
@@ -424,13 +451,15 @@ def build_replay_manifest(args: argparse.Namespace) -> int:
         reference_output = subprocess.run(
             reference_command, check=True, capture_output=True, text=True
         )
+        reference_records = parse_decode_records(reference_output.stdout)
         cases.append(
             {
                 "id": f"{mode}-replay-{index:03d}",
                 "mode": mode,
                 "cohort": "replay",
                 "wav_path": str(wav_path),
-                "expected_messages": parse_decode_lines(reference_output.stdout),
+                "expected_messages": [record["message"] for record in reference_records],
+                "expected_records": reference_records,
                 "reference_stdout": reference_output.stdout,
             }
         )
@@ -452,6 +481,7 @@ def compare_case(case: dict, rust_template: str, reference_template: str | None)
     rust_command = command_from_template(rust_template, wav=wav, mode=case["mode"])
     rust_output = subprocess.run(rust_command, check=True, capture_output=True, text=True)
     rust_messages = parse_decode_lines(rust_output.stdout)
+    truth_messages = truth_messages_for_case(case)
     if reference_template is not None:
         reference_command = command_from_template(reference_template, wav=wav, mode=case["mode"])
         reference_output = subprocess.run(
@@ -459,14 +489,23 @@ def compare_case(case: dict, rust_template: str, reference_template: str | None)
         )
         reference_messages = parse_decode_lines(reference_output.stdout)
     else:
-        reference_messages = sorted(set(case.get("expected_messages", [])))
+        reference_messages = truth_messages
+    rust_only_messages = sorted(set(rust_messages) - set(reference_messages))
+    stock_only_messages = sorted(set(reference_messages) - set(rust_messages))
+    stock_missed_truth_messages = sorted(set(truth_messages) - set(reference_messages))
+    rust_only_truth_messages = sorted(set(rust_messages) & set(truth_messages) - set(reference_messages))
     return {
         "id": case["id"],
         "mode": case["mode"],
         "cohort": case.get("cohort"),
         "wav_path": wav,
+        "truth_messages": truth_messages,
         "rust_messages": rust_messages,
         "reference_messages": reference_messages,
+        "rust_only_messages": rust_only_messages,
+        "stock_only_messages": stock_only_messages,
+        "stock_missed_truth_messages": stock_missed_truth_messages,
+        "rust_only_truth_messages": rust_only_truth_messages,
         "match": rust_messages == reference_messages,
     }
 
@@ -474,12 +513,15 @@ def compare_case(case: dict, rust_template: str, reference_template: str | None)
 def compare_corpus(args: argparse.Namespace) -> int:
     manifest = json.loads(Path(args.manifest).read_text())
     cases = manifest["cases"]
+    reference_template = args.reference_cmd
+    if args.use_stock_reference:
+        reference_template = default_stock_reference_template(args.profile)
     results = []
     mismatches = 0
     jobs = args.jobs or os.cpu_count() or 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
         futures = [
-            executor.submit(compare_case, case, args.rust_cmd, args.reference_cmd)
+            executor.submit(compare_case, case, args.rust_cmd, reference_template)
             for case in cases
         ]
         for future in concurrent.futures.as_completed(futures):
@@ -490,6 +532,8 @@ def compare_corpus(args: argparse.Namespace) -> int:
 
     payload = {
         "manifest": str(Path(args.manifest).resolve()),
+        "profile": args.profile,
+        "reference_cmd": reference_template,
         "case_count": len(results),
         "mismatch_count": mismatches,
         "results": results,
@@ -498,6 +542,364 @@ def compare_corpus(args: argparse.Namespace) -> int:
         Path(args.output).write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps({"case_count": len(results), "mismatch_count": mismatches}, indent=2))
     return 0 if mismatches == 0 else 1
+
+
+def run_json_command(command: list[str]) -> dict:
+    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    return json.loads(completed.stdout)
+
+
+def run_decoder_report(
+    decoder_binary: Path,
+    wav_path: str,
+    mode: str,
+    profile: str,
+    *,
+    max_candidates: int,
+    search_passes: int,
+    no_subtraction: bool,
+) -> dict:
+    command = [
+        str(decoder_binary),
+        "decode",
+        wav_path,
+        "--mode",
+        mode,
+        "--profile",
+        profile,
+        "--max-candidates",
+        str(max_candidates),
+        "--search-passes",
+        str(search_passes),
+        "--json",
+    ]
+    if no_subtraction:
+        command.append("--no-subtraction")
+    return run_json_command(command)
+
+
+def run_decoder_debug(
+    decoder_binary: Path,
+    wav_path: str,
+    mode: str,
+    dt_seconds: float,
+    freq_hz: float,
+    message: str | None,
+) -> dict | None:
+    if message is not None:
+        standard_command = [
+            str(decoder_binary),
+            "debug-standard-candidate",
+            wav_path,
+            "--mode",
+            mode,
+            f"--dt-seconds={dt_seconds}",
+            f"--freq-hz={freq_hz}",
+            "--message",
+            message,
+        ]
+        completed = subprocess.run(
+            standard_command,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode == 0:
+            return json.loads(completed.stdout)
+
+    generic_command = [
+        str(decoder_binary),
+        "debug-candidate",
+        wav_path,
+        "--mode",
+        mode,
+        f"--dt-seconds={dt_seconds}",
+        f"--freq-hz={freq_hz}",
+    ]
+    completed = subprocess.run(generic_command, capture_output=True, text=True)
+    if completed.returncode != 0:
+        return None
+    return json.loads(completed.stdout)
+
+
+def reference_records_for_case(case: dict, reference_template: str) -> list[dict]:
+    wav = case["wav_path"]
+    command = command_from_template(reference_template, wav=wav, mode=case["mode"])
+    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    return parse_decode_records(completed.stdout)
+
+
+def lookup_case(manifest: dict, case_id: str) -> dict:
+    for case in manifest["cases"]:
+        if case["id"] == case_id:
+            return case
+    raise KeyError(f"missing case {case_id}")
+
+
+def nearest_top_candidate(report: dict, dt_seconds: float, freq_hz: float) -> dict | None:
+    candidates = report.get("diagnostics", {}).get("top_candidates", [])
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda candidate: (
+            abs(candidate["freq_hz"] - freq_hz),
+            abs(candidate["dt_seconds"] - dt_seconds),
+            -candidate["score"],
+        ),
+    )
+
+
+def has_nearby_top_candidate(
+    report: dict,
+    dt_seconds: float,
+    freq_hz: float,
+    *,
+    dt_tolerance: float = 0.08,
+    freq_tolerance: float = 7.5,
+) -> bool:
+    candidate = nearest_top_candidate(report, dt_seconds, freq_hz)
+    if candidate is None:
+        return False
+    return (
+        abs(candidate["dt_seconds"] - dt_seconds) <= dt_tolerance
+        and abs(candidate["freq_hz"] - freq_hz) <= freq_tolerance
+    )
+
+
+def message_in_decode_report(report: dict, message: str) -> bool:
+    return any(decode["text"].strip().upper() == message for decode in report.get("decodes", []))
+
+
+def closest_decode(report: dict, dt_seconds: float, freq_hz: float) -> dict | None:
+    decodes = report.get("decodes", [])
+    if not decodes:
+        return None
+    return min(
+        decodes,
+        key=lambda decode: (
+            abs(decode["dt_seconds"] - dt_seconds),
+            abs(decode["freq_hz"] - freq_hz),
+            decode["candidate_score"],
+        ),
+    )
+
+
+def classify_stock_only_message(
+    *,
+    stock_record: dict,
+    baseline_report: dict,
+    raised_report: dict,
+    extra_pass_report: dict,
+    no_subtraction_report: dict,
+    stock_debug: dict | None,
+) -> str:
+    message = stock_record["message"]
+    if not has_nearby_top_candidate(raised_report, stock_record["dt_seconds"], stock_record["freq_hz"]):
+        return "search/admission"
+    if message_in_decode_report(no_subtraction_report, message) or message_in_decode_report(
+        extra_pass_report, message
+    ):
+        return "subtraction/pass scheduling"
+    if stock_debug is None:
+        return "search/admission"
+
+    if any(pass_info.get("decoded_text") == message for pass_info in stock_debug.get("passes", [])):
+        return "subtraction/pass scheduling"
+
+    refined_dt = stock_debug.get("refined_dt_seconds", stock_record["dt_seconds"])
+    refined_freq = stock_debug.get("refined_freq_hz", stock_record["freq_hz"])
+    if abs(refined_dt - stock_record["dt_seconds"]) > 0.03 or abs(refined_freq - stock_record["freq_hz"]) > 4.5:
+        return "refine drift"
+    return "metric/LLR extraction"
+
+
+def classify_rust_only_message(message: str, truth_messages: list[str]) -> tuple[str, str]:
+    if message in truth_messages:
+        return "acceptance/gating", "stock miss on truth-labeled signal"
+    return "acceptance/gating", "rust false positive vs stock"
+
+
+def triage_mismatches(args: argparse.Namespace) -> int:
+    compare_payload = json.loads(Path(args.compare).read_text())
+    manifest = json.loads(Path(compare_payload["manifest"]).read_text())
+    decoder_binary = Path(args.decoder_binary).resolve()
+    output_root = Path(args.output_root).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    reference_template = args.reference_cmd or compare_payload.get("reference_cmd")
+    if args.use_stock_reference or not reference_template:
+        reference_template = default_stock_reference_template(args.profile)
+
+    bundle_count = 0
+    mismatch_count = 0
+    for result in compare_payload["results"]:
+        if result["match"]:
+            continue
+        mismatch_count += 1
+        case = lookup_case(manifest, result["id"])
+        mode = case["mode"]
+        wav_path = case["wav_path"]
+        truth_messages = truth_messages_for_case(case)
+        stock_records = reference_records_for_case(case, reference_template)
+        stock_records_by_message: dict[str, list[dict]] = {}
+        for record in stock_records:
+            stock_records_by_message.setdefault(record["message"], []).append(record)
+
+        baseline_report = run_decoder_report(
+            decoder_binary,
+            wav_path,
+            mode,
+            args.profile,
+            max_candidates=args.max_candidates,
+            search_passes=args.search_passes,
+            no_subtraction=False,
+        )
+        raised_report = run_decoder_report(
+            decoder_binary,
+            wav_path,
+            mode,
+            args.profile,
+            max_candidates=args.raised_max_candidates,
+            search_passes=args.search_passes,
+            no_subtraction=False,
+        )
+        extra_pass_report = run_decoder_report(
+            decoder_binary,
+            wav_path,
+            mode,
+            args.profile,
+            max_candidates=args.raised_max_candidates,
+            search_passes=args.extra_search_passes,
+            no_subtraction=False,
+        )
+        no_subtraction_report = run_decoder_report(
+            decoder_binary,
+            wav_path,
+            mode,
+            args.profile,
+            max_candidates=args.raised_max_candidates,
+            search_passes=args.search_passes,
+            no_subtraction=True,
+        )
+
+        bundle_dir = output_root / result["id"]
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        bundle = {
+            "id": result["id"],
+            "mode": mode,
+            "cohort": case.get("cohort"),
+            "wav_path": wav_path,
+            "truth_messages": truth_messages,
+            "stock_messages": [record["message"] for record in stock_records],
+            "rust_messages": [decode["text"].strip().upper() for decode in baseline_report.get("decodes", [])],
+            "stock_only": [],
+            "rust_only": [],
+            "baseline_report": baseline_report,
+            "raised_report": raised_report,
+            "extra_pass_report": extra_pass_report,
+            "no_subtraction_report": no_subtraction_report,
+        }
+
+        for message in sorted(set(result.get("stock_only_messages", []))):
+            for ordinal, stock_record in enumerate(stock_records_by_message.get(message, [])):
+                stock_debug = run_decoder_debug(
+                    decoder_binary,
+                    wav_path,
+                    mode,
+                    stock_record["dt_seconds"],
+                    stock_record["freq_hz"],
+                    message,
+                )
+                best_rust_decode = closest_decode(
+                    baseline_report, stock_record["dt_seconds"], stock_record["freq_hz"]
+                )
+                best_rust_candidate = nearest_top_candidate(
+                    raised_report, stock_record["dt_seconds"], stock_record["freq_hz"]
+                )
+                best_rust_debug = None
+                if best_rust_decode is not None:
+                    best_rust_debug = run_decoder_debug(
+                        decoder_binary,
+                        wav_path,
+                        mode,
+                        best_rust_decode["dt_seconds"],
+                        best_rust_decode["freq_hz"],
+                        best_rust_decode["text"],
+                    )
+                elif best_rust_candidate is not None:
+                    best_rust_debug = run_decoder_debug(
+                        decoder_binary,
+                        wav_path,
+                        mode,
+                        best_rust_candidate["dt_seconds"],
+                        best_rust_candidate["freq_hz"],
+                        None,
+                    )
+                stage = classify_stock_only_message(
+                    stock_record=stock_record,
+                    baseline_report=baseline_report,
+                    raised_report=raised_report,
+                    extra_pass_report=extra_pass_report,
+                    no_subtraction_report=no_subtraction_report,
+                    stock_debug=stock_debug,
+                )
+                artifact = {
+                    "message": message,
+                    "ordinal": ordinal,
+                    "classification": stage,
+                    "stock_record": stock_record,
+                    "closest_baseline_decode": best_rust_decode,
+                    "closest_raised_top_candidate": best_rust_candidate,
+                    "stock_coordinate_debug": stock_debug,
+                    "best_rust_coordinate_debug": best_rust_debug,
+                }
+                bundle["stock_only"].append(artifact)
+                bundle_count += 1
+
+        for message in sorted(set(result.get("rust_only_messages", []))):
+            stage, issue_kind = classify_rust_only_message(message, truth_messages)
+            rust_decode = next(
+                (
+                    decode
+                    for decode in baseline_report.get("decodes", [])
+                    if decode["text"].strip().upper() == message
+                ),
+                None,
+            )
+            rust_debug = None
+            if rust_decode is not None:
+                rust_debug = run_decoder_debug(
+                    decoder_binary,
+                    wav_path,
+                    mode,
+                    rust_decode["dt_seconds"],
+                    rust_decode["freq_hz"],
+                    message,
+                )
+            bundle["rust_only"].append(
+                {
+                    "message": message,
+                    "classification": stage,
+                    "issue_kind": issue_kind,
+                    "rust_decode": rust_decode,
+                    "rust_coordinate_debug": rust_debug,
+                }
+            )
+            bundle_count += 1
+
+        write_manifest(bundle_dir / "triage.json", bundle)
+
+    summary = {
+        "compare": str(Path(args.compare).resolve()),
+        "manifest": compare_payload["manifest"],
+        "profile": args.profile,
+        "reference_cmd": reference_template,
+        "mismatch_cases": mismatch_count,
+        "mismatch_bundles": bundle_count,
+        "output_root": str(output_root),
+    }
+    write_manifest(output_root / "summary.json", summary)
+    print(json.dumps(summary, indent=2))
+    return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -535,6 +937,17 @@ def parse_args() -> argparse.Namespace:
         "--reference-cmd",
         help="Shell-style command template with {wav} and optional {mode}. Omit to use frozen expected_messages in the manifest.",
     )
+    compare.add_argument(
+        "--use-stock-reference",
+        action="store_true",
+        help="Use the canonical stock reference entrypoint for the requested profile.",
+    )
+    compare.add_argument(
+        "--profile",
+        default="medium",
+        choices=["medium", "deepest"],
+        help="Reference profile when --use-stock-reference is enabled.",
+    )
     compare.add_argument("--jobs", type=int, help="Parallel decode jobs. Defaults to the host CPU count.")
     compare.add_argument("--output", help="Optional JSON output path.")
 
@@ -565,7 +978,11 @@ def parse_args() -> argparse.Namespace:
         help="Whether to generate source signals with the local Rust encoder or reference helpers.",
     )
     build_synth.add_argument("--reference-ft4-gen", help="Path to the transient FT4 reference generator.")
-    build_synth.add_argument("--reference-ft2-gen", help="Path to the transient FT2 reference generator.")
+    build_synth.add_argument(
+        "--reference-ft2-gen",
+        default=str(DEFAULT_FT2_REF_GEN),
+        help="Path to the transient FT2 reference generator.",
+    )
     build_synth.add_argument("--output-root", default="artifacts/mode-parity/synthetic")
     build_synth.add_argument("--modes", nargs="+", default=["ft4", "ft2"])
     build_synth.add_argument("--count-per-mode", type=int, default=32)
@@ -586,6 +1003,38 @@ def parse_args() -> argparse.Namespace:
     build_synth.add_argument("--noise-dbfs", type=float, default=-28.0)
     build_synth.add_argument("--total-seconds", type=float)
 
+    triage = subparsers.add_parser("triage", help="Emit one mismatch triage bundle per failing case")
+    triage.add_argument("--compare", required=True, help="JSON emitted by the compare subcommand.")
+    triage.add_argument(
+        "--decoder-binary",
+        default="decoder/target/release/ft8-decoder",
+        help="Path to the local Rust decoder binary.",
+    )
+    triage.add_argument(
+        "--output-root",
+        required=True,
+        help="Directory that will receive one triage bundle per mismatching case.",
+    )
+    triage.add_argument(
+        "--reference-cmd",
+        help="Shell-style command template with {wav} and optional {mode}. Defaults to the canonical stock entrypoint.",
+    )
+    triage.add_argument(
+        "--use-stock-reference",
+        action="store_true",
+        help="Ignore any frozen reference output and rerun the canonical stock decoder for triage.",
+    )
+    triage.add_argument(
+        "--profile",
+        default="medium",
+        choices=["medium", "deepest"],
+        help="Decode profile to use for both stock and Rust triage reruns.",
+    )
+    triage.add_argument("--max-candidates", type=int, default=600)
+    triage.add_argument("--raised-max-candidates", type=int, default=4000)
+    triage.add_argument("--search-passes", type=int, default=3)
+    triage.add_argument("--extra-search-passes", type=int, default=6)
+
     return parser.parse_args()
 
 
@@ -599,6 +1048,8 @@ def main() -> int:
         return build_replay_manifest(args)
     if args.command == "build-synth":
         return build_synth_corpus(args)
+    if args.command == "triage":
+        return triage_mismatches(args)
     raise AssertionError(f"unsupported command {args.command}")
 
 

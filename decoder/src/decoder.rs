@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -8,7 +8,7 @@ use rustfft::{Fft, FftPlanner};
 use serde::Serialize;
 
 use crate::encode::{
-    channel_symbols_from_codeword_bits_for_mode, synthesize_channel_reference_for_mode,
+    channel_symbols_from_codeword_bits_for_mode,
 };
 use crate::ldpc::ParityMatrix;
 use crate::message::{
@@ -84,6 +84,7 @@ pub struct DecodeOptions {
     pub target_freq_hz: f32,
     pub tx_freq_hz: f32,
     pub ap_width_hz: f32,
+    pub disable_subtraction: bool,
 }
 
 impl Default for DecodeOptions {
@@ -99,6 +100,7 @@ impl Default for DecodeOptions {
             target_freq_hz: 1_500.0,
             tx_freq_hz: 1_500.0,
             ap_width_hz: 75.0,
+            disable_subtraction: false,
         }
     }
 }
@@ -116,11 +118,16 @@ impl DecodeOptions {
         }
     }
 
-    fn max_osd_passes(&self, outer_pass: usize, _freq_hz: f32) -> isize {
-        match self.profile {
-            DecodeProfile::Quick => -1,
-            DecodeProfile::Medium => 0,
-            DecodeProfile::Deepest => {
+    fn max_osd_passes(&self, outer_pass: usize, freq_hz: f32) -> isize {
+        match (self.mode, self.profile) {
+            (_, DecodeProfile::Quick) => -1,
+            (Mode::Ft4, DecodeProfile::Medium) => -1,
+            (_, DecodeProfile::Medium) => 0,
+            (Mode::Ft4, DecodeProfile::Deepest) => {
+                let near_qso = (freq_hz - self.target_freq_hz).abs() <= self.ap_width_hz.max(80.0);
+                if near_qso { 3 } else { 2 }
+            }
+            (_, DecodeProfile::Deepest) => {
                 if outer_pass == 0 {
                     0
                 } else {
@@ -1130,6 +1137,9 @@ mod tests {
             1.0,
             0,
             false,
+            &[],
+            &HashResolver::default(),
+            &std::collections::HashSet::new(),
             ParityMatrix::global(),
             &mut counters,
         )
