@@ -56,6 +56,7 @@ const BANDMAP_MAX_AGE_SLOTS: u64 = 10;
 const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
+const CQ_ACTIVITY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_QUEUE_NO_MSG_RETRY_DELAY: Duration = Duration::from_secs(35);
 const DEFAULT_QUEUE_NO_FWD_RETRY_DELAY: Duration = Duration::from_secs(300);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -233,6 +234,9 @@ enum QueueCommand {
         kind: QueueRetryDelayKind,
         retry_delay_seconds: u64,
     },
+    SetAutoAddAllDecodedCalls {
+        enabled: bool,
+    },
     SetAutoAddDirect {
         enabled: bool,
     },
@@ -244,6 +248,12 @@ enum QueueCommand {
     },
     SetCqPercent {
         percent: u8,
+    },
+    SetPauseCqWhenFewUniqueCalls {
+        enabled: bool,
+    },
+    SetCqPauseMinUniqueCalls5m {
+        count: u32,
     },
     SetCompoundRr73Handoff {
         enabled: bool,
@@ -437,6 +447,11 @@ struct QueueFlagRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct QueueCountRequest {
+    count: u32,
+}
+
+#[derive(Debug, Deserialize)]
 struct QueueTxFreqRequest {
     slot_family: String,
     tx_freq_hz: f32,
@@ -477,10 +492,14 @@ struct ApiStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 struct WebQueueSnapshot {
     auto_enabled: bool,
+    auto_add_all_decoded_calls: bool,
     auto_add_direct_calls: bool,
     ignore_direct_calls_from_recently_worked: bool,
     cq_enabled: bool,
     cq_percent: u8,
+    pause_cq_when_few_unique_calls: bool,
+    cq_pause_min_unique_calls_5m: u32,
+    unique_calls_last_5m: u32,
     use_compound_rr73_handoff: bool,
     use_compound_73_once_handoff: bool,
     use_compound_for_direct_signal_callers: bool,
@@ -590,10 +609,13 @@ struct WorkQueueState {
     auto_enabled: bool,
     our_call: String,
     current_band: Option<String>,
+    auto_add_all_decoded_calls: bool,
     auto_add_direct_calls: bool,
     ignore_direct_calls_from_recently_worked: bool,
     cq_enabled: bool,
     cq_percent: u8,
+    pause_cq_when_few_unique_calls: bool,
+    cq_pause_min_unique_calls_5m: u32,
     use_compound_rr73_handoff: bool,
     use_compound_73_once_handoff: bool,
     use_compound_for_direct_signal_callers: bool,
@@ -765,12 +787,15 @@ impl WorkQueueState {
             auto_enabled: false,
             our_call: config.station.our_call.clone(),
             current_band: None,
+            auto_add_all_decoded_calls: config.queue.auto_add_all_decoded_calls_default,
             auto_add_direct_calls: config.queue.auto_add_direct_calls_default,
             ignore_direct_calls_from_recently_worked: config
                 .queue
                 .ignore_direct_calls_from_recently_worked_default,
             cq_enabled: config.queue.cq_enabled_default,
             cq_percent: config.queue.cq_percent_default.min(100),
+            pause_cq_when_few_unique_calls: config.queue.pause_cq_when_few_unique_calls_default,
+            cq_pause_min_unique_calls_5m: config.queue.cq_pause_min_unique_calls_5m_default,
             use_compound_rr73_handoff: config.queue.use_compound_rr73_handoff_default,
             use_compound_73_once_handoff: config.queue.use_compound_73_once_handoff_default,
             use_compound_for_direct_signal_callers: config
@@ -999,6 +1024,11 @@ impl WorkQueueState {
         info!(enabled, "queue_auto_changed");
     }
 
+    fn set_auto_add_all_decoded_calls(&mut self, enabled: bool) {
+        self.auto_add_all_decoded_calls = enabled;
+        info!(enabled, "queue_auto_add_all_decoded_changed");
+    }
+
     fn set_auto_add_direct_calls(&mut self, enabled: bool) {
         self.auto_add_direct_calls = enabled;
         info!(enabled, "queue_auto_add_direct_changed");
@@ -1017,6 +1047,19 @@ impl WorkQueueState {
     fn set_cq_percent(&mut self, percent: u8) {
         self.cq_percent = percent.min(100);
         info!(cq_percent = self.cq_percent, "queue_cq_percent_changed");
+    }
+
+    fn set_pause_cq_when_few_unique_calls(&mut self, enabled: bool) {
+        self.pause_cq_when_few_unique_calls = enabled;
+        info!(enabled, "queue_pause_cq_low_activity_changed");
+    }
+
+    fn set_cq_pause_min_unique_calls_5m(&mut self, count: u32) {
+        self.cq_pause_min_unique_calls_5m = count;
+        info!(
+            min_unique_calls_5m = self.cq_pause_min_unique_calls_5m,
+            "queue_cq_low_activity_threshold_changed"
+        );
     }
 
     fn set_use_compound_rr73_handoff(&mut self, enabled: bool) {
@@ -1212,6 +1255,8 @@ impl WorkQueueState {
         qso_busy: bool,
         tune_active: bool,
     ) -> Option<QueueDispatch> {
+        let unique_calls_last_5m =
+            tracker.unique_sender_count_since(now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now));
         self.prune_recent_worked(now);
         self.refresh_entry_observed_times(tracker);
         self.prune_queue(now, tracker);
@@ -1238,7 +1283,8 @@ impl WorkQueueState {
             return Some(dispatch);
         }
         let normal_pick = self.pick_oldest_ready_normal(now, tracker);
-        if self.cq_enabled && self.should_choose_cq(now) {
+        let cq_paused_for_low_activity = self.cq_paused_for_low_activity(unique_calls_last_5m);
+        if self.cq_enabled && !cq_paused_for_low_activity && self.should_choose_cq(now) {
             let tx_slot_family = if self.next_cq_parity_flipped {
                 Some(qso::slot_family(next_slot_boundary(now)).opposite())
             } else {
@@ -1277,11 +1323,21 @@ impl WorkQueueState {
             return Some(dispatch);
         }
         self.scheduler_status = if self.entries.is_empty() {
-            if self.cq_enabled {
+            if self.cq_enabled && cq_paused_for_low_activity {
+                format!(
+                    "idle; cq paused at {}/{} unique calls in 5m",
+                    unique_calls_last_5m, self.cq_pause_min_unique_calls_5m
+                )
+            } else if self.cq_enabled {
                 format!("idle; cq skipped at {}%", self.cq_percent)
             } else {
                 "queue empty".to_string()
             }
+        } else if cq_paused_for_low_activity {
+            format!(
+                "no ready queued stations; cq paused at {}/{} unique calls in 5m",
+                unique_calls_last_5m, self.cq_pause_min_unique_calls_5m
+            )
         } else {
             "no ready queued stations".to_string()
         };
@@ -1289,6 +1345,9 @@ impl WorkQueueState {
     }
 
     fn web_snapshot(&self, tracker: &StationTracker, now: SystemTime) -> WebQueueSnapshot {
+        let unique_calls_last_5m = tracker
+            .unique_sender_count_since(now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now))
+            as u32;
         let mut entries = self
             .entries
             .iter()
@@ -1316,10 +1375,14 @@ impl WorkQueueState {
         entries.sort_by_key(|entry| !entry.priority_direct);
         WebQueueSnapshot {
             auto_enabled: self.auto_enabled,
+            auto_add_all_decoded_calls: self.auto_add_all_decoded_calls,
             auto_add_direct_calls: self.auto_add_direct_calls,
             ignore_direct_calls_from_recently_worked: self.ignore_direct_calls_from_recently_worked,
             cq_enabled: self.cq_enabled,
             cq_percent: self.cq_percent,
+            pause_cq_when_few_unique_calls: self.pause_cq_when_few_unique_calls,
+            cq_pause_min_unique_calls_5m: self.cq_pause_min_unique_calls_5m,
+            unique_calls_last_5m,
             use_compound_rr73_handoff: self.use_compound_rr73_handoff,
             use_compound_73_once_handoff: self.use_compound_73_once_handoff,
             use_compound_for_direct_signal_callers: self.use_compound_for_direct_signal_callers,
@@ -1586,6 +1649,11 @@ impl WorkQueueState {
         }
         let roll = ((slot_index(now).wrapping_mul(1103515245).wrapping_add(12345)) % 100) as u8;
         roll < self.cq_percent
+    }
+
+    fn cq_paused_for_low_activity(&self, unique_calls_last_5m: usize) -> bool {
+        self.pause_cq_when_few_unique_calls
+            && unique_calls_last_5m < self.cq_pause_min_unique_calls_5m as usize
     }
 }
 
@@ -2502,13 +2570,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
                 <option value="100">100%</option>
               </select>
             </div>
+            <div class="input-wrap">
+              <div class="label">CQ 5m Unique Min</div>
+              <input id="queue-cq-min-unique-calls-5m" class="control-input" type="number" min="0" max="1000" step="1">
+            </div>
+            <div class="input-wrap">
+              <div class="label">5m Unique Now</div>
+              <div class="value small" id="queue-unique-calls-last-5m">0</div>
+            </div>
             <button id="queue-next-cq-parity" class="button secondary" type="button">Flip Next CQ Parity</button>
             <button id="queue-clear" class="button secondary" type="button">Clear Queue</button>
           </div>
         <div class="control-row">
+          <label class="toggle-row"><input id="queue-auto-add-decoded" type="checkbox"> Auto add eligible decodes</label>
           <label class="toggle-row"><input id="queue-auto-add-direct" type="checkbox"> Auto add direct calls</label>
           <label class="toggle-row"><input id="queue-ignore-direct-worked" type="checkbox"> Ignore direct calls from already worked stations</label>
           <label class="toggle-row"><input id="queue-cq-enabled" type="checkbox"> Enable CQ</label>
+          <label class="toggle-row"><input id="queue-pause-cq-low-activity" type="checkbox"> Pause CQ on low 5m activity</label>
           <label class="toggle-row"><input id="queue-compound-rr73" type="checkbox"> Use compound RR73 handoff</label>
           <label class="toggle-row"><input id="queue-compound-73-once" type="checkbox"> Use compound 73-once handoff</label>
           <label class="toggle-row"><input id="queue-compound-direct-signal" type="checkbox"> Use compound for direct signal callers</label>
@@ -2803,6 +2881,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/queue/auto', { enabled });
       scheduleRefresh(10);
     }
+    async function updateQueueAutoAddDecoded(enabled) {
+      await postJson('/api/queue/auto-add-decoded', { enabled });
+      scheduleRefresh(10);
+    }
     async function updateQueueAutoAddDirect(enabled) {
       await postJson('/api/queue/auto-add-direct', { enabled });
       scheduleRefresh(10);
@@ -2829,6 +2911,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function updateQueueCqPercent(percent) {
       await postJson('/api/queue/cq-percent', { percent });
+      scheduleRefresh(10);
+    }
+    async function updateQueuePauseCqLowActivity(enabled) {
+      await postJson('/api/queue/pause-cq-low-activity', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueCqMinUniqueCalls5m(count) {
+      await postJson('/api/queue/cq-min-unique-calls-5m', { count });
       scheduleRefresh(10);
     }
     async function updateQueueTxFreq(txParity, txFreqHz) {
@@ -3184,9 +3274,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const status = document.getElementById('queue-status');
       const noMessageRetryDelay = document.getElementById('queue-no-message-retry-delay');
       const noForwardRetryDelay = document.getElementById('queue-no-forward-retry-delay');
+      const autoAddDecoded = document.getElementById('queue-auto-add-decoded');
       const autoAddDirect = document.getElementById('queue-auto-add-direct');
       const ignoreDirectWorked = document.getElementById('queue-ignore-direct-worked');
       const cqEnabled = document.getElementById('queue-cq-enabled');
+      const pauseCqLowActivity = document.getElementById('queue-pause-cq-low-activity');
+      const cqMinUniqueCalls5m = document.getElementById('queue-cq-min-unique-calls-5m');
+      const uniqueCallsLast5m = document.getElementById('queue-unique-calls-last-5m');
       const compoundRr73 = document.getElementById('queue-compound-rr73');
       const compound73Once = document.getElementById('queue-compound-73-once');
       const compoundDirectSignal = document.getElementById('queue-compound-direct-signal');
@@ -3197,13 +3291,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       count.textContent = `${(queue.entries || []).length} queued`;
       status.textContent = queue.scheduler_status || 'auto disabled';
       clearButton.disabled = !(queue.entries || []).length;
+      autoAddDecoded.checked = !!queue.auto_add_all_decoded_calls;
       autoAddDirect.checked = !!queue.auto_add_direct_calls;
       ignoreDirectWorked.checked = !!queue.ignore_direct_calls_from_recently_worked;
       cqEnabled.checked = !!queue.cq_enabled;
+      pauseCqLowActivity.checked = !!queue.pause_cq_when_few_unique_calls;
       compoundRr73.checked = !!queue.use_compound_rr73_handoff;
       compound73Once.checked = !!queue.use_compound_73_once_handoff;
       compoundDirectSignal.checked = !!queue.use_compound_for_direct_signal_callers;
       cqPercent.value = String(queue.cq_percent ?? 80);
+      uniqueCallsLast5m.textContent = String(queue.unique_calls_last_5m ?? 0);
       nextCqParity.textContent = queue.next_cq_parity_flipped ? 'Next CQ Parity Flipped' : 'Flip Next CQ Parity';
       if (
         noMessageRetryDelay.value === ''
@@ -3216,6 +3313,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
         || Number(noForwardRetryDelay.value) !== Number(queue.no_forward_retry_delay_seconds)
       ) {
         noForwardRetryDelay.value = String(queue.no_forward_retry_delay_seconds ?? 300);
+      }
+      if (
+        cqMinUniqueCalls5m.value === ''
+        || Number(cqMinUniqueCalls5m.value) !== Number(queue.cq_pause_min_unique_calls_5m)
+      ) {
+        cqMinUniqueCalls5m.value = String(queue.cq_pause_min_unique_calls_5m ?? 3);
       }
       list.innerHTML = `
         <div class="queue-item queue-head">
@@ -3479,6 +3582,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById('queue-clear').addEventListener('click', () => {
       clearQueue().catch((error) => console.error(error));
     });
+    document.getElementById('queue-auto-add-decoded').addEventListener('change', (event) => {
+      updateQueueAutoAddDecoded(event.currentTarget.checked).catch((error) => console.error(error));
+    });
     document.getElementById('queue-auto-add-direct').addEventListener('change', (event) => {
       updateQueueAutoAddDirect(event.currentTarget.checked).catch((error) => console.error(error));
     });
@@ -3487,6 +3593,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     });
     document.getElementById('queue-cq-enabled').addEventListener('change', (event) => {
       updateQueueCqEnabled(event.currentTarget.checked).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-pause-cq-low-activity').addEventListener('change', (event) => {
+      updateQueuePauseCqLowActivity(event.currentTarget.checked).catch((error) => console.error(error));
     });
     document.getElementById('queue-compound-rr73').addEventListener('change', (event) => {
       updateQueueCompoundRr73Handoff(event.currentTarget.checked).catch((error) => console.error(error));
@@ -3499,6 +3608,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     });
     document.getElementById('queue-cq-percent').addEventListener('change', (event) => {
       updateQueueCqPercent(Number(event.currentTarget.value)).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-cq-min-unique-calls-5m').addEventListener('change', (event) => {
+      const value = Number(event.currentTarget.value);
+      if (!Number.isFinite(value) || value < 0 || value > 1000) {
+        if (lastSnapshot) renderQueue(lastSnapshot);
+        return;
+      }
+      updateQueueCqMinUniqueCalls5m(Math.round(value)).catch((error) => console.error(error));
     });
     document.getElementById('queue-next-cq-parity').addEventListener('click', () => {
       fetchJson('/api/queue/next-cq-parity', { method: 'POST' }).then(refresh).catch((error) => console.error(error));
@@ -3553,6 +3670,10 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route("/api/queue/clear", post(api_queue_clear_handler))
                 .route("/api/queue/auto", post(api_queue_auto_handler))
                 .route(
+                    "/api/queue/auto-add-decoded",
+                    post(api_queue_auto_add_decoded_handler),
+                )
+                .route(
                     "/api/queue/auto-add-direct",
                     post(api_queue_auto_add_direct_handler),
                 )
@@ -3562,6 +3683,14 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 )
                 .route("/api/queue/cq-enabled", post(api_queue_cq_enabled_handler))
                 .route("/api/queue/cq-percent", post(api_queue_cq_percent_handler))
+                .route(
+                    "/api/queue/pause-cq-low-activity",
+                    post(api_queue_pause_cq_low_activity_handler),
+                )
+                .route(
+                    "/api/queue/cq-min-unique-calls-5m",
+                    post(api_queue_cq_min_unique_calls_5m_handler),
+                )
                 .route(
                     "/api/queue/compound-rr73-handoff",
                     post(api_queue_compound_rr73_handoff_handler),
@@ -3703,6 +3832,24 @@ async fn api_queue_auto_handler(
     )
 }
 
+async fn api_queue_auto_add_decoded_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetAutoAddAllDecodedCalls {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue decoded auto-add updated".to_string(),
+        }),
+    )
+}
+
 async fn api_queue_auto_add_direct_handler(
     State(state): State<WebAppState>,
     Json(request): Json<QueueFlagRequest>,
@@ -3774,6 +3921,51 @@ async fn api_queue_cq_percent_handler(
         Json(ApiStatus {
             ok: true,
             message: "queue cq percent updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_pause_cq_low_activity_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetPauseCqWhenFewUniqueCalls {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue low-activity cq pause updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_cq_min_unique_calls_5m_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueCountRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    if request.count > 1000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "count must be between 0 and 1000".to_string(),
+            }),
+        );
+    }
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetCqPauseMinUniqueCalls5m {
+            count: request.count,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue cq 5m unique threshold updated".to_string(),
         }),
     )
 }
@@ -4586,6 +4778,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     kind,
                     retry_delay_seconds,
                 } => work_queue.set_retry_delay(kind, Duration::from_secs(retry_delay_seconds)),
+                QueueCommand::SetAutoAddAllDecodedCalls { enabled } => {
+                    work_queue.set_auto_add_all_decoded_calls(enabled)
+                }
                 QueueCommand::SetAutoAddDirect { enabled } => {
                     work_queue.set_auto_add_direct_calls(enabled)
                 }
@@ -4594,6 +4789,12 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 }
                 QueueCommand::SetCqEnabled { enabled } => work_queue.set_cq_enabled(enabled),
                 QueueCommand::SetCqPercent { percent } => work_queue.set_cq_percent(percent),
+                QueueCommand::SetPauseCqWhenFewUniqueCalls { enabled } => {
+                    work_queue.set_pause_cq_when_few_unique_calls(enabled)
+                }
+                QueueCommand::SetCqPauseMinUniqueCalls5m { count } => {
+                    work_queue.set_cq_pause_min_unique_calls_5m(count)
+                }
                 QueueCommand::SetCompoundRr73Handoff { enabled } => {
                     work_queue.set_use_compound_rr73_handoff(enabled)
                 }
@@ -4743,6 +4944,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 dt_frame_history.push_back(display.full_decodes.clone());
                                 station_tracker.ingest_frame(slot_start, &display.full_decodes);
                                 update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
+                                maybe_auto_add_decoded_calls(
+                                    &mut work_queue,
+                                    &station_tracker,
+                                    &qso_controller,
+                                    &display.full_decodes,
+                                    slot_start,
+                                );
                                 maybe_track_priority_directs(
                                     &mut work_queue,
                                     &mut qso_controller,
@@ -6669,6 +6877,16 @@ impl StationTracker {
             })
             .collect()
     }
+
+    fn unique_sender_count_since(&self, since: SystemTime) -> usize {
+        let mut calls = BTreeSet::new();
+        for entry in &self.logs {
+            if entry.received_at >= since {
+                calls.insert(entry.sender_call.clone());
+            }
+        }
+        calls.len()
+    }
 }
 
 fn qso_peer_from_first_field(
@@ -6932,6 +7150,37 @@ fn maybe_track_priority_directs(
             if let Err(message) = work_queue.add_direct_observation(observation, slot_start) {
                 warn!(message, "queue_direct_add_failed");
             }
+        }
+    }
+}
+
+fn maybe_auto_add_decoded_calls(
+    work_queue: &mut WorkQueueState,
+    station_tracker: &StationTracker,
+    qso_controller: &QsoController,
+    decodes: &[DecodedMessage],
+    now: SystemTime,
+) {
+    if !work_queue.auto_add_all_decoded_calls {
+        return;
+    }
+    let active_partner = qso_controller.active_partner_call();
+    let mut callsigns = BTreeSet::new();
+    for decode in decodes {
+        let Some(callsign) = semantic_sender_call(&decode.message) else {
+            continue;
+        };
+        if active_partner.as_deref() == Some(callsign.as_str()) {
+            continue;
+        }
+        callsigns.insert(callsign);
+    }
+    for callsign in callsigns {
+        let Some(info) = station_tracker.start_info(&callsign) else {
+            continue;
+        };
+        if let Err(message) = work_queue.add_station(&callsign, info.last_heard_at, now) {
+            warn!(callsign, message, "queue_auto_add_decoded_failed");
         }
     }
 }
@@ -7276,10 +7525,13 @@ mod tests {
                 tx_freq_max_hz: 3500.0,
             },
             queue: QueueConfig {
+                auto_add_all_decoded_calls_default: false,
                 auto_add_direct_calls_default: true,
                 ignore_direct_calls_from_recently_worked_default: true,
                 cq_enabled_default: false,
                 cq_percent_default: 80,
+                pause_cq_when_few_unique_calls_default: false,
+                cq_pause_min_unique_calls_5m_default: 3,
                 use_compound_rr73_handoff_default: true,
                 use_compound_73_once_handoff_default: false,
                 use_compound_for_direct_signal_callers_default: false,
@@ -7905,6 +8157,64 @@ mod tests {
                     now + Duration::from_secs(15)
                 )))
             ),
+            _ => panic!("expected cq dispatch"),
+        }
+    }
+
+    #[test]
+    fn auto_add_decoded_calls_queues_unique_non_active_callers() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_band(Some("40m".to_string()));
+        queue.set_auto_add_all_decoded_calls(true);
+        let mut tracker = StationTracker::default();
+        let controller = qso::QsoController::new(config, Box::new(NoopTxBackend));
+
+        let alpha = cq_decode("ALPHA");
+        let bravo = cq_decode("BRAVO");
+        tracker.ingest_frame(now, &[alpha.clone(), bravo.clone(), alpha]);
+
+        maybe_auto_add_decoded_calls(
+            &mut queue,
+            &tracker,
+            &controller,
+            &[cq_decode("ALPHA"), cq_decode("BRAVO"), cq_decode("ALPHA")],
+            now,
+        );
+
+        let calls = queue
+            .entries
+            .iter()
+            .map(|entry| entry.callsign.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec!["ALPHA".to_string(), "BRAVO".to_string()]);
+    }
+
+    #[test]
+    fn cq_pause_low_activity_blocks_cq_dispatch_until_threshold_met() {
+        let now = UNIX_EPOCH + Duration::from_secs(60);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let mut tracker = StationTracker::default();
+        queue.auto_enabled = true;
+        queue.cq_enabled = true;
+        queue.cq_percent = 100;
+        queue.set_pause_cq_when_few_unique_calls(true);
+        queue.set_cq_pause_min_unique_calls_5m(3);
+
+        tracker.ingest_decode(now - Duration::from_secs(30), &cq_decode("A1"));
+        tracker.ingest_decode(now - Duration::from_secs(15), &cq_decode("A2"));
+
+        assert!(queue.scheduler_pick(now, &tracker, false, false).is_none());
+        assert!(queue.scheduler_status.contains("cq paused"));
+
+        tracker.ingest_decode(now, &cq_decode("A3"));
+        let dispatch = queue
+            .scheduler_pick(now + Duration::from_secs(1), &tracker, false, false)
+            .expect("cq dispatch once threshold is met");
+        match dispatch.kind {
+            QueueDispatchKind::Cq { .. } => {}
             _ => panic!("expected cq dispatch"),
         }
     }

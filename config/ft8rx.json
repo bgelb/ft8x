@@ -13,10 +13,13 @@
     "tx_freq_max_hz": 3500.0
   },
   "queue": {
+    "auto_add_all_decoded_calls_default": false,
     "auto_add_direct_calls_default": true,
     "ignore_direct_calls_from_recently_worked_default": true,
     "cq_enabled_default": false,
     "cq_percent_default": 80,
+    "pause_cq_when_few_unique_calls_default": false,
+    "cq_pause_min_unique_calls_5m_default": 3,
     "use_compound_rr73_handoff_default": true,
     "use_compound_73_once_handoff_default": false,
     "use_compound_for_direct_signal_callers_default": false,
