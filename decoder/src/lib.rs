@@ -13,7 +13,7 @@ pub use decoder::{
     DecodeProfile, DecodeReport, DecodeStage, DecodedMessage, DecoderSession, DecoderState,
     StageDecodeReport, debug_candidate_pcm, debug_candidate_truth_wav_file,
     debug_candidate_wav_file, decode_pcm, decode_pcm_with_state, decode_wav_file,
-    decode_wav_file_with_state,
+    decode_wav_file_with_state, subtract_truth_pcm, subtract_truth_wav_file,
 };
 pub use encode::{
     EncodeError, EncodedFrame, SynthesizedTxMessage, TxDirectedPayload, TxMessage, TxRttyExchange,

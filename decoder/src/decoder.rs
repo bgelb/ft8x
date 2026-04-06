@@ -406,6 +406,23 @@ pub fn debug_candidate_truth_wav_file(
     ))
 }
 
+pub fn subtract_truth_wav_file(
+    path: impl AsRef<Path>,
+    mode: Mode,
+    dt_seconds: f32,
+    freq_hz: f32,
+    truth_codeword_bits: &[u8],
+) -> Result<Option<AudioBuffer>, DecoderError> {
+    let audio = load_wav(path)?;
+    Ok(subtract_truth_pcm(
+        &audio,
+        mode,
+        dt_seconds,
+        freq_hz,
+        truth_codeword_bits,
+    ))
+}
+
 pub fn debug_candidate_pcm(
     audio: &AudioBuffer,
     mode: Mode,
@@ -607,6 +624,32 @@ fn debug_candidate_pcm_inner(
         snr_db: refined.snr_db,
         passes,
     })
+}
+
+pub fn subtract_truth_pcm(
+    audio: &AudioBuffer,
+    mode: Mode,
+    dt_seconds: f32,
+    freq_hz: f32,
+    truth_codeword_bits: &[u8],
+) -> Option<AudioBuffer> {
+    let payload = unpack_message_for_mode(mode, truth_codeword_bits)?;
+    let mut residual = audio.clone();
+    let success = SuccessfulDecode {
+        mode,
+        payload: payload.clone(),
+        codeword_bits: truth_codeword_bits.to_vec(),
+        candidate: DecodeCandidate {
+            start_seconds: mode.spec().start_seconds_from_dt(dt_seconds),
+            dt_seconds,
+            freq_hz,
+            score: 0.0,
+        },
+        ldpc_iterations: 0,
+        snr_db: 0,
+    };
+    subtract_candidate(&mut residual, &success, SubtractionPlan::for_mode(mode));
+    Some(residual)
 }
 
 fn append_debug_passes(

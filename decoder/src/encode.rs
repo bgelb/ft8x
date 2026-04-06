@@ -1757,6 +1757,40 @@ mod tests {
             "W9XYZ G8ABC R 559 0013"
         );
 
+        let ft4_rtty = encode_rtty_contest_message(
+            false,
+            "AC6BW",
+            "KR9A",
+            true,
+            559,
+            &TxRttyExchange::Multiplier("WI".to_string()),
+        )
+        .expect("encode ft4 rtty");
+        let stock_ft4_wire_bits =
+            bits_from_string("01100011000010110010100011111000011110000110011100100110000010100110001001110");
+        let stock_ft4_raw_bits: Vec<u8> = stock_ft4_wire_bits
+            .iter()
+            .zip(FT4_RVEC.iter())
+            .map(|(&bit, &mask)| bit ^ mask)
+            .collect();
+        let stock_ft4_rtty_payload = payload_from_message_bits(&stock_ft4_raw_bits);
+        assert_eq!(
+            stock_ft4_rtty_payload
+                .to_message(&HashResolver::default())
+                .to_text(),
+            "AC6BW KR9A R 559 WI"
+        );
+        assert_eq!(
+            bits_to_string(&ft4_rtty.message_bits),
+            bits_to_string(&stock_ft4_raw_bits)
+        );
+        assert_eq!(
+            payload_from_message_bits(&ft4_rtty.message_bits)
+                .to_message(&HashResolver::default())
+                .to_text(),
+            "AC6BW KR9A R 559 WI"
+        );
+
         let eu_vhf = encode_eu_vhf_message("<PA3XYZ>", "<G4ABC/P>", true, 59, 3, "IO91NP")
             .expect("encode eu vhf");
         assert_eq!(
@@ -1872,6 +1906,16 @@ mod tests {
     fn bits_to_string(bits: &[u8]) -> String {
         bits.iter()
             .map(|bit| if *bit == 0 { '0' } else { '1' })
+            .collect()
+    }
+
+    fn bits_from_string(bits: &str) -> Vec<u8> {
+        bits.chars()
+            .map(|ch| match ch {
+                '0' => 0,
+                '1' => 1,
+                other => panic!("unexpected bit {other}"),
+            })
             .collect()
     }
 
