@@ -31,10 +31,13 @@ pub struct TxConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueueConfig {
+    pub auto_add_all_decoded_calls_default: bool,
     pub auto_add_direct_calls_default: bool,
     pub ignore_direct_calls_from_recently_worked_default: bool,
     pub cq_enabled_default: bool,
     pub cq_percent_default: u8,
+    pub pause_cq_when_few_unique_calls_default: bool,
+    pub cq_pause_min_unique_calls_5m_default: u32,
     pub use_compound_rr73_handoff_default: bool,
     pub use_compound_73_once_handoff_default: bool,
     pub use_compound_for_direct_signal_callers_default: bool,
