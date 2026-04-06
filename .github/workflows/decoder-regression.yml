@@ -23,6 +23,7 @@ jobs:
           - macos-15
     env:
       PYTHONPATH: src
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 

@@ -87,13 +87,23 @@ def load_config(paths: Paths) -> dict[str, Any]:
     return json.loads(paths.config.read_text())
 
 
+def request_headers(url: str) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": USER_AGENT,
+    }
+    if url.startswith("https://api.github.com/"):
+        headers["Accept"] = "application/vnd.github+json"
+        github_token = os.environ.get("GITHUB_TOKEN")
+        if github_token:
+            headers["Authorization"] = f"Bearer {github_token}"
+    return headers
+
+
 def fetch_bytes(url: str, method: str = "GET") -> bytes:
     request = urllib.request.Request(
         url,
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "User-Agent": USER_AGENT,
-        },
+        headers=request_headers(url),
         method=method,
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
