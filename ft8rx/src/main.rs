@@ -1255,8 +1255,10 @@ impl WorkQueueState {
         qso_busy: bool,
         tune_active: bool,
     ) -> Option<QueueDispatch> {
-        let unique_calls_last_5m =
-            tracker.unique_sender_count_since(now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now));
+        let unique_calls_last_5m = tracker.unique_sender_count_since_excluding(
+            now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now),
+            &self.our_call,
+        );
         self.prune_recent_worked(now);
         self.refresh_entry_observed_times(tracker);
         self.prune_queue(now, tracker);
@@ -1345,9 +1347,10 @@ impl WorkQueueState {
     }
 
     fn web_snapshot(&self, tracker: &StationTracker, now: SystemTime) -> WebQueueSnapshot {
-        let unique_calls_last_5m = tracker
-            .unique_sender_count_since(now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now))
-            as u32;
+        let unique_calls_last_5m = tracker.unique_sender_count_since_excluding(
+            now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now),
+            &self.our_call,
+        ) as u32;
         let mut entries = self
             .entries
             .iter()
@@ -6878,10 +6881,10 @@ impl StationTracker {
             .collect()
     }
 
-    fn unique_sender_count_since(&self, since: SystemTime) -> usize {
+    fn unique_sender_count_since_excluding(&self, since: SystemTime, excluded_call: &str) -> usize {
         let mut calls = BTreeSet::new();
         for entry in &self.logs {
-            if entry.received_at >= since {
+            if entry.received_at >= since && !entry.sender_call.eq_ignore_ascii_case(excluded_call) {
                 calls.insert(entry.sender_call.clone());
             }
         }
@@ -8217,6 +8220,23 @@ mod tests {
             QueueDispatchKind::Cq { .. } => {}
             _ => panic!("expected cq dispatch"),
         }
+    }
+
+    #[test]
+    fn unique_sender_count_excludes_our_own_call() {
+        let now = UNIX_EPOCH + Duration::from_secs(60);
+        let mut tracker = StationTracker::default();
+        tracker.ingest_decode(now - Duration::from_secs(30), &cq_decode("A1"));
+        tracker.ingest_decode(now - Duration::from_secs(15), &cq_decode("N1VF"));
+        tracker.ingest_decode(now, &cq_decode("A2"));
+
+        assert_eq!(
+            tracker.unique_sender_count_since_excluding(
+                now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now),
+                "N1VF",
+            ),
+            2
+        );
     }
 
     #[test]
