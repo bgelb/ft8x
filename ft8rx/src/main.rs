@@ -4699,6 +4699,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
     let mut next_slot = next_slot_boundary(SystemTime::now());
     let mut next_slot_stages = SlotStageState::default();
+    let mut slot_direct_skip_start: Option<SystemTime> = None;
+    let mut slot_direct_skip_calls = BTreeSet::<String>::new();
     let mut last_rig_poll = UNIX_EPOCH;
     let mut active_decode: Option<ActiveDecodeJob> = None;
     let mut waterfall_rows = seeded_waterfall_rows();
@@ -4864,6 +4866,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     result,
                 } => {
                     active_decode = None;
+                    if slot_direct_skip_start != Some(slot_start) {
+                        slot_direct_skip_start = Some(slot_start);
+                        slot_direct_skip_calls.clear();
+                    }
+                    if let Some(active_partner) = qso_controller.active_partner_call() {
+                        slot_direct_skip_calls.insert(active_partner);
+                    }
                     match result {
                         Ok(update) => match stage {
                             DecodeStage::Early41 => {
@@ -4880,6 +4889,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     &display.early41_decodes,
                                     &config.station.our_call,
                                     slot_start,
+                                    &slot_direct_skip_calls,
                                 );
                                 qso_controller.on_decode_stage(
                                     slot_start,
@@ -4923,6 +4933,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     &display.early47_decodes,
                                     &config.station.our_call,
                                     slot_start,
+                                    &slot_direct_skip_calls,
                                 );
                                 qso_controller.on_decode_stage(
                                     slot_start,
@@ -4973,6 +4984,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     &display.full_decodes,
                                     &config.station.our_call,
                                     slot_start,
+                                    &slot_direct_skip_calls,
                                 );
                                 qso_controller.on_decode_stage(
                                     slot_start,
@@ -7179,6 +7191,7 @@ fn maybe_track_priority_directs(
     decodes: &[DecodedMessage],
     our_call: &str,
     slot_start: SystemTime,
+    slot_skip_calls: &BTreeSet<String>,
 ) {
     if work_queue.auto_add_direct_calls {
         let active_partner = qso_controller.active_partner_call();
@@ -7188,6 +7201,12 @@ fn maybe_track_priority_directs(
             else {
                 continue;
             };
+            if slot_skip_calls
+                .iter()
+                .any(|callsign| callsign.eq_ignore_ascii_case(observation.callsign.as_str()))
+            {
+                continue;
+            }
             if active_partner.as_deref() == Some(observation.callsign.as_str()) {
                 continue;
             }
@@ -8136,6 +8155,127 @@ mod tests {
             &[decode],
             "N1VF",
             rx_slot_start,
+            &BTreeSet::from(["NEW1".to_string()]),
+        );
+        assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn later_decode_stage_does_not_requeue_same_slot_active_partner_direct() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_auto_add_direct_calls(true);
+        let mut controller = qso::QsoController::new(config, Box::new(NoopTxBackend));
+
+        let start_at = UNIX_EPOCH + Duration::from_secs(13);
+        controller.handle_command(
+            qso::QsoCommand::Start {
+                partner_call: "JA1IST".to_string(),
+                tx_freq_hz: 800.0,
+                initial_state: QsoState::Send73,
+                start_mode: qso::QsoStartMode::Direct,
+                tx_slot_family_override: Some(SlotFamily::Odd),
+            },
+            Some(qso::StationStartInfo {
+                callsign: "JA1IST".to_string(),
+                last_heard_at: start_at,
+                last_heard_slot_family: SlotFamily::Even,
+                last_snr_db: 2,
+                last_text: Some("N1VF JA1IST R-21".to_string()),
+                last_structured_json: Some("{}".to_string()),
+            }),
+            start_at,
+        );
+
+        let slot_1 = UNIX_EPOCH + Duration::from_secs(15);
+        let slot_2 = UNIX_EPOCH + Duration::from_secs(45);
+        let slot_3 = UNIX_EPOCH + Duration::from_secs(75);
+        let ack_21 = DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: 2,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: "N1VF JA1IST R-21".to_string(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message: StructuredMessage::Standard {
+                i3: 0,
+                first: standard_call("N1VF"),
+                second: standard_call("JA1IST"),
+                acknowledge: true,
+                info: StructuredInfoField {
+                    raw: 0,
+                    value: StructuredInfoValue::SignalReport { db: -21 },
+                },
+            },
+        };
+        let ack_08 = DecodedMessage {
+            utc: "00:00:30".to_string(),
+            snr_db: 1,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: "N1VF JA1IST R-08".to_string(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message: StructuredMessage::Standard {
+                i3: 0,
+                first: standard_call("N1VF"),
+                second: standard_call("JA1IST"),
+                acknowledge: true,
+                info: StructuredInfoField {
+                    raw: 0,
+                    value: StructuredInfoValue::SignalReport { db: -8 },
+                },
+            },
+        };
+
+        controller.on_decode_stage(
+            slot_1,
+            DecodeStage::Early41,
+            std::slice::from_ref(&ack_21),
+            slot_1,
+        );
+        controller.on_decode_stage(
+            slot_2,
+            DecodeStage::Early41,
+            std::slice::from_ref(&ack_08),
+            slot_2,
+        );
+        assert_eq!(controller.active_partner_call().as_deref(), Some("JA1IST"));
+
+        let slot_skip_calls = BTreeSet::from(["JA1IST".to_string()]);
+        maybe_track_priority_directs(
+            &mut queue,
+            &mut controller,
+            std::slice::from_ref(&ack_08),
+            "N1VF",
+            slot_3,
+            &slot_skip_calls,
+        );
+        assert!(queue.entries.is_empty());
+
+        controller.on_decode_stage(
+            slot_3,
+            DecodeStage::Early41,
+            std::slice::from_ref(&ack_08),
+            slot_3,
+        );
+        controller.handle_command(
+            qso::QsoCommand::Stop {
+                reason: "test_stop".to_string(),
+            },
+            None,
+            slot_3,
+        );
+        assert!(controller.active_partner_call().is_none());
+
+        maybe_track_priority_directs(
+            &mut queue,
+            &mut controller,
+            std::slice::from_ref(&ack_08),
+            "N1VF",
+            slot_3,
+            &slot_skip_calls,
         );
         assert!(queue.entries.is_empty());
     }
