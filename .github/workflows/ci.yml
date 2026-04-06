@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux audio build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            decoder -> decoder/target
+            audiolib -> audiolib/target
+            rigctl -> rigctl/target
+            ft8rx -> ft8rx/target
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python harness tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -q
+
+      - name: Decoder tests
+        run: cargo test --manifest-path decoder/Cargo.toml
+
+      - name: Audio library tests
+        run: cargo test --manifest-path audiolib/Cargo.toml
+
+      - name: Rig control tests
+        run: cargo test --manifest-path rigctl/Cargo.toml
+
+      - name: FT8RX tests
+        run: cargo test --manifest-path ft8rx/Cargo.toml

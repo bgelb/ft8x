@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ft8_regr.core import describe_release_install, ensure_linux_compat_lib_dirs, select_host_artifact
+from ft8_regr.core import (
+    describe_release_install,
+    ensure_linux_compat_lib_dirs,
+    request_headers,
+    select_host_artifact,
+)
 
 
 class RegressionCoreTests(unittest.TestCase):
@@ -73,7 +79,7 @@ class RegressionCoreTests(unittest.TestCase):
             (compat_root / "libgfortran.so.4").write_text("stub")
             paths = patch_default_paths(Path(tmpdir))
             compat_dirs = ensure_linux_compat_lib_dirs(paths, ["libgfortran.so.4"])
-        self.assertEqual(compat_dirs, [compat_root])
+        self.assertEqual([path.resolve() for path in compat_dirs], [compat_root.resolve()])
 
     def test_selects_macos_dmg_for_macos_host(self) -> None:
         release_files = {
@@ -96,6 +102,19 @@ class RegressionCoreTests(unittest.TestCase):
         self.assertIsNotNone(artifact)
         self.assertEqual(artifact["name"], "wsjtx-2.7.0-Darwin.dmg")
         self.assertEqual(artifact["kind"], "dmg")
+
+    def test_request_headers_adds_github_token_for_api_urls(self) -> None:
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}, clear=False):
+            headers = request_headers("https://api.github.com/repos/example/project/contents")
+        self.assertEqual(headers["Accept"], "application/vnd.github+json")
+        self.assertEqual(headers["Authorization"], "Bearer test-token")
+        self.assertEqual(headers["User-Agent"], "ft8-regr-prototype/0.1")
+
+    def test_request_headers_ignores_github_token_for_non_api_urls(self) -> None:
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}, clear=False):
+            headers = request_headers("https://example.invalid/data.json")
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(headers["Accept"], "application/json, text/plain, */*")
 
 
 def patch_default_paths(root: Path):

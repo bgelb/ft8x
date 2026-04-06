@@ -1,0 +1,77 @@
+name: Decoder Regression
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-regression:
+    name: Rust decoder regression (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+    env:
+      PYTHONPATH: src
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            decoder -> decoder/target
+            audiolib -> audiolib/target
+            rigctl -> rigctl/target
+            ft8rx -> ft8rx/target
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache sample corpora
+        uses: actions/cache@v4
+        with:
+          path: artifacts/samples
+          key: samples-${{ runner.os }}-${{ hashFiles('config/sources.json') }}
+
+      - name: Sync sample corpora
+        run: python3 -m ft8_regr.cli sync-samples
+
+      - name: Build decoder release binary
+        run: cargo build --manifest-path decoder/Cargo.toml --release
+
+      - name: Run Rust decoder regression
+        run: >
+          python3 -m ft8_regr.cli run-rust
+          --profiles medium deepest
+          --datasets kgoba-ft8-lib d9394-ft8-test-wave
+          --binary decoder/target/release/ft8-decoder
+
+      - name: Compare regression metrics to checked-in expectation
+        run: |
+          latest_run="$(ls -td artifacts/results/rust-* | head -1)"
+          python3 scripts/check_rust_regression.py \
+            --summary "$latest_run/summary.csv" \
+            --expected tests/golden/rust_decoder_regression_expected.json
+
+      - name: Upload regression summary on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-regression-${{ runner.os }}
+          path: |
+            artifacts/results/rust-*/summary.csv
+            artifacts/results/rust-*/results.json
