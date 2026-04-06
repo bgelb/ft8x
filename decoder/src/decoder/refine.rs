@@ -103,20 +103,42 @@ pub(super) fn extract_candidate_at(
     extract_candidate_from_baseband(&baseband, spec, start_seconds, freq_hz)
 }
 
+pub(super) fn extract_candidate_at_relaxed(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
+    start_seconds: f32,
+    freq_hz: f32,
+) -> Option<RefinedCandidate> {
+    let baseband = downsample_candidate(long_spectrum, baseband_plan, spec, freq_hz)?;
+    extract_candidate_from_baseband_with_threshold(&baseband, spec, start_seconds, freq_hz, false)
+}
+
 pub(super) fn extract_candidate_from_baseband(
     baseband: &[Complex32],
     spec: &ModeSpec,
     start_seconds: f32,
     freq_hz: f32,
 ) -> Option<RefinedCandidate> {
+    extract_candidate_from_baseband_with_threshold(baseband, spec, start_seconds, freq_hz, true)
+}
+
+fn extract_candidate_from_baseband_with_threshold(
+    baseband: &[Complex32],
+    spec: &ModeSpec,
+    start_seconds: f32,
+    freq_hz: f32,
+    enforce_sync_quality: bool,
+) -> Option<RefinedCandidate> {
     let start_index = (start_seconds * spec.baseband_rate_hz()).round() as isize;
     let full_tones = extract_symbol_tones(spec, baseband, start_index);
-    if sync_quality(spec, &full_tones)
-        <= match spec.mode {
-            Mode::Ft8 => 6,
-            Mode::Ft4 => 7,
-            Mode::Ft2 => 4,
-        }
+    if enforce_sync_quality
+        && sync_quality(spec, &full_tones)
+            <= match spec.mode {
+                Mode::Ft8 => 6,
+                Mode::Ft4 => 7,
+                Mode::Ft2 => 4,
+            }
     {
         return None;
     }

@@ -5,7 +5,8 @@ use clap::{ArgAction, Parser, Subcommand};
 use ft8_decoder::{
     DecodeOptions, DecodeProfile, GridReport, Mode, WaveformOptions,
     debug_candidate_truth_wav_file, debug_candidate_wav_file, decode_wav_file,
-    encode_standard_message, parse_standard_info, write_rectangular_standard_wav,
+    encode_standard_message, encode_standard_message_for_mode, parse_standard_info,
+    write_rectangular_standard_wav,
 };
 
 #[derive(Debug, Parser)]
@@ -53,6 +54,9 @@ enum Command {
         #[arg(value_name = "WAV")]
         wav: PathBuf,
 
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
         #[arg(long)]
         dt_seconds: f32,
 
@@ -65,6 +69,9 @@ enum Command {
     DebugStandardCandidate {
         #[arg(value_name = "WAV")]
         wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
 
         #[arg(long)]
         dt_seconds: f32,
@@ -162,11 +169,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::DebugCandidate {
             wav,
+            mode,
             dt_seconds,
             freq_hz,
             pretty,
         } => {
-            let report = debug_candidate_wav_file(&wav, dt_seconds, freq_hz)?;
+            let mode = mode.parse::<Mode>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let report = debug_candidate_wav_file(&wav, mode, dt_seconds, freq_hz)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -175,21 +186,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::DebugStandardCandidate {
             wav,
+            mode,
             dt_seconds,
             freq_hz,
             message,
             pretty,
         } => {
+            let mode = mode.parse::<Mode>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
             let (first, second, acknowledge, info) = parse_rendered_standard_message(&message)
                 .map_err(|message| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
                 })?;
-            let frame =
-                encode_standard_message(&first, &second, acknowledge, &info).map_err(|error| {
+            let frame = encode_standard_message_for_mode(mode, &first, &second, acknowledge, &info)
+                .map_err(|error| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
                 })?;
-            let report =
-                debug_candidate_truth_wav_file(&wav, dt_seconds, freq_hz, &frame.codeword_bits)?;
+            let report = debug_candidate_truth_wav_file(
+                &wav,
+                mode,
+                dt_seconds,
+                freq_hz,
+                &frame.codeword_bits,
+            )?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

@@ -374,15 +374,17 @@ pub fn decode_wav_file_with_state(
 
 pub fn debug_candidate_wav_file(
     path: impl AsRef<Path>,
+    mode: Mode,
     dt_seconds: f32,
     freq_hz: f32,
 ) -> Result<Option<CandidateDebugReport>, DecoderError> {
     let audio = load_wav(path)?;
-    Ok(debug_candidate_pcm(&audio, dt_seconds, freq_hz))
+    Ok(debug_candidate_pcm(&audio, mode, dt_seconds, freq_hz))
 }
 
 pub fn debug_candidate_truth_wav_file(
     path: impl AsRef<Path>,
+    mode: Mode,
     dt_seconds: f32,
     freq_hz: f32,
     truth_codeword_bits: &[u8],
@@ -390,7 +392,7 @@ pub fn debug_candidate_truth_wav_file(
     let audio = load_wav(path)?;
     Ok(debug_candidate_pcm_inner(
         &audio,
-        Mode::Ft8,
+        mode,
         dt_seconds,
         freq_hz,
         Some(truth_codeword_bits),
@@ -399,10 +401,11 @@ pub fn debug_candidate_truth_wav_file(
 
 pub fn debug_candidate_pcm(
     audio: &AudioBuffer,
+    mode: Mode,
     dt_seconds: f32,
     freq_hz: f32,
 ) -> Option<CandidateDebugReport> {
-    debug_candidate_pcm_inner(audio, Mode::Ft8, dt_seconds, freq_hz, None)
+    debug_candidate_pcm_inner(audio, mode, dt_seconds, freq_hz, None)
 }
 
 fn debug_candidate_pcm_inner(
@@ -427,7 +430,16 @@ fn debug_candidate_pcm_inner(
         spec,
         spec.start_seconds_from_dt(dt_seconds),
         freq_hz,
-    )?;
+    )
+    .or_else(|| {
+        extract_candidate_at_relaxed(
+            &long_spectrum,
+            &baseband_plan,
+            spec,
+            spec.start_seconds_from_dt(dt_seconds),
+            freq_hz,
+        )
+    })?;
     let parity = ParityMatrix::global();
     let mut counters = DecodeCounters::default();
     let mut passes = Vec::new();
