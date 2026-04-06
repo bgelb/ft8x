@@ -555,6 +555,7 @@ struct StationTracker {
 struct StationState {
     last_heard_at: SystemTime,
     last_heard_slot_index: u64,
+    last_heard_decode_stage: DecodeStage,
     last_heard_freq_hz: f32,
     last_heard_snr_db: i32,
     last_heard_slot_family: qso::SlotFamily,
@@ -589,6 +590,8 @@ enum PeerRef {
 #[derive(Debug, Clone)]
 struct LoggedDecode {
     received_at: SystemTime,
+    slot_index: u64,
+    decode_stage: DecodeStage,
     sender_call: String,
     peer: Option<PeerRef>,
     peer_before: Option<PeerRef>,
@@ -4866,6 +4869,11 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             DecodeStage::Early41 => {
                                 display.early41_wall_ms = Some(wall_ms);
                                 display.early41_decodes = update.report.decodes.clone();
+                                station_tracker.ingest_stage(
+                                    slot_start,
+                                    stage,
+                                    &display.early41_decodes,
+                                );
                                 maybe_track_priority_directs(
                                     &mut work_queue,
                                     &mut qso_controller,
@@ -4904,6 +4912,11 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                     tx_margin_after_stage_decode_ms(slot_start, stage, wall_ms)?,
                                 );
                                 display.early47_decodes = update.report.decodes.clone();
+                                station_tracker.ingest_stage(
+                                    slot_start,
+                                    stage,
+                                    &display.early47_decodes,
+                                );
                                 maybe_track_priority_directs(
                                     &mut work_queue,
                                     &mut qso_controller,
@@ -5126,7 +5139,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             tx_freq_hz: dispatch.tx_freq_hz,
                             initial_state,
                             start_mode,
-                            tx_slot_family_override: None,
+                            tx_slot_family_override: Some(dispatch.tx_slot_family),
                         },
                         station_info,
                         dispatch_now,
@@ -6479,7 +6492,12 @@ fn reply_word_text(word: ft8_decoder::ReplyWord) -> &'static str {
 }
 
 impl StationTracker {
-    fn ingest_frame(&mut self, received_at: SystemTime, decodes: &[DecodedMessage]) {
+    fn ingest_stage(
+        &mut self,
+        received_at: SystemTime,
+        stage: DecodeStage,
+        decodes: &[DecodedMessage],
+    ) {
         let mut grouped = BTreeMap::<String, Vec<&DecodedMessage>>::new();
         let mut passthrough = Vec::<&DecodedMessage>::new();
         for decode in decodes {
@@ -6492,7 +6510,7 @@ impl StationTracker {
         }
 
         for decode in passthrough {
-            self.ingest_decode(received_at, decode);
+            self.ingest_decode_stage(received_at, stage, decode);
         }
 
         for sender_decodes in grouped.values() {
@@ -6505,16 +6523,38 @@ impl StationTracker {
                 }
             });
             for decode in ordered {
-                self.ingest_decode(received_at, decode);
+                self.ingest_decode_stage(received_at, stage, decode);
             }
         }
         self.prune(received_at);
     }
 
+    fn ingest_frame(&mut self, received_at: SystemTime, decodes: &[DecodedMessage]) {
+        self.ingest_stage(received_at, DecodeStage::Full, decodes);
+    }
+
     fn ingest_decode(&mut self, received_at: SystemTime, decode: &DecodedMessage) {
+        self.ingest_decode_stage(received_at, DecodeStage::Full, decode);
+    }
+
+    fn ingest_decode_stage(
+        &mut self,
+        received_at: SystemTime,
+        stage: DecodeStage,
+        decode: &DecodedMessage,
+    ) {
         let Some(sender_call) = semantic_sender_call(&decode.message) else {
             return;
         };
+        let current_slot_index = slot_index(received_at);
+        if let Some(existing) = self.stations.get(&sender_call) {
+            if current_slot_index < existing.last_heard_slot_index
+                || (current_slot_index == existing.last_heard_slot_index
+                    && stage < existing.last_heard_decode_stage)
+            {
+                return;
+            }
+        }
         let observed_peer = qso_peer_from_first_field(&decode.message, self);
         let existing_active = self
             .stations
@@ -6552,7 +6592,8 @@ impl StationTracker {
             .entry(sender_call.clone())
             .or_insert_with(|| StationState {
                 last_heard_at: received_at,
-                last_heard_slot_index: slot_index(received_at),
+                last_heard_slot_index: current_slot_index,
+                last_heard_decode_stage: stage,
                 last_heard_freq_hz: decode.freq_hz,
                 last_heard_snr_db: decode.snr_db,
                 last_heard_slot_family: qso::slot_family(received_at),
@@ -6564,7 +6605,8 @@ impl StationTracker {
                 qso_history: Vec::new(),
             });
         entry.last_heard_at = received_at;
-        entry.last_heard_slot_index = slot_index(received_at);
+        entry.last_heard_slot_index = current_slot_index;
+        entry.last_heard_decode_stage = stage;
         entry.last_heard_freq_hz = decode.freq_hz;
         entry.last_heard_snr_db = decode.snr_db;
         entry.last_heard_slot_family = qso::slot_family(received_at);
@@ -6661,9 +6703,11 @@ impl StationTracker {
                 }
             }
         }
-        self.logs.push_back(LoggedDecode {
+        let logged = LoggedDecode {
             received_at,
-            sender_call,
+            slot_index: current_slot_index,
+            decode_stage: stage,
+            sender_call: sender_call.clone(),
             peer,
             peer_before,
             peer_after,
@@ -6676,7 +6720,16 @@ impl StationTracker {
             field2,
             info,
             text: decode.text.clone(),
-        });
+        };
+        if let Some(existing) = self.logs.iter_mut().find(|entry| {
+            entry.sender_call == sender_call && entry.slot_index == current_slot_index
+        }) {
+            if stage >= existing.decode_stage {
+                *existing = logged;
+            }
+        } else {
+            self.logs.push_back(logged);
+        }
     }
 
     fn observe_message_resolutions(&mut self, message: &StructuredMessage) {
@@ -6884,7 +6937,8 @@ impl StationTracker {
     fn unique_sender_count_since_excluding(&self, since: SystemTime, excluded_call: &str) -> usize {
         let mut calls = BTreeSet::new();
         for entry in &self.logs {
-            if entry.received_at >= since && !entry.sender_call.eq_ignore_ascii_case(excluded_call) {
+            if entry.received_at >= since && !entry.sender_call.eq_ignore_ascii_case(excluded_call)
+            {
                 calls.insert(entry.sender_call.clone());
             }
         }
@@ -7205,32 +7259,69 @@ fn station_info_from_dispatch(
         return None;
     };
     let mut station_info = tracker.start_info(callsign);
-    if station_info.is_none() {
-        if let (Some(last_heard_at), Some(last_heard_slot_family)) =
-            (*context_last_heard_at, *context_last_heard_slot_family)
-        {
-            station_info = Some(StationStartInfo {
-                callsign: callsign.clone(),
-                last_heard_at,
-                last_heard_slot_family,
-                last_snr_db: context_snr_db.unwrap_or(0),
-                last_text: context_text.clone(),
-                last_structured_json: context_structured_json.clone(),
-            });
-        }
-    }
-    if let Some(info) = &mut station_info {
-        if let Some(text) = context_text.clone() {
-            info.last_text = Some(text);
-        }
-        if let Some(structured_json) = context_structured_json.clone() {
-            info.last_structured_json = Some(structured_json);
-        }
-        if let Some(snr_db) = *context_snr_db {
-            info.last_snr_db = snr_db;
+    if let (Some(last_heard_at), Some(last_heard_slot_family)) =
+        (*context_last_heard_at, *context_last_heard_slot_family)
+    {
+        match &mut station_info {
+            Some(info) if last_heard_at >= info.last_heard_at => {
+                info.last_heard_at = last_heard_at;
+                info.last_heard_slot_family = last_heard_slot_family;
+                info.last_snr_db = context_snr_db.unwrap_or(info.last_snr_db);
+                info.last_text = context_text.clone().or_else(|| info.last_text.clone());
+                info.last_structured_json = context_structured_json
+                    .clone()
+                    .or_else(|| info.last_structured_json.clone());
+            }
+            None => {
+                station_info = Some(StationStartInfo {
+                    callsign: callsign.clone(),
+                    last_heard_at,
+                    last_heard_slot_family,
+                    last_snr_db: context_snr_db.unwrap_or(0),
+                    last_text: context_text.clone(),
+                    last_structured_json: context_structured_json.clone(),
+                });
+            }
+            Some(info) => {
+                if let Some(text) = context_text.clone() {
+                    info.last_text = Some(text);
+                }
+                if let Some(structured_json) = context_structured_json.clone() {
+                    info.last_structured_json = Some(structured_json);
+                }
+                if let Some(snr_db) = *context_snr_db {
+                    info.last_snr_db = snr_db;
+                }
+            }
         }
     }
     station_info
+}
+
+fn qso_start_command_from_dispatch(dispatch: &QueueDispatch) -> qso::QsoCommand {
+    match &dispatch.kind {
+        QueueDispatchKind::Station {
+            callsign,
+            initial_state,
+            start_mode,
+            ..
+        } => qso::QsoCommand::Start {
+            partner_call: callsign.clone(),
+            tx_freq_hz: dispatch.tx_freq_hz,
+            initial_state: *initial_state,
+            start_mode: *start_mode,
+            tx_slot_family_override: Some(dispatch.tx_slot_family),
+        },
+        QueueDispatchKind::Cq {
+            tx_slot_family_override,
+        } => qso::QsoCommand::Start {
+            partner_call: "CQ".to_string(),
+            tx_freq_hz: dispatch.tx_freq_hz,
+            initial_state: QsoState::SendCq,
+            start_mode: QsoStartMode::Cq,
+            tx_slot_family_override: *tx_slot_family_override,
+        },
+    }
 }
 
 fn maybe_arm_compound_handoff_from_queue(
@@ -8237,6 +8328,130 @@ mod tests {
             ),
             2
         );
+    }
+
+    #[test]
+    fn station_tracker_uses_early_stage_for_start_info() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(45);
+        let mut tracker = StationTracker::default();
+        tracker.ingest_stage(
+            slot_start,
+            DecodeStage::Early47,
+            &[DecodedMessage {
+                utc: "00:00:00".to_string(),
+                snr_db: -4,
+                dt_seconds: 0.1,
+                freq_hz: 1000.0,
+                text: "N1VF K7VAY DM42".to_string(),
+                candidate_score: 0.0,
+                ldpc_iterations: 0,
+                message: StructuredMessage::Standard {
+                    i3: 0,
+                    first: standard_call("N1VF"),
+                    second: standard_call("K7VAY"),
+                    acknowledge: false,
+                    info: grid_info("DM42"),
+                },
+            }],
+        );
+
+        let info = tracker.start_info("K7VAY").expect("start info");
+        assert_eq!(info.last_heard_at, slot_start);
+        assert_eq!(info.last_heard_slot_family, SlotFamily::Odd);
+        assert_eq!(info.last_snr_db, -4);
+        assert_eq!(info.last_text.as_deref(), Some("N1VF K7VAY DM42"));
+    }
+
+    #[test]
+    fn station_tracker_replaces_same_slot_log_with_later_stage() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(45);
+        let mut tracker = StationTracker::default();
+        let early = DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -9,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: "N1VF K7VAY DM42".to_string(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message: StructuredMessage::Standard {
+                i3: 0,
+                first: standard_call("N1VF"),
+                second: standard_call("K7VAY"),
+                acknowledge: false,
+                info: grid_info("DM42"),
+            },
+        };
+        let full = DecodedMessage {
+            snr_db: -4,
+            ..early.clone()
+        };
+
+        tracker.ingest_stage(slot_start, DecodeStage::Early47, &[early]);
+        tracker.ingest_stage(slot_start, DecodeStage::Full, &[full]);
+
+        let logs = tracker.web_logs();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].sender_call, "K7VAY");
+        assert_eq!(logs[0].snr_db, -4);
+        let info = tracker.start_info("K7VAY").expect("start info");
+        assert_eq!(info.last_snr_db, -4);
+        assert_eq!(info.last_heard_slot_family, SlotFamily::Odd);
+    }
+
+    #[test]
+    fn station_dispatch_preserves_scheduler_selected_tx_parity() {
+        let dispatch = QueueDispatch {
+            kind: QueueDispatchKind::Station {
+                callsign: "K7VAY".to_string(),
+                initial_state: QsoState::SendSig,
+                start_mode: QsoStartMode::Direct,
+                context_last_heard_at: None,
+                context_last_heard_slot_family: None,
+                context_text: None,
+                context_structured_json: None,
+                context_snr_db: None,
+            },
+            callsign: "K7VAY".to_string(),
+            tx_slot_family: SlotFamily::Even,
+            tx_freq_hz: 720.0,
+        };
+
+        match qso_start_command_from_dispatch(&dispatch) {
+            qso::QsoCommand::Start {
+                tx_slot_family_override,
+                ..
+            } => assert_eq!(tx_slot_family_override, Some(SlotFamily::Even)),
+            _ => panic!("expected start command"),
+        }
+    }
+
+    #[test]
+    fn direct_dispatch_context_overrides_stale_tracker_slot_family() {
+        let older = UNIX_EPOCH + Duration::from_secs(30);
+        let newer = older + Duration::from_secs(15);
+        let mut tracker = StationTracker::default();
+        tracker.ingest_decode(older, &cq_decode("K7VAY"));
+
+        let station_info = station_info_from_dispatch(
+            &tracker,
+            &QueueDispatchKind::Station {
+                callsign: "K7VAY".to_string(),
+                initial_state: QsoState::SendSig,
+                start_mode: QsoStartMode::Direct,
+                context_last_heard_at: Some(newer),
+                context_last_heard_slot_family: Some(SlotFamily::Odd),
+                context_text: Some("N1VF K7VAY DM42".to_string()),
+                context_structured_json: Some("{}".to_string()),
+                context_snr_db: Some(-4),
+            },
+        )
+        .expect("station info");
+
+        assert_eq!(station_info.last_heard_at, newer);
+        assert_eq!(station_info.last_heard_slot_family, SlotFamily::Odd);
+        assert_eq!(station_info.last_snr_db, -4);
+        assert_eq!(station_info.last_text.as_deref(), Some("N1VF K7VAY DM42"));
     }
 
     #[test]
