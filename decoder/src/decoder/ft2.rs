@@ -1,0 +1,661 @@
+use std::sync::OnceLock;
+
+use num_complex::Complex32;
+use realfft::RealFftPlanner;
+use rustfft::FftPlanner;
+
+use super::session::validate_audio;
+use super::{
+    DecodeCandidate, DecodeDiagnostics, DecodeOptions, DecodeReport, DecodedMessage,
+};
+use crate::crc;
+use crate::message::HashResolver;
+use crate::message::unpack_message_for_mode;
+use crate::modes::Mode;
+use crate::wave::{AudioBuffer, DecoderError};
+
+const FT2_NMAX: usize = 30_000;
+const FT2_NSPS: usize = 160;
+const FT2_NFFT1: usize = 400;
+const FT2_NH1: usize = FT2_NFFT1 / 2;
+const FT2_NSTEP: usize = FT2_NSPS / 4;
+const FT2_NHSYM: usize = FT2_NMAX / FT2_NSTEP - 3;
+const FT2_NDOWN: usize = 16;
+const FT2_NFFT2: usize = FT2_NMAX / FT2_NDOWN;
+const FT2_DOWNSAMPLED_SYMBOL_SAMPLES: usize = FT2_NSPS / FT2_NDOWN;
+const FT2_SYMBOL_COUNT: usize = 144;
+const FT2_SYNC: [u8; 16] = [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0];
+const FT2_BP_MAX_ITERS: usize = 40;
+const FT2_ROWS: usize = 38;
+const FT2_COLUMNS: usize = 128;
+
+const FT2_COLUMN_ROWS: [[usize; 3]; FT2_COLUMNS] = [
+    [20, 33, 35],
+    [0, 7, 27],
+    [1, 8, 36],
+    [2, 6, 18],
+    [3, 15, 31],
+    [1, 4, 21],
+    [5, 12, 24],
+    [9, 30, 32],
+    [10, 23, 26],
+    [11, 14, 22],
+    [13, 17, 25],
+    [16, 19, 28],
+    [16, 29, 33],
+    [5, 33, 34],
+    [0, 9, 29],
+    [2, 17, 22],
+    [3, 11, 24],
+    [4, 27, 35],
+    [6, 13, 20],
+    [7, 14, 30],
+    [8, 26, 31],
+    [10, 18, 34],
+    [12, 15, 36],
+    [19, 23, 37],
+    [20, 21, 25],
+    [11, 28, 32],
+    [0, 16, 34],
+    [1, 27, 29],
+    [2, 9, 31],
+    [3, 7, 35],
+    [4, 18, 28],
+    [5, 19, 26],
+    [6, 21, 36],
+    [8, 10, 32],
+    [12, 23, 25],
+    [13, 30, 33],
+    [14, 15, 24],
+    [12, 17, 37],
+    [7, 19, 22],
+    [0, 31, 32],
+    [1, 16, 18],
+    [2, 23, 33],
+    [3, 6, 37],
+    [4, 10, 30],
+    [5, 17, 20],
+    [8, 14, 35],
+    [9, 15, 27],
+    [11, 25, 29],
+    [13, 26, 28],
+    [21, 24, 34],
+    [22, 29, 31],
+    [3, 10, 36],
+    [0, 13, 22],
+    [1, 7, 24],
+    [2, 12, 26],
+    [4, 9, 36],
+    [5, 15, 30],
+    [6, 14, 17],
+    [8, 21, 23],
+    [11, 18, 35],
+    [16, 25, 37],
+    [19, 20, 32],
+    [19, 27, 34],
+    [3, 28, 33],
+    [0, 25, 35],
+    [1, 22, 33],
+    [2, 8, 37],
+    [4, 5, 16],
+    [6, 26, 34],
+    [7, 13, 31],
+    [9, 14, 21],
+    [10, 17, 28],
+    [11, 12, 27],
+    [15, 18, 32],
+    [20, 24, 30],
+    [23, 29, 36],
+    [0, 2, 20],
+    [1, 17, 30],
+    [3, 5, 8],
+    [4, 7, 32],
+    [6, 28, 31],
+    [9, 12, 18],
+    [10, 21, 22],
+    [11, 26, 33],
+    [13, 14, 29],
+    [15, 26, 37],
+    [16, 27, 36],
+    [19, 24, 25],
+    [4, 23, 34],
+    [2, 5, 35],
+    [0, 11, 30],
+    [1, 3, 32],
+    [2, 15, 29],
+    [0, 1, 23],
+    [4, 22, 26],
+    [5, 27, 31],
+    [6, 16, 35],
+    [7, 21, 37],
+    [8, 17, 19],
+    [9, 20, 28],
+    [10, 12, 33],
+    [3, 13, 19],
+    [10, 29, 37],
+    [13, 34, 36],
+    [14, 18, 25],
+    [2, 27, 28],
+    [6, 7, 8],
+    [4, 17, 33],
+    [12, 14, 16],
+    [11, 15, 34],
+    [9, 22, 24],
+    [18, 20, 36],
+    [16, 26, 30],
+    [23, 24, 35],
+    [0, 17, 18],
+    [5, 25, 32],
+    [21, 30, 31],
+    [2, 19, 21],
+    [3, 20, 26],
+    [1, 12, 28],
+    [5, 6, 11],
+    [14, 23, 31],
+    [8, 24, 29],
+    [22, 36, 37],
+    [4, 15, 25],
+    [10, 13, 27],
+    [32, 35, 37],
+    [7, 9, 34],
+];
+
+pub(super) fn decode_ft2(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+) -> Result<DecodeReport, DecoderError> {
+    let spec = Mode::Ft2.spec();
+    validate_audio(audio, spec)?;
+
+    let padded = ft2_padded_samples(audio);
+    let candidates = collect_candidates(&padded, options);
+    let mut decodes = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    for candidate in &candidates {
+        if let Some(decoded) = decode_candidate(&padded, candidate) {
+            if seen.insert(decoded.text.clone()) {
+                decodes.push(decoded);
+            }
+            if decodes.len() >= options.max_successes {
+                break;
+            }
+        }
+    }
+
+    Ok(DecodeReport {
+        sample_rate_hz: audio.sample_rate_hz,
+        duration_seconds: audio.samples.len() as f32 / audio.sample_rate_hz as f32,
+        decodes,
+        diagnostics: DecodeDiagnostics {
+            frame_count: FT2_NHSYM,
+            usable_bins: FT2_NH1,
+            examined_candidates: candidates.len(),
+            accepted_candidates: 0,
+            ldpc_codewords: 0,
+            parsed_payloads: 0,
+            top_candidates: candidates,
+        },
+    })
+}
+
+fn ft2_padded_samples(audio: &AudioBuffer) -> Vec<f32> {
+    let mut padded = vec![0.0f32; FT2_NMAX];
+    let copy_len = audio.samples.len().min(FT2_NMAX);
+    padded[..copy_len].copy_from_slice(&audio.samples[..copy_len]);
+    padded
+}
+
+fn collect_candidates(samples: &[f32], options: &DecodeOptions) -> Vec<DecodeCandidate> {
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(FT2_NFFT1);
+    let mut input = fft.make_input_vec();
+    let mut spectrum = fft.make_output_vec();
+    let mut savg = [0.0f32; FT2_NH1];
+    let fac = 1.0f32 / 300.0;
+
+    for j in 0..FT2_NHSYM {
+        let ia = j * FT2_NSTEP;
+        let ib = ia + FT2_NSPS;
+        input.fill(0.0);
+        for (dst, sample) in input[..FT2_NSPS].iter_mut().zip(samples[ia..ib].iter().copied()) {
+            *dst = fac * sample * i16::MAX as f32;
+        }
+        fft.process(&mut input, &mut spectrum).expect("ft2 sync fft");
+        for i in 1..=FT2_NH1 {
+            savg[i - 1] += spectrum[i].norm_sqr();
+        }
+    }
+
+    let mut savsm = [0.0f32; FT2_NH1];
+    savsm[0] = savg[0];
+    savsm[FT2_NH1 - 1] = savg[FT2_NH1 - 1];
+    for i in 1..FT2_NH1 - 1 {
+        savsm[i] = (savg[i - 1] + savg[i] + savg[i + 1]) / 3.0;
+    }
+
+    let df = 12_000.0 / FT2_NFFT1 as f32;
+    let nfa = (options.min_freq_hz.max(375.0) / df).round() as usize;
+    let nfb = (options.max_freq_hz.min(3_000.0) / df).round() as usize;
+    if nfa >= nfb || nfb >= FT2_NH1 {
+        return Vec::new();
+    }
+
+    let mut baseline = savsm[nfa..=nfb].to_vec();
+    baseline.sort_by(|left, right| left.total_cmp(right));
+    let baseline_index =
+        ((0.30 * baseline.len() as f32).round() as usize).clamp(1, baseline.len()) - 1;
+    let xn = baseline[baseline_index].max(1e-6);
+    for value in &mut savsm {
+        *value /= xn;
+    }
+
+    let mut raw = Vec::new();
+    for i in nfa..=nfb {
+        raw.push(DecodeCandidate {
+            start_seconds: 0.0,
+            dt_seconds: 0.0,
+            freq_hz: i as f32 * df,
+            score: savsm[i],
+        });
+    }
+    raw.sort_by(|left, right| right.score.total_cmp(&left.score));
+    raw.truncate(options.max_candidates.min(128));
+    raw
+}
+
+fn decode_candidate(samples: &[f32], candidate: &DecodeCandidate) -> Option<DecodedMessage> {
+    let c2 = ft2_downsample(samples, candidate.freq_hz);
+    let refs = Ft2Refs::global();
+    let mut best_ibest = 0usize;
+    let mut best_df = 0i32;
+    let mut best_sync = f32::NEG_INFINITY;
+
+    for df in -30..=30 {
+        let cb = twkfreq(&c2, df as f32, 750.0);
+        for is in 0..375usize {
+            let mut csync = Complex32::new(0.0, 0.0);
+            let mut cterm = Complex32::new(1.0, 0.0);
+            for (ib, &sync) in FT2_SYNC.iter().enumerate() {
+                let i1 = ib * FT2_DOWNSAMPLED_SYMBOL_SAMPLES + is;
+                let corr = if sync == 1 {
+                    dot_conj(
+                        &cb[i1..i1 + FT2_DOWNSAMPLED_SYMBOL_SAMPLES],
+                        &refs.c1,
+                    )
+                } else {
+                    dot_conj(
+                        &cb[i1..i1 + FT2_DOWNSAMPLED_SYMBOL_SAMPLES],
+                        &refs.c0,
+                    )
+                };
+                csync += corr * cterm;
+                cterm *= if sync == 1 { refs.cc1 } else { refs.cc0 };
+            }
+            let metric = csync.norm();
+            if metric > best_sync {
+                best_sync = metric;
+                best_ibest = is;
+                best_df = df;
+            }
+        }
+    }
+
+    let cb = twkfreq(&c2, best_df as f32, 750.0);
+    let mut cd = cb[best_ibest..best_ibest + FT2_SYMBOL_COUNT * FT2_DOWNSAMPLED_SYMBOL_SAMPLES]
+        .to_vec();
+    let power = cd.iter().map(|value| value.norm_sqr()).sum::<f32>() / cd.len() as f32;
+    if power <= 0.0 {
+        return None;
+    }
+    let gain = power.sqrt();
+    for sample in &mut cd {
+        *sample /= gain;
+    }
+
+    let mut ccor0 = [Complex32::new(0.0, 0.0); FT2_SYMBOL_COUNT];
+    let mut ccor1 = [Complex32::new(0.0, 0.0); FT2_SYMBOL_COUNT];
+    let mut sbits = [0.0f32; FT2_SYMBOL_COUNT];
+    let mut hbits = [0u8; FT2_SYMBOL_COUNT];
+    for bit in 0..FT2_SYMBOL_COUNT {
+        let start = bit * FT2_DOWNSAMPLED_SYMBOL_SAMPLES;
+        ccor1[bit] = dot_conj(&cd[start..start + FT2_DOWNSAMPLED_SYMBOL_SAMPLES], &refs.c1);
+        ccor0[bit] = dot_conj(&cd[start..start + FT2_DOWNSAMPLED_SYMBOL_SAMPLES], &refs.c0);
+        sbits[bit] = ccor1[bit].norm() - ccor0[bit].norm();
+        hbits[bit] = u8::from(sbits[bit] > 0.0);
+    }
+
+    let decoder = Ft2ParityMatrix::global();
+    let mut best_decode = None;
+    for nseq in 1..=5usize {
+        let metrics = if nseq == 1 {
+            sbits
+        } else {
+            sequence_metrics(nseq, &ccor0, &ccor1, refs)
+        };
+        let hard: [u8; FT2_SYMBOL_COUNT] = std::array::from_fn(|index| u8::from(metrics[index] > 0.0));
+        let sync_ok = FT2_SYNC
+            .iter()
+            .zip(hard[..16].iter())
+            .filter(|(left, right)| **left == **right)
+            .count();
+        if sync_ok < 10 {
+            break;
+        }
+
+        let rxdata = &metrics[16..];
+        let mean = rxdata.iter().copied().sum::<f32>() / rxdata.len() as f32;
+        let mean_sq = rxdata.iter().map(|value| value * value).sum::<f32>() / rxdata.len() as f32;
+        let sigma = (mean_sq - mean * mean).max(1e-6).sqrt();
+        let llrs: Vec<f32> = rxdata
+            .iter()
+            .map(|value| 2.0 * (value / sigma) / (0.8 * 0.8))
+            .collect();
+
+        if let Some((codeword, iterations)) = decoder.decode(&llrs) {
+            if codeword[..77].iter().all(|bit| *bit == 0) {
+                continue;
+            }
+            let payload = unpack_message_for_mode(Mode::Ft2, &codeword)?;
+            let message = payload.to_message(&HashResolver::default());
+            best_decode = Some(DecodedMessage {
+                utc: "000000".to_string(),
+                snr_db: (10.0 * (best_sync * best_sync).max(1e-12).log10() - 115.0).round() as i32,
+                dt_seconds: best_ibest as f32 / 750.0,
+                freq_hz: candidate.freq_hz + best_df as f32,
+                text: message.to_text(),
+                candidate_score: best_sync,
+                ldpc_iterations: iterations,
+                message,
+            });
+            break;
+        }
+    }
+    best_decode
+}
+
+fn sequence_metrics(
+    nseq: usize,
+    ccor0: &[Complex32; FT2_SYMBOL_COUNT],
+    ccor1: &[Complex32; FT2_SYMBOL_COUNT],
+    refs: &Ft2Refs,
+) -> [f32; FT2_SYMBOL_COUNT] {
+    let nbit = 2 * nseq - 1;
+    let half = nbit / 2;
+    let numseq = 1usize << nbit;
+    let mut metrics = [0.0f32; FT2_SYMBOL_COUNT];
+    for target in half..(FT2_SYMBOL_COUNT - half) {
+        let mut max1 = 0.0f32;
+        let mut max0 = 0.0f32;
+        for seq in 0..numseq {
+            let mut csum = Complex32::new(0.0, 0.0);
+            let mut cterm = Complex32::new(1.0, 0.0);
+            for pos in 0..nbit {
+                let bit = ((seq >> (nbit - 1 - pos)) & 1) as usize;
+                let index = target - half + pos;
+                csum += if bit == 1 { ccor1[index] } else { ccor0[index] } * cterm;
+                cterm *= if bit == 1 { refs.cc1 } else { refs.cc0 };
+            }
+            let score = csum.norm();
+            if ((seq >> half) & 1) == 1 {
+                max1 = max1.max(score);
+            } else {
+                max0 = max0.max(score);
+            }
+        }
+        metrics[target] = max1 - max0;
+    }
+    metrics
+}
+
+fn ft2_downsample(samples: &[f32], f0: f32) -> Vec<Complex32> {
+    let mut real_planner = RealFftPlanner::<f32>::new();
+    let rfft = real_planner.plan_fft_forward(FT2_NMAX);
+    let mut input = rfft.make_input_vec();
+    let mut spectrum = rfft.make_output_vec();
+    for (dst, sample) in input.iter_mut().zip(samples.iter().copied()) {
+        *dst = sample * i16::MAX as f32;
+    }
+    rfft.process(&mut input, &mut spectrum).expect("ft2 long fft");
+
+    let df = 12_000.0 / FT2_NMAX as f32;
+    let i0 = (f0 / df).round() as usize;
+    let mut c1 = vec![Complex32::new(0.0, 0.0); FT2_NFFT2];
+    c1[0] = spectrum[i0];
+    for i in 1..=(FT2_NFFT2 / 2) {
+        let arg = (i as f32 - 1.0) * df / (4.0 * 75.0);
+        let win = (-arg * arg).exp();
+        c1[i] = spectrum[i0 + i] * win;
+        c1[FT2_NFFT2 - i] = spectrum[i0 - i] * win;
+    }
+    let scale = 1.0 / FT2_NFFT2 as f32;
+    for value in &mut c1 {
+        *value *= scale;
+    }
+
+    let mut planner = FftPlanner::<f32>::new();
+    let ifft = planner.plan_fft_inverse(FT2_NFFT2);
+    ifft.process(&mut c1);
+    c1
+}
+
+fn twkfreq(samples: &[Complex32], df_hz: f32, sample_rate_hz: f32) -> Vec<Complex32> {
+    let step = Complex32::from_polar(1.0, -2.0 * std::f32::consts::PI * df_hz / sample_rate_hz);
+    let mut phase = Complex32::new(1.0, 0.0);
+    let mut out = Vec::with_capacity(samples.len());
+    for sample in samples {
+        out.push(*sample * phase);
+        phase *= step;
+    }
+    out
+}
+
+fn dot_conj(lhs: &[Complex32], rhs: &[Complex32]) -> Complex32 {
+    lhs.iter()
+        .zip(rhs.iter())
+        .fold(Complex32::new(0.0, 0.0), |acc, (left, right)| {
+            acc + *left * right.conj()
+        })
+}
+
+struct Ft2Refs {
+    c0: [Complex32; FT2_DOWNSAMPLED_SYMBOL_SAMPLES],
+    c1: [Complex32; FT2_DOWNSAMPLED_SYMBOL_SAMPLES],
+    cc0: Complex32,
+    cc1: Complex32,
+}
+
+impl Ft2Refs {
+    fn global() -> &'static Self {
+        static REFS: OnceLock<Ft2Refs> = OnceLock::new();
+        REFS.get_or_init(Self::new)
+    }
+
+    fn new() -> Self {
+        let fs = 12_000.0 / FT2_NDOWN as f32;
+        let dt = 1.0 / fs;
+        let tt = FT2_NSPS as f32 * dt;
+        let baud = 1.0 / tt;
+        let h = 0.8;
+        let twopi = 2.0 * std::f32::consts::PI;
+        let dphi = twopi / 2.0 * baud * h * dt * 16.0;
+        let mut phi0 = 0.0f32;
+        let mut phi1 = 0.0f32;
+        let c1 = std::array::from_fn(|_| {
+            let value = Complex32::new(phi1.cos(), phi1.sin());
+            phi1 = (phi1 + dphi).rem_euclid(twopi);
+            value
+        });
+        let c0 = std::array::from_fn(|_| {
+            let value = Complex32::new(phi0.cos(), phi0.sin());
+            phi0 = (phi0 - dphi).rem_euclid(twopi);
+            value
+        });
+        let the = twopi * h / 2.0;
+        Self {
+            c0,
+            c1,
+            cc1: Complex32::new(the.cos(), -the.sin()),
+            cc0: Complex32::new(the.cos(), the.sin()),
+        }
+    }
+}
+
+struct Ft2ParityMatrix {
+    row_columns: Vec<Vec<usize>>,
+    row_column_slots: Vec<Vec<usize>>,
+}
+
+impl Ft2ParityMatrix {
+    fn global() -> &'static Self {
+        static MATRIX: OnceLock<Ft2ParityMatrix> = OnceLock::new();
+        MATRIX.get_or_init(Self::new)
+    }
+
+    fn new() -> Self {
+        let mut row_columns = vec![Vec::new(); FT2_ROWS];
+        for (column, rows) in FT2_COLUMN_ROWS.iter().enumerate() {
+            for &row in rows {
+                row_columns[row].push(column);
+            }
+        }
+        let mut row_column_slots = vec![Vec::new(); FT2_ROWS];
+        for (row_index, columns) in row_columns.iter().enumerate() {
+            row_column_slots[row_index] = columns
+                .iter()
+                .map(|&column| {
+                    FT2_COLUMN_ROWS[column]
+                        .iter()
+                        .position(|&stored_row| stored_row == row_index)
+                        .expect("ft2 column contains row")
+                })
+                .collect();
+        }
+        Self {
+            row_columns,
+            row_column_slots,
+        }
+    }
+
+    fn decode(&self, llrs: &[f32]) -> Option<(Vec<u8>, usize)> {
+        if llrs.len() != FT2_COLUMNS {
+            return None;
+        }
+
+        let mut tov = [[0.0f32; 3]; FT2_COLUMNS];
+        let mut toc = [[0.0f32; 11]; FT2_ROWS];
+        let mut tanhtoc = [[0.0f32; 11]; FT2_ROWS];
+        let mut zn = [0.0f32; FT2_COLUMNS];
+
+        for (row_index, columns) in self.row_columns.iter().enumerate() {
+            for (slot, &column) in columns.iter().enumerate() {
+                toc[row_index][slot] = llrs[column];
+            }
+        }
+
+        let mut ncnt = 0isize;
+        let mut nclast = 0usize;
+        for iteration in 0..=FT2_BP_MAX_ITERS {
+            for column in 0..FT2_COLUMNS {
+                zn[column] = llrs[column] + tov[column][0] + tov[column][1] + tov[column][2];
+            }
+
+            let hard: [u8; FT2_COLUMNS] = std::array::from_fn(|index| u8::from(zn[index] > 0.0));
+            let ncheck = self
+                .row_columns
+                .iter()
+                .filter(|row| row.iter().fold(0u8, |acc, &column| acc ^ hard[column]) != 0)
+                .count();
+            if ncheck == 0 && crc::crc_matches_ft2(&hard[..77], &hard[77..90]) {
+                return Some((hard.to_vec(), iteration));
+            }
+
+            if iteration > 0 {
+                let delta = ncheck as isize - nclast as isize;
+                if delta < 0 {
+                    ncnt = 0;
+                } else {
+                    ncnt += 1;
+                }
+                if ncnt >= 3 && iteration >= 5 && ncheck > 10 {
+                    return None;
+                }
+            }
+            nclast = ncheck;
+
+            for (row_index, columns) in self.row_columns.iter().enumerate() {
+                for (slot, &column) in columns.iter().enumerate() {
+                    let column_slot = self.row_column_slots[row_index][slot];
+                    toc[row_index][slot] = zn[column] - tov[column][column_slot];
+                }
+            }
+
+            for (row_index, columns) in self.row_columns.iter().enumerate() {
+                for slot in 0..columns.len() {
+                    tanhtoc[row_index][slot] = (-toc[row_index][slot] / 2.0).tanh();
+                }
+            }
+
+            for column in 0..FT2_COLUMNS {
+                for (slot, &row_index) in FT2_COLUMN_ROWS[column].iter().enumerate() {
+                    let mut product = 1.0f32;
+                    for (row_slot, &other_column) in self.row_columns[row_index].iter().enumerate()
+                    {
+                        if other_column == column {
+                            continue;
+                        }
+                        product *= tanhtoc[row_index][row_slot];
+                    }
+                    tov[column][slot] = 2.0 * atanh_clamped(-product);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn atanh_clamped(value: f32) -> f32 {
+    let clamped = value.clamp(-0.999_999, 0.999_999);
+    0.5 * ((1.0 + clamped) / (1.0 - clamped)).ln()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::{WaveformOptions, encode_standard_message_for_mode, synthesize_rectangular_waveform};
+    use crate::message::GridReport;
+
+    #[test]
+    fn ft2_generated_waveform_round_trips_through_decoder() {
+        let frame = encode_standard_message_for_mode(
+            Mode::Ft2,
+            "K1ABC",
+            "W1XYZ",
+            false,
+            &GridReport::Grid("FN31".to_string()),
+        )
+        .expect("encode");
+        let audio = synthesize_rectangular_waveform(
+            &frame,
+            &WaveformOptions {
+                mode: Mode::Ft2,
+                base_freq_hz: 900.0,
+                total_seconds: 2.5,
+                start_seconds: 0.0,
+                ..WaveformOptions::default()
+            },
+        )
+        .expect("waveform");
+        let report = decode_ft2(&audio, &DecodeOptions {
+            mode: Mode::Ft2,
+            ..DecodeOptions::default()
+        })
+        .expect("decode");
+        assert!(
+            report
+                .decodes
+                .iter()
+                .any(|decode| decode.text == "K1ABC W1XYZ FN31")
+        );
+    }
+}

@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 use ft8_decoder::{
-    DecodeOptions, DecodeProfile, GridReport, WaveformOptions, debug_candidate_truth_wav_file,
-    debug_candidate_wav_file, decode_wav_file, encode_standard_message, parse_standard_info,
-    write_rectangular_standard_wav,
+    DecodeOptions, DecodeProfile, GridReport, Mode, WaveformOptions,
+    debug_candidate_truth_wav_file, debug_candidate_wav_file, decode_wav_file,
+    encode_standard_message, parse_standard_info, write_rectangular_standard_wav,
 };
 
 #[derive(Debug, Parser)]
@@ -42,6 +42,9 @@ enum Command {
 
         #[arg(long, default_value = "medium")]
         profile: String,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
 
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
@@ -102,6 +105,9 @@ enum Command {
 
         #[arg(long, default_value_t = 0.8)]
         amplitude: f32,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
     },
 }
 
@@ -117,12 +123,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_successes,
             search_passes,
             profile,
+            mode,
             pretty,
         } => {
             let profile = profile.parse::<DecodeProfile>().map_err(|message| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             })?;
+            let mode = mode.parse::<Mode>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
             let options = DecodeOptions {
+                mode,
                 profile,
                 min_freq_hz,
                 max_freq_hz,
@@ -195,9 +206,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_seconds,
             total_seconds,
             amplitude,
+            mode,
         } => {
             let info = parse_standard_info(&info)?;
+            let mode = mode.parse::<Mode>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
             let options = WaveformOptions {
+                mode,
                 base_freq_hz: freq_hz,
                 start_seconds,
                 total_seconds,

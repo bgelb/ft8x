@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn search_grid(audio: &AudioBuffer, options: &DecodeOptions) -> SearchGrid {
-    let spec = &ACTIVE_MODE;
+    let spec = options.mode.spec();
     let geometry = &spec.geometry;
     let min_bin = (options.min_freq_hz / geometry.tone_spacing_hz)
         .floor()
@@ -19,7 +19,7 @@ pub(super) fn search_grid(audio: &AudioBuffer, options: &DecodeOptions) -> Searc
 
 pub(super) fn build_spectrogram(audio: &AudioBuffer, options: &DecodeOptions) -> Spectrogram {
     let search_grid = search_grid(audio, options);
-    let geometry = &ACTIVE_MODE.geometry;
+    let geometry = &options.mode.spec().geometry;
     let min_bin = search_grid.min_bin;
     let usable_bins = search_grid.usable_bins;
     let frame_count = search_grid.frame_count;
@@ -65,7 +65,10 @@ pub(super) fn collect_candidates(
     options: &DecodeOptions,
     sync_threshold: f32,
 ) -> Vec<DecodeCandidate> {
-    let spec = &ACTIVE_MODE;
+    let spec = options.mode.spec();
+    if spec.mode == Mode::Ft4 {
+        return collect_candidates_legacy(audio, options);
+    }
     let geometry = &spec.geometry;
     let tuning = &spec.tuning;
     let sync_step_samples = spec.sync_step_samples();
@@ -88,7 +91,7 @@ pub(super) fn collect_candidates(
         return Vec::new();
     }
 
-    let plan = Sync8Plan::global();
+    let plan = Sync8Plan::for_mode(options.mode);
     let fft = &plan.forward;
     let mut input = fft.make_input_vec();
     let mut spectrum = fft.make_output_vec();
@@ -118,7 +121,7 @@ pub(super) fn collect_candidates(
         let mut best_local = (f32::NEG_INFINITY, 0isize);
         let mut best_wide = (f32::NEG_INFINITY, 0isize);
         for lag in -tuning.sync_max_lag..=tuning.sync_max_lag {
-            let score = sync8_score(&symbol_power, nhsym, bin, lag, nominal_start);
+            let score = sync8_score(spec, &symbol_power, nhsym, bin, lag, nominal_start);
             if (-tuning.sync_local_lag..=tuning.sync_local_lag).contains(&lag)
                 && score > best_local.0
             {
@@ -132,8 +135,8 @@ pub(super) fn collect_candidates(
         secondary.push((bin, best_wide.1, best_wide.0));
     }
 
-    normalize_sync_scores(&mut primary);
-    normalize_sync_scores(&mut secondary);
+    normalize_sync_scores(spec, &mut primary);
+    normalize_sync_scores(spec, &mut secondary);
 
     let mut raw = Vec::<DecodeCandidate>::new();
     for &(bin, lag, score) in &primary {
@@ -212,7 +215,7 @@ pub(super) fn collect_candidates_legacy(
     audio: &AudioBuffer,
     options: &DecodeOptions,
 ) -> Vec<DecodeCandidate> {
-    let spec = &ACTIVE_MODE;
+    let spec = options.mode.spec();
     let geometry = &spec.geometry;
     let tuning = &spec.tuning;
     let hops_per_symbol = geometry.hops_per_symbol();
@@ -226,17 +229,20 @@ pub(super) fn collect_candidates_legacy(
     for phase in 0..hops_per_symbol {
         let mut start_frame = phase;
         while start_frame < max_start_frame {
-            for base in 0..spectrogram.usable_bins.saturating_sub(7) {
+            for base in 0..spectrogram
+                .usable_bins
+                .saturating_sub(spec.tone_count().saturating_sub(1))
+            {
                 let mut score = 0.0f32;
                 for &(symbol_index, tone) in &costas {
                     let frame = start_frame + symbol_index * hops_per_symbol;
                     let row = frame * spectrogram.usable_bins;
                     let mut band_sum = 0.0;
-                    for offset in 0..8 {
+                    for offset in 0..spec.tone_count() {
                         band_sum += spectrogram.bins[row + base + offset];
                     }
                     let expected = spectrogram.bins[row + base + tone];
-                    score += expected * 8.0 - band_sum;
+                    score += expected * spec.tone_count() as f32 - band_sum;
                 }
                 raw.push(DecodeCandidate {
                     start_seconds: start_frame as f32 * geometry.hop_samples as f32
@@ -275,51 +281,75 @@ pub(super) fn collect_candidates_legacy(
 }
 
 impl Sync8Plan {
-    pub(super) fn global() -> &'static Self {
-        static PLAN: OnceLock<Sync8Plan> = OnceLock::new();
-        PLAN.get_or_init(|| {
-            let mut planner = RealFftPlanner::<f32>::new();
-            Self {
-                forward: planner.plan_fft_forward(ACTIVE_MODE.sync_fft_samples()),
+    pub(super) fn for_mode(mode: Mode) -> &'static Self {
+        match mode {
+            Mode::Ft8 => {
+                static PLAN: OnceLock<Sync8Plan> = OnceLock::new();
+                PLAN.get_or_init(|| Sync8Plan::new(mode.spec()))
             }
-        })
+            Mode::Ft4 => {
+                static PLAN: OnceLock<Sync8Plan> = OnceLock::new();
+                PLAN.get_or_init(|| Sync8Plan::new(mode.spec()))
+            }
+            Mode::Ft2 => {
+                static PLAN: OnceLock<Sync8Plan> = OnceLock::new();
+                PLAN.get_or_init(|| Sync8Plan::new(mode.spec()))
+            }
+        }
+    }
+
+    fn new(spec: &ModeSpec) -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        Self {
+            forward: planner.plan_fft_forward(spec.sync_fft_samples()),
+        }
     }
 }
 
 pub(super) fn sync8_score(
+    spec: &ModeSpec,
     symbol_power: &[f32],
     nhsym: usize,
     bin: usize,
     lag: isize,
     nominal_start: isize,
 ) -> f32 {
-    let geometry = &ACTIVE_MODE.geometry;
-    let row_len = ACTIVE_MODE.sync_fft_samples() / 2 + 1;
-    let sync_steps_per_symbol = ACTIVE_MODE.tuning.sync_step_divisor;
+    let geometry = &spec.geometry;
+    let row_len = spec.sync_fft_samples() / 2 + 1;
+    let sync_steps_per_symbol = spec.tuning.sync_step_divisor;
+    let tone_bin_stride = spec.sync_tone_bin_stride();
+    let tone_count = spec.tone_count();
     let mut block_signal = vec![0.0f32; geometry.sync_block_starts.len()];
     let mut block_band = vec![0.0f32; geometry.sync_block_starts.len()];
 
-    for (offset, costas) in geometry.costas_pattern.iter().copied().enumerate() {
-        for (block_index, &block_start) in geometry.sync_block_starts.iter().enumerate() {
+    for (block_index, (&block_start, pattern)) in geometry
+        .sync_block_starts
+        .iter()
+        .zip(geometry.sync_patterns.iter().copied())
+        .enumerate()
+    {
+        for (offset, costas) in pattern.iter().copied().enumerate() {
             let row_start =
                 lag + nominal_start + ((block_start + offset) * sync_steps_per_symbol) as isize;
             if !(1..=nhsym as isize).contains(&row_start) {
                 continue;
             }
             let row = (row_start as usize - 1) * row_len;
-            block_signal[block_index] += symbol_power[row + bin + 2 * costas];
-            for tone in 0..7 {
-                block_band[block_index] += symbol_power[row + bin + 2 * tone];
+            block_signal[block_index] += symbol_power[row + bin + tone_bin_stride * costas];
+            for tone in 0..tone_count {
+                block_band[block_index] += symbol_power[row + bin + tone_bin_stride * tone];
             }
         }
     }
 
     let score_all = ratio_sync_score(
+        spec,
         block_signal.iter().copied().sum(),
         block_band.iter().copied().sum(),
     );
     let score_tail = if block_signal.len() > 1 {
         ratio_sync_score(
+            spec,
             block_signal[1..].iter().copied().sum(),
             block_band[1..].iter().copied().sum(),
         )
@@ -329,12 +359,12 @@ pub(super) fn sync8_score(
     score_all.max(score_tail)
 }
 
-pub(super) fn ratio_sync_score(signal: f32, band_total: f32) -> f32 {
-    let noise = (band_total - signal) / (ACTIVE_MODE.sync_tone_span_bins() - 1) as f32;
+pub(super) fn ratio_sync_score(spec: &ModeSpec, signal: f32, band_total: f32) -> f32 {
+    let noise = (band_total - signal) / (spec.tone_count().saturating_sub(1).max(1)) as f32;
     if noise > 0.0 { signal / noise } else { 0.0 }
 }
 
-pub(super) fn normalize_sync_scores(scores: &mut [(usize, isize, f32)]) {
+pub(super) fn normalize_sync_scores(spec: &ModeSpec, scores: &mut [(usize, isize, f32)]) {
     let mut values: Vec<f32> = scores
         .iter()
         .map(|&(_, _, score)| score)
@@ -344,11 +374,11 @@ pub(super) fn normalize_sync_scores(scores: &mut [(usize, isize, f32)]) {
         return;
     }
     values.sort_by(|left, right| left.total_cmp(right));
-    let percentile = ((values.len() as f32 * ACTIVE_MODE.tuning.sync_baseline_percentile).round()
-        as usize)
-        .clamp(1, values.len())
-        - 1;
-    let baseline = values[percentile].max(ACTIVE_MODE.tuning.sync_baseline_floor);
+    let percentile =
+        ((values.len() as f32 * spec.tuning.sync_baseline_percentile).round() as usize)
+            .clamp(1, values.len())
+            - 1;
+    let baseline = values[percentile].max(spec.tuning.sync_baseline_floor);
     for (_, _, score) in scores.iter_mut() {
         *score /= baseline;
     }
@@ -360,26 +390,31 @@ mod tests {
 
     #[test]
     fn sync8_score_uses_quarter_symbol_row_mapping() {
-        let geometry = &ACTIVE_MODE.geometry;
-        let row_len = ACTIVE_MODE.sync_fft_samples() / 2 + 1;
+        let spec = Mode::Ft8.spec();
+        let geometry = &spec.geometry;
+        let row_len = spec.sync_fft_samples() / 2 + 1;
         let nhsym = 400usize;
         let bin = 10usize;
         let nominal_start = 2isize;
         let lag = 0isize;
         let mut symbol_power = vec![0.0f32; nhsym * row_len];
 
-        for (offset, costas) in geometry.costas_pattern.iter().copied().enumerate() {
-            for &block_start in geometry.sync_block_starts {
-                let row_start = nominal_start
-                    + ((block_start + offset) * ACTIVE_MODE.tuning.sync_step_divisor) as isize;
+        for (&block_start, pattern) in geometry
+            .sync_block_starts
+            .iter()
+            .zip(geometry.sync_patterns.iter().copied())
+        {
+            for (offset, costas) in pattern.iter().copied().enumerate() {
+                let row_start =
+                    nominal_start + ((block_start + offset) * spec.tuning.sync_step_divisor) as isize;
                 let row = (row_start as usize - 1) * row_len;
-                for tone in 0..7 {
-                    symbol_power[row + bin + 2 * tone] = 1.0;
+                for tone in 0..spec.tone_count() {
+                    symbol_power[row + bin + spec.sync_tone_bin_stride() * tone] = 1.0;
                 }
-                symbol_power[row + bin + 2 * costas] = 8.0;
+                symbol_power[row + bin + spec.sync_tone_bin_stride() * costas] = 8.0;
             }
         }
 
-        assert!(sync8_score(&symbol_power, nhsym, bin, lag, nominal_start) > 5.0);
+        assert!(sync8_score(spec, &symbol_power, nhsym, bin, lag, nominal_start) > 5.0);
     }
 }

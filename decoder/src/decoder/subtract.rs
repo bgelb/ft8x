@@ -21,11 +21,19 @@ pub(super) fn subtract_candidate_with_dt_refinement(
     plan: &SubtractionPlan,
     refine_dt: bool,
 ) {
-    let Some(channel_symbols) = channel_symbols_from_codeword_bits(&success.codeword_bits) else {
+    let Some(channel_symbols) =
+        channel_symbols_from_codeword_bits_for_mode(success.mode, &success.codeword_bits)
+    else {
         return;
     };
-    let start_sample = ACTIVE_MODE.start_sample_from_dt(success.candidate.dt_seconds);
-    let reference = synthesize_channel_reference(&channel_symbols, success.candidate.freq_hz);
+    let spec = success.mode.spec();
+    let start_sample = spec.start_sample_from_dt(success.candidate.dt_seconds);
+    let reference =
+        synthesize_channel_reference_for_mode(
+            success.mode,
+            &channel_symbols,
+            success.candidate.freq_hz,
+        );
     let offset_samples = if refine_dt {
         let Some(offset_samples) = refined_subtraction_offset(
             audio,
@@ -50,7 +58,8 @@ pub(super) fn refined_subtraction_offset(
     start_sample: isize,
     plan: &SubtractionPlan,
 ) -> Option<isize> {
-    let probe_step = ACTIVE_MODE.tuning.subtraction_refine_probe_step_samples;
+    let spec = plan.spec;
+    let probe_step = spec.tuning.subtraction_refine_probe_step_samples;
     let sqm =
         subtraction_residual_band_power(audio, reference, freq_hz, start_sample - probe_step, plan);
     let sq0 = subtraction_residual_band_power(audio, reference, freq_hz, start_sample, plan);
@@ -110,7 +119,8 @@ pub(super) fn subtraction_residual_band_power(
     start_sample: isize,
     plan: &SubtractionPlan,
 ) -> f32 {
-    let mut residual = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
+    let spec = plan.spec;
+    let mut residual = vec![Complex32::new(0.0, 0.0); long_input_samples(spec)];
     let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
         let residual_window =
@@ -133,11 +143,11 @@ pub(super) fn subtraction_residual_band_power(
         }
     }
     plan.forward.process(&mut residual);
-    let df = ACTIVE_MODE.geometry.sample_rate_hz as f32 / LONG_INPUT_SAMPLES as f32;
-    let start_bin = (ACTIVE_MODE.band_low_hz(freq_hz) / df).trunc().max(0.0) as usize;
-    let end_bin = (ACTIVE_MODE.band_high_hz(freq_hz) / df)
+    let df = spec.geometry.sample_rate_hz as f32 / long_input_samples(spec) as f32;
+    let start_bin = (spec.band_low_hz(freq_hz) / df).trunc().max(0.0) as usize;
+    let end_bin = (spec.band_high_hz(freq_hz) / df)
         .trunc()
-        .min((LONG_INPUT_SAMPLES / 2) as f32) as usize;
+        .min((long_input_samples(spec) / 2) as f32) as usize;
     residual[start_bin..=end_bin]
         .iter()
         .map(|value| value.re * value.re + value.im * value.im)
@@ -150,7 +160,7 @@ pub(super) fn filtered_subtraction_envelope(
     start_sample: isize,
     plan: &SubtractionPlan,
 ) -> Vec<Complex32> {
-    let mut envelope = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
+    let mut envelope = vec![Complex32::new(0.0, 0.0); long_input_samples(plan.spec)];
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
         let envelope_window =
             &mut envelope[window.reference_start..window.reference_start + window.len];
@@ -170,7 +180,7 @@ pub(super) fn filtered_subtraction_envelope(
         *value *= *filter;
     }
     plan.inverse.process(&mut envelope);
-    let scale = 1.0 / LONG_INPUT_SAMPLES as f32;
+    let scale = 1.0 / long_input_samples(plan.spec) as f32;
     for value in &mut envelope {
         *value *= scale;
     }
@@ -206,28 +216,43 @@ pub(super) fn apply_subtraction(
 }
 
 impl SubtractionPlan {
-    pub(super) fn global() -> &'static Self {
-        static PLAN: OnceLock<SubtractionPlan> = OnceLock::new();
-        PLAN.get_or_init(Self::new)
+    pub(super) fn for_mode(mode: Mode) -> &'static Self {
+        match mode {
+            Mode::Ft8 => {
+                static PLAN: OnceLock<SubtractionPlan> = OnceLock::new();
+                PLAN.get_or_init(|| SubtractionPlan::new(mode.spec()))
+            }
+            Mode::Ft4 => {
+                static PLAN: OnceLock<SubtractionPlan> = OnceLock::new();
+                PLAN.get_or_init(|| SubtractionPlan::new(mode.spec()))
+            }
+            Mode::Ft2 => {
+                static PLAN: OnceLock<SubtractionPlan> = OnceLock::new();
+                PLAN.get_or_init(|| SubtractionPlan::new(mode.spec()))
+            }
+        }
     }
 
-    fn new() -> Self {
+    fn new(spec: &'static ModeSpec) -> Self {
         let mut planner = FftPlanner::<f32>::new();
-        let forward = planner.plan_fft_forward(LONG_INPUT_SAMPLES);
-        let inverse = planner.plan_fft_inverse(LONG_INPUT_SAMPLES);
+        let long_input_samples = long_input_samples(spec);
+        let forward = planner.plan_fft_forward(long_input_samples);
+        let inverse = planner.plan_fft_inverse(long_input_samples);
+        let subtract_filter_samples = spec.tuning.subtract_filter_samples;
+        let subtract_filter_half = subtract_filter_samples / 2;
 
-        let mut window = Vec::with_capacity(SUBTRACT_FILTER_SAMPLES);
-        for tap in -(SUBTRACT_FILTER_HALF as isize)..=(SUBTRACT_FILTER_HALF as isize) {
-            let phase = std::f32::consts::PI * tap as f32 / SUBTRACT_FILTER_SAMPLES as f32;
+        let mut window = Vec::with_capacity(subtract_filter_samples);
+        for tap in -(subtract_filter_half as isize)..=(subtract_filter_half as isize) {
+            let phase = std::f32::consts::PI * tap as f32 / subtract_filter_samples as f32;
             window.push(phase.cos().powi(2));
         }
         let sumw = window.iter().copied().sum::<f32>();
 
-        let mut kernel = vec![Complex32::new(0.0, 0.0); LONG_INPUT_SAMPLES];
+        let mut kernel = vec![Complex32::new(0.0, 0.0); long_input_samples];
         for (index, weight) in window.iter().copied().enumerate() {
-            let lag = index as isize - SUBTRACT_FILTER_HALF as isize;
+            let lag = index as isize - subtract_filter_half as isize;
             let slot = if lag < 0 {
-                (LONG_INPUT_SAMPLES as isize + lag) as usize
+                (long_input_samples as isize + lag) as usize
             } else {
                 lag as usize
             };
@@ -235,9 +260,9 @@ impl SubtractionPlan {
         }
         forward.process(&mut kernel);
 
-        let mut edge_correction = Vec::with_capacity(SUBTRACT_FILTER_HALF + 1);
-        for edge in 0..=SUBTRACT_FILTER_HALF {
-            let missing = window[SUBTRACT_FILTER_HALF + edge..]
+        let mut edge_correction = Vec::with_capacity(subtract_filter_half + 1);
+        for edge in 0..=subtract_filter_half {
+            let missing = window[subtract_filter_half + edge..]
                 .iter()
                 .copied()
                 .sum::<f32>();
@@ -249,6 +274,7 @@ impl SubtractionPlan {
             inverse,
             filter_spectrum: kernel,
             edge_correction,
+            spec,
         }
     }
 }
@@ -259,6 +285,7 @@ mod tests {
 
     #[test]
     fn refined_subtraction_offset_is_zero_for_aligned_reference() {
+        let mode = Mode::Ft8;
         let frame =
             crate::encode::encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank)
                 .expect("encode frame");
@@ -271,8 +298,8 @@ mod tests {
             },
         )
         .expect("audio");
-        let reference = synthesize_channel_reference(&frame.channel_symbols, 1_234.0);
-        let start_sample = ACTIVE_MODE.start_sample_from_dt(0.0);
+        let reference = synthesize_channel_reference_for_mode(mode, &frame.channel_symbols, 1_234.0);
+        let start_sample = mode.spec().start_sample_from_dt(0.0);
 
         assert_eq!(
             refined_subtraction_offset(
@@ -280,7 +307,7 @@ mod tests {
                 &reference,
                 1_234.0,
                 start_sample,
-                SubtractionPlan::global(),
+                SubtractionPlan::for_mode(mode),
             ),
             Some(0)
         );

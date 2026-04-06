@@ -18,14 +18,17 @@ impl DecoderSession {
         audio: &AudioBuffer,
         options: &DecodeOptions,
     ) -> Result<Vec<StageDecodeReport>, DecoderError> {
-        validate_audio(audio)?;
+        let spec = options.mode.spec();
+        validate_audio(audio, spec)?;
 
         let mut updates = Vec::new();
         for stage in DecodeStage::ordered() {
             if self.emitted_stages.contains(&stage) {
                 continue;
             }
-            if !stage_is_enabled(stage, options) || audio.samples.len() < stage.required_samples() {
+            if !stage_is_enabled(stage, options)
+                || audio.samples.len() < stage.required_samples(spec)
+            {
                 continue;
             }
             let update = self.decode_stage(audio, options, stage)?;
@@ -40,7 +43,8 @@ impl DecoderSession {
         options: &DecodeOptions,
         state: Option<&DecoderState>,
     ) -> Result<Vec<(StageDecodeReport, DecoderState)>, DecoderError> {
-        validate_audio(audio)?;
+        let spec = options.mode.spec();
+        validate_audio(audio, spec)?;
 
         let mut updates = Vec::new();
         let mut current_state = state.cloned();
@@ -48,7 +52,9 @@ impl DecoderSession {
             if self.emitted_stages.contains(&stage) {
                 continue;
             }
-            if !stage_is_enabled(stage, options) || audio.samples.len() < stage.required_samples() {
+            if !stage_is_enabled(stage, options)
+                || audio.samples.len() < stage.required_samples(spec)
+            {
                 continue;
             }
             let (update, next_state) =
@@ -76,7 +82,8 @@ impl DecoderSession {
         stage: DecodeStage,
         state: Option<&DecoderState>,
     ) -> Result<(StageDecodeReport, DecoderState), DecoderError> {
-        validate_audio(audio)?;
+        let spec = options.mode.spec();
+        validate_audio(audio, spec)?;
         if !stage_is_enabled(stage, options) {
             return Err(DecoderError::UnsupportedFormat(format!(
                 "stage {} is not enabled for profile {}",
@@ -84,7 +91,7 @@ impl DecoderSession {
                 options.profile.as_str()
             )));
         }
-        if audio.samples.len() < stage.required_samples() {
+        if audio.samples.len() < stage.required_samples(spec) {
             return Err(DecoderError::UnsupportedFormat(format!(
                 "audio too short for stage {}",
                 stage.as_str()
@@ -93,14 +100,14 @@ impl DecoderSession {
 
         let search = match stage {
             DecodeStage::Early41 => {
-                let early_audio = zero_tail(audio, EARLY_41_SAMPLES);
+                let early_audio = zero_tail(audio, early_41_samples(spec));
                 let search = run_decode_search(
                     &early_audio,
                     options,
                     None,
                     Vec::new(),
                     state.map(|state| &state.resolver),
-                    SYNC8_EARLY_THRESHOLD,
+                    sync8_early_threshold(spec),
                     false,
                 );
                 self.early41 = Some(search.clone());
@@ -182,8 +189,8 @@ pub(super) fn is_new_success(
     !seen.contains(&candidate_key)
 }
 
-pub(super) fn validate_audio(audio: &AudioBuffer) -> Result<(), DecoderError> {
-    let geometry = &ACTIVE_MODE.geometry;
+pub(super) fn validate_audio(audio: &AudioBuffer, spec: &ModeSpec) -> Result<(), DecoderError> {
+    let geometry = &spec.geometry;
     if audio.sample_rate_hz != geometry.sample_rate_hz {
         return Err(DecoderError::UnsupportedFormat(format!(
             "expected {} Hz audio, got {} Hz",
@@ -211,11 +218,12 @@ pub(super) fn run_early47_search(
     early41: Option<&SearchResult>,
     state: Option<&DecoderState>,
 ) -> SearchResult {
-    let subtraction_plan = SubtractionPlan::global();
-    let mut partial47 = zero_tail(audio, EARLY_47_SAMPLES);
+    let spec = options.mode.spec();
+    let subtraction_plan = SubtractionPlan::for_mode(options.mode);
+    let mut partial47 = zero_tail(audio, early_47_samples(spec));
     if let Some(stage41) = early41 {
         for success in &stage41.successes {
-            if success.candidate.dt_seconds < ACTIVE_MODE.tuning.subtraction_refine_cutoff_seconds {
+            if success.candidate.dt_seconds < spec.tuning.subtraction_refine_cutoff_seconds {
                 subtract_candidate_with_dt_refinement(
                     &mut partial47,
                     success,
@@ -246,7 +254,7 @@ pub(super) fn run_full_search(
     early47: Option<&SearchResult>,
     state: Option<&DecoderState>,
 ) -> SearchResult {
-    let subtraction_plan = SubtractionPlan::global();
+    let subtraction_plan = SubtractionPlan::for_mode(options.mode);
     let initial_successes = early47
         .map(|stage| stage.successes.clone())
         .or_else(|| early41.map(|stage| stage.successes.clone()))
@@ -374,8 +382,9 @@ pub(super) fn run_decode_search(
     let total_passes = options.search_passes.max(1);
     let has_residual_override = residual_override.is_some();
     let mut residual_audio = residual_override.unwrap_or_else(|| audio.clone());
-    let baseband_plan = BasebandPlan::new();
-    let subtraction_plan = SubtractionPlan::global();
+    let spec = options.mode.spec();
+    let baseband_plan = BasebandPlan::new(spec);
+    let subtraction_plan = SubtractionPlan::for_mode(options.mode);
     let parity = ParityMatrix::global();
     let mut top_candidates = Vec::new();
     let mut counters = DecodeCounters::default();
@@ -391,7 +400,7 @@ pub(super) fn run_decode_search(
     }
 
     for pass in 0..total_passes {
-        let long_spectrum = build_long_spectrum(&residual_audio);
+        let long_spectrum = build_long_spectrum(&residual_audio, spec);
         let mut pass_options = options.clone();
         pass_options.max_candidates = options.max_candidates_for_pass(pass);
         let candidates = collect_candidates(&residual_audio, &pass_options, sync_threshold);
@@ -411,6 +420,7 @@ pub(super) fn run_decode_search(
                 &long_spectrum,
                 &baseband_plan,
                 candidate,
+                spec,
                 options,
                 pass,
                 parity,
@@ -456,6 +466,7 @@ pub(super) fn try_candidate(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
     candidate: &DecodeCandidate,
+    spec: &ModeSpec,
     options: &DecodeOptions,
     outer_pass: usize,
     parity: &ParityMatrix,
@@ -468,13 +479,15 @@ pub(super) fn try_candidate(
     if coarse_freq_hz < options.min_freq_hz || coarse_freq_hz > options.max_freq_hz {
         return None;
     }
-    let Some(initial_baseband) = downsample_candidate(long_spectrum, baseband_plan, coarse_freq_hz)
+    let Some(initial_baseband) =
+        downsample_candidate(long_spectrum, baseband_plan, spec, coarse_freq_hz)
     else {
         return None;
     };
     if let Some(refined) = refine_candidate_with_cache(
         long_spectrum,
         baseband_plan,
+        spec,
         &initial_baseband,
         &mut refined_basebands,
         candidate.start_seconds,
@@ -483,6 +496,7 @@ pub(super) fn try_candidate(
         let max_osd = options.max_osd_passes(outer_pass, refined.freq_hz);
         best = try_refined_candidate(
             &refined,
+            options.mode,
             candidate.score,
             max_osd,
             allow_ap,
@@ -493,11 +507,13 @@ pub(super) fn try_candidate(
         if best.is_none() && matches!(options.profile, DecodeProfile::Medium) {
             if let Some(seed) = extract_candidate_from_baseband(
                 &initial_baseband,
+                spec,
                 candidate.start_seconds,
                 coarse_freq_hz,
             ) {
                 best = try_refined_candidate(
                     &seed,
+                    options.mode,
                     candidate.score,
                     max_osd,
                     allow_ap,
@@ -512,6 +528,7 @@ pub(super) fn try_candidate(
 
 pub(super) fn try_refined_candidate(
     refined: &RefinedCandidate,
+    mode: Mode,
     candidate_score: f32,
     max_osd: isize,
     allow_ap: bool,
@@ -519,16 +536,18 @@ pub(super) fn try_refined_candidate(
     counters: &mut DecodeCounters,
 ) -> Option<SuccessfulDecode> {
     for llrs in &refined.llr_sets {
-        let Some((payload, bits, iterations)) = decode_llr_set(parity, llrs, max_osd, counters)
+        let Some((payload, bits, iterations)) =
+            decode_llr_set(mode, parity, llrs, max_osd, counters)
         else {
             continue;
         };
         return Some(SuccessfulDecode {
+            mode,
             payload,
             codeword_bits: bits,
             candidate: DecodeCandidate {
                 start_seconds: refined.start_seconds,
-                dt_seconds: ACTIVE_MODE.dt_seconds_from_start(refined.start_seconds),
+                dt_seconds: mode.spec().dt_seconds_from_start(refined.start_seconds),
                 freq_hz: refined.freq_hz,
                 score: refined.sync_score.max(candidate_score),
             },
@@ -544,17 +563,20 @@ pub(super) fn try_refined_candidate(
             .fold(0.0f32, f32::max)
             * 1.01;
         if ap_magnitude > 0.0 {
-            for known_bits in [cq_ap_known_bits(), mycall_ap_known_bits()] {
+            for known_bits in [cq_ap_known_bits(mode), mycall_ap_known_bits(mode)] {
                 let ap_llrs = llrs_with_known_bits(&refined.llr_sets[0], known_bits, ap_magnitude);
                 if let Some((payload, bits, iterations)) =
-                    decode_llr_set_with_known_bits(parity, &ap_llrs, known_bits, max_osd, counters)
+                    decode_llr_set_with_known_bits(
+                        mode, parity, &ap_llrs, known_bits, max_osd, counters,
+                    )
                 {
                     return Some(SuccessfulDecode {
+                        mode,
                         payload,
                         codeword_bits: bits,
                         candidate: DecodeCandidate {
                             start_seconds: refined.start_seconds,
-                            dt_seconds: ACTIVE_MODE.dt_seconds_from_start(refined.start_seconds),
+                            dt_seconds: mode.spec().dt_seconds_from_start(refined.start_seconds),
                             freq_hz: refined.freq_hz,
                             score: refined.sync_score.max(candidate_score),
                         },
@@ -574,6 +596,7 @@ mod tests {
     use super::*;
     use crate::message::ReplyWord;
     use crate::message::hash_callsign;
+    use crate::message::unpack_message_for_mode;
 
     #[test]
     fn merged_resolver_collects_callsigns_from_successes() {
@@ -585,16 +608,17 @@ mod tests {
             true,
         )
         .expect("encode frame");
-        let payload = unpack_message(&frame.codeword_bits)
+        let payload = unpack_message_for_mode(Mode::Ft8, &frame.codeword_bits)
             .expect("payload")
             .clone();
         let resolver = merged_resolver(
             None,
             &[SuccessfulDecode {
+                mode: Mode::Ft8,
                 payload,
                 codeword_bits: frame.codeword_bits.to_vec(),
                 candidate: DecodeCandidate {
-                    start_seconds: ACTIVE_MODE.nominal_start_seconds(),
+                    start_seconds: Mode::Ft8.spec().nominal_start_seconds(),
                     dt_seconds: 0.0,
                     freq_hz: 1_200.0,
                     score: 1.0,

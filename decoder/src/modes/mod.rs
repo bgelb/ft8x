@@ -1,4 +1,62 @@
+pub mod ft2;
+pub mod ft4;
 pub mod ft8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    Ft8,
+    Ft4,
+    Ft2,
+}
+
+impl Mode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ft8 => "ft8",
+            Self::Ft4 => "ft4",
+            Self::Ft2 => "ft2",
+        }
+    }
+
+    pub const fn spec(self) -> &'static ModeSpec {
+        match self {
+            Self::Ft8 => &ft8::FT8_SPEC,
+            Self::Ft4 => &ft4::FT4_SPEC,
+            Self::Ft2 => &ft2::FT2_SPEC,
+        }
+    }
+}
+
+impl Default for Mode {
+    fn default() -> Self {
+        Self::Ft8
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ft8" => Ok(Self::Ft8),
+            "ft4" => Ok(Self::Ft4),
+            "ft2" => Ok(Self::Ft2),
+            other => Err(format!(
+                "unsupported mode '{other}'; expected ft8, ft4, or ft2"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelCoding {
+    pub message_bits: usize,
+    pub crc_bits: usize,
+    pub info_bits: usize,
+    pub codeword_bits: usize,
+    pub bits_per_symbol: usize,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct FrameGeometry {
@@ -7,14 +65,23 @@ pub struct FrameGeometry {
     pub tone_spacing_hz: f32,
     pub message_symbols: usize,
     pub sync_block_starts: &'static [usize],
-    pub costas_pattern: &'static [usize],
+    pub sync_patterns: &'static [&'static [usize]],
     pub data_symbol_positions: &'static [usize],
+    pub data_symbol_group_starts: &'static [usize],
     pub hop_samples: usize,
 }
 
 impl FrameGeometry {
-    pub const fn sync_symbol_count(&self) -> usize {
-        self.sync_block_starts.len() * self.costas_pattern.len()
+    pub fn sync_symbol_count(&self) -> usize {
+        self.sync_patterns.iter().map(|pattern| pattern.len()).sum()
+    }
+
+    pub const fn sync_block_count(&self) -> usize {
+        self.sync_block_starts.len()
+    }
+
+    pub fn sync_pattern_len(&self) -> usize {
+        self.sync_patterns.first().map_or(0, |pattern| pattern.len())
     }
 
     pub const fn hops_per_symbol(&self) -> usize {
@@ -61,6 +128,8 @@ pub struct SearchTuning {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModeSpec {
+    pub mode: Mode,
+    pub coding: ChannelCoding,
     pub geometry: FrameGeometry,
     pub tuning: SearchTuning,
 }
@@ -111,6 +180,14 @@ impl ModeSpec {
         self.geometry.sample_rate_hz as f32 / self.sync_fft_samples() as f32
     }
 
+    pub const fn tone_count(&self) -> usize {
+        1usize << self.coding.bits_per_symbol
+    }
+
+    pub fn sync_tone_bin_stride(&self) -> usize {
+        (self.sync_fft_samples() / self.geometry.symbol_samples).max(1)
+    }
+
     pub fn early41_samples(&self) -> usize {
         41 * self.tuning.early_block_samples
     }
@@ -127,27 +204,30 @@ impl ModeSpec {
         self.tuning.baseband_valid_samples
     }
 
-    /// Number of LDPC code bits carried by one data half of the frame.
-    pub const fn codeword_half_bits(&self) -> usize {
-        self.geometry.data_symbol_positions.len() * 3 / 2
+    pub const fn data_symbol_groups(&self) -> usize {
+        self.geometry.data_symbol_group_starts.len()
     }
 
-    /// Number of 3-bit data symbols carried by one data half of the frame.
+    /// Number of LDPC code bits carried by one FT8-style data half of the frame.
+    pub const fn codeword_half_bits(&self) -> usize {
+        self.coding.codeword_bits / self.geometry.data_symbol_group_starts.len()
+    }
+
+    /// Number of payload symbols carried by one FT8-style data half of the frame.
     pub const fn groups_per_half(&self) -> usize {
-        self.geometry.data_symbol_positions.len() / 2
+        self.geometry.data_symbol_positions.len() / self.geometry.data_symbol_group_starts.len()
     }
 
     /// Legacy FT8 bitmetric loops index from the symbol just before each 29-symbol data half.
     pub fn bitmetric_half_start_symbols(&self) -> [usize; 2] {
-        let groups_per_half = self.groups_per_half();
         [
-            self.geometry.data_symbol_positions[0] - 1,
-            self.geometry.data_symbol_positions[groups_per_half] - 1,
+            self.geometry.data_symbol_group_starts[0] - 1,
+            self.geometry.data_symbol_group_starts[1] - 1,
         ]
     }
 
-    pub const fn sync_tone_span_bins(&self) -> usize {
-        self.geometry.costas_pattern.len()
+    pub fn sync_tone_span_bins(&self) -> usize {
+        self.geometry.sync_pattern_len()
     }
 
     pub fn start_seconds_from_dt(&self, dt_seconds: f32) -> f32 {
@@ -190,8 +270,12 @@ impl ModeSpec {
 
 pub fn all_costas_positions(geometry: &FrameGeometry) -> Vec<(usize, usize)> {
     let mut positions = Vec::with_capacity(geometry.sync_symbol_count());
-    for &block_start in geometry.sync_block_starts {
-        for (offset, tone) in geometry.costas_pattern.iter().copied().enumerate() {
+    for (&block_start, pattern) in geometry
+        .sync_block_starts
+        .iter()
+        .zip(geometry.sync_patterns.iter().copied())
+    {
+        for (offset, tone) in pattern.iter().copied().enumerate() {
             positions.push((block_start + offset, tone));
         }
     }
@@ -210,11 +294,15 @@ pub fn populate_channel_symbols(
     }
 
     channel_symbols.fill(0);
-    for &block_start in geometry.sync_block_starts {
-        if block_start + geometry.costas_pattern.len() > channel_symbols.len() {
+    for (&block_start, pattern) in geometry
+        .sync_block_starts
+        .iter()
+        .zip(geometry.sync_patterns.iter().copied())
+    {
+        if block_start + pattern.len() > channel_symbols.len() {
             return None;
         }
-        for (offset, tone) in geometry.costas_pattern.iter().copied().enumerate() {
+        for (offset, tone) in pattern.iter().copied().enumerate() {
             channel_symbols[block_start + offset] = tone as u8;
         }
     }
@@ -236,16 +324,26 @@ mod tests {
 
     const MOCK_SYNC_BLOCKS: [usize; 2] = [0, 3];
     const MOCK_COSTAS: [usize; 2] = [1, 0];
+    const MOCK_SYNC_PATTERNS: [&[usize]; 2] = [&MOCK_COSTAS, &MOCK_COSTAS];
     const MOCK_DATA_POSITIONS: [usize; 4] = [2, 5, 6, 7];
+    const MOCK_GROUP_STARTS: [usize; 2] = [2, 5];
     const MOCK_GEOMETRY: FrameGeometry = FrameGeometry {
         sample_rate_hz: 4_000,
         symbol_samples: 160,
         tone_spacing_hz: 12.5,
         message_symbols: 8,
         sync_block_starts: &MOCK_SYNC_BLOCKS,
-        costas_pattern: &MOCK_COSTAS,
+        sync_patterns: &MOCK_SYNC_PATTERNS,
         data_symbol_positions: &MOCK_DATA_POSITIONS,
+        data_symbol_group_starts: &MOCK_GROUP_STARTS,
         hop_samples: 20,
+    };
+    const MOCK_CODING: ChannelCoding = ChannelCoding {
+        message_bits: 6,
+        crc_bits: 2,
+        info_bits: 8,
+        codeword_bits: 12,
+        bits_per_symbol: 3,
     };
     const MOCK_TUNING: SearchTuning = SearchTuning {
         long_input_samples: 4_000,
@@ -279,6 +377,8 @@ mod tests {
         llr_scale_factor: 2.0,
     };
     const MOCK_SPEC: ModeSpec = ModeSpec {
+        mode: Mode::Ft8,
+        coding: MOCK_CODING,
         geometry: MOCK_GEOMETRY,
         tuning: MOCK_TUNING,
     };
@@ -311,7 +411,7 @@ mod tests {
         assert_eq!(MOCK_SPEC.nominal_start_sync_fraction(), 0.0);
         assert_eq!(MOCK_SPEC.codeword_half_bits(), 6);
         assert_eq!(MOCK_SPEC.groups_per_half(), 2);
-        assert_eq!(MOCK_SPEC.bitmetric_half_start_symbols(), [1, 5]);
+        assert_eq!(MOCK_SPEC.bitmetric_half_start_symbols(), [1, 4]);
         assert_eq!(MOCK_SPEC.sync_tone_span_bins(), 2);
         assert_eq!(MOCK_SPEC.nominal_start_seconds(), 0.25);
         assert!((MOCK_SPEC.start_seconds_from_dt(0.1) - 0.35).abs() < 1e-6);

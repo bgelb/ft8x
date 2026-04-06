@@ -7,11 +7,14 @@ use realfft::{RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftPlanner};
 use serde::Serialize;
 
-use crate::encode::{channel_symbols_from_codeword_bits, synthesize_channel_reference};
+use crate::encode::{
+    channel_symbols_from_codeword_bits_for_mode, synthesize_channel_reference_for_mode,
+};
 use crate::ldpc::ParityMatrix;
-use crate::message::{GridReport, HashResolver, Payload, StructuredMessage, unpack_message};
-use crate::modes::ft8::FT8_SPEC;
-use crate::modes::{ModeSpec, all_costas_positions};
+use crate::message::{
+    GridReport, HashResolver, Payload, StructuredMessage, unpack_message_for_mode,
+};
+use crate::modes::{Mode, ModeSpec, all_costas_positions};
 use crate::wave::{AudioBuffer, DecoderError, load_wav};
 
 #[cfg(test)]
@@ -22,11 +25,13 @@ mod refine;
 mod search;
 mod session;
 mod subtract;
+mod ft2;
 
 use metrics::*;
 use refine::*;
 use search::*;
 use subtract::*;
+use ft2::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -69,6 +74,7 @@ impl std::str::FromStr for DecodeProfile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DecodeOptions {
+    pub mode: Mode,
     pub profile: DecodeProfile,
     pub min_freq_hz: f32,
     pub max_freq_hz: f32,
@@ -83,6 +89,7 @@ pub struct DecodeOptions {
 impl Default for DecodeOptions {
     fn default() -> Self {
         Self {
+            mode: Mode::Ft8,
             profile: DecodeProfile::Medium,
             min_freq_hz: 200.0,
             max_freq_hz: 4_000.0,
@@ -105,7 +112,7 @@ impl DecodeOptions {
         if matches!(self.profile, DecodeProfile::Deepest) {
             1.3
         } else {
-            ACTIVE_MODE.tuning.sync_threshold
+            self.mode.spec().tuning.sync_threshold
         }
     }
 
@@ -188,11 +195,11 @@ impl DecodeStage {
         }
     }
 
-    pub fn required_samples(self) -> usize {
+    pub fn required_samples(self, spec: &ModeSpec) -> usize {
         match self {
-            Self::Early41 => ACTIVE_MODE.early41_samples(),
-            Self::Early47 => ACTIVE_MODE.early47_samples(),
-            Self::Full => LONG_INPUT_SAMPLES,
+            Self::Early41 => spec.early41_samples(),
+            Self::Early47 => spec.early47_samples(),
+            Self::Full => long_input_samples(spec),
         }
     }
 }
@@ -252,6 +259,7 @@ pub struct CandidateDebugReport {
 
 #[derive(Debug, Clone)]
 struct SuccessfulDecode {
+    mode: Mode,
     payload: Payload,
     codeword_bits: Vec<u8>,
     candidate: DecodeCandidate,
@@ -325,25 +333,28 @@ struct BasebandPlan {
 }
 
 struct SubtractionPlan {
+    spec: &'static ModeSpec,
     forward: Arc<dyn Fft<f32>>,
     inverse: Arc<dyn Fft<f32>>,
     filter_spectrum: Vec<Complex32>,
     edge_correction: Vec<f32>,
 }
 
-const ACTIVE_MODE: ModeSpec = FT8_SPEC;
+fn long_input_samples(spec: &ModeSpec) -> usize {
+    spec.tuning.long_input_samples
+}
 
-const LONG_INPUT_SAMPLES: usize = ACTIVE_MODE.tuning.long_input_samples;
-const LONG_FFT_SAMPLES: usize = ACTIVE_MODE.tuning.long_fft_samples;
-const SYNC8_EARLY_THRESHOLD: f32 = ACTIVE_MODE.tuning.sync_early_threshold;
-const BASEBAND_SAMPLES: usize = ACTIVE_MODE.baseband_samples();
-const BASEBAND_SYMBOL_SAMPLES: usize = ACTIVE_MODE.baseband_symbol_samples();
-const BASEBAND_TAPER_LEN: usize = ACTIVE_MODE.tuning.baseband_taper_len;
-const SUBTRACT_FILTER_SAMPLES: usize = ACTIVE_MODE.tuning.subtract_filter_samples;
-const SUBTRACT_FILTER_HALF: usize = SUBTRACT_FILTER_SAMPLES / 2;
-const EARLY_BLOCK_SAMPLES: usize = ACTIVE_MODE.tuning.early_block_samples;
-const EARLY_41_SAMPLES: usize = 41 * EARLY_BLOCK_SAMPLES;
-const EARLY_47_SAMPLES: usize = 47 * EARLY_BLOCK_SAMPLES;
+fn sync8_early_threshold(spec: &ModeSpec) -> f32 {
+    spec.tuning.sync_early_threshold
+}
+
+fn early_41_samples(spec: &ModeSpec) -> usize {
+    spec.early41_samples()
+}
+
+fn early_47_samples(spec: &ModeSpec) -> usize {
+    spec.early47_samples()
+}
 pub fn decode_wav_file(
     path: impl AsRef<Path>,
     options: &DecodeOptions,
@@ -379,6 +390,7 @@ pub fn debug_candidate_truth_wav_file(
     let audio = load_wav(path)?;
     Ok(debug_candidate_pcm_inner(
         &audio,
+        Mode::Ft8,
         dt_seconds,
         freq_hz,
         Some(truth_codeword_bits),
@@ -390,27 +402,30 @@ pub fn debug_candidate_pcm(
     dt_seconds: f32,
     freq_hz: f32,
 ) -> Option<CandidateDebugReport> {
-    debug_candidate_pcm_inner(audio, dt_seconds, freq_hz, None)
+    debug_candidate_pcm_inner(audio, Mode::Ft8, dt_seconds, freq_hz, None)
 }
 
 fn debug_candidate_pcm_inner(
     audio: &AudioBuffer,
+    mode: Mode,
     dt_seconds: f32,
     freq_hz: f32,
     truth_codeword_bits: Option<&[u8]>,
 ) -> Option<CandidateDebugReport> {
-    if audio.sample_rate_hz != ACTIVE_MODE.geometry.sample_rate_hz
-        || audio.samples.len() < ACTIVE_MODE.geometry.symbol_samples
+    let spec = mode.spec();
+    if audio.sample_rate_hz != spec.geometry.sample_rate_hz
+        || audio.samples.len() < spec.geometry.symbol_samples
     {
         return None;
     }
 
-    let long_spectrum = build_long_spectrum(audio);
-    let baseband_plan = BasebandPlan::new();
+    let long_spectrum = build_long_spectrum(audio, spec);
+    let baseband_plan = BasebandPlan::new(spec);
     let refined = refine_candidate(
         &long_spectrum,
         &baseband_plan,
-        ACTIVE_MODE.start_seconds_from_dt(dt_seconds),
+        spec,
+        spec.start_seconds_from_dt(dt_seconds),
         freq_hz,
     )?;
     let parity = ParityMatrix::global();
@@ -421,6 +436,7 @@ fn debug_candidate_pcm_inner(
     append_debug_passes(
         &mut passes,
         "regular",
+        mode,
         &refined.llr_sets,
         parity,
         &mut counters,
@@ -431,6 +447,7 @@ fn debug_candidate_pcm_inner(
     append_debug_passes(
         &mut passes,
         "regular-osd2",
+        mode,
         &refined.llr_sets,
         parity,
         &mut counters,
@@ -441,6 +458,7 @@ fn debug_candidate_pcm_inner(
     append_debug_passes(
         &mut passes,
         "regular-osd3",
+        mode,
         &refined.llr_sets,
         parity,
         &mut counters,
@@ -451,6 +469,7 @@ fn debug_candidate_pcm_inner(
     append_debug_single_pass(
         &mut passes,
         "symbol",
+        mode,
         &refined.symbol_bit_llrs,
         parity,
         &mut counters,
@@ -461,6 +480,7 @@ fn debug_candidate_pcm_inner(
     append_debug_single_pass(
         &mut passes,
         "symbol-osd2",
+        mode,
         &refined.symbol_bit_llrs,
         parity,
         &mut counters,
@@ -471,6 +491,7 @@ fn debug_candidate_pcm_inner(
     append_debug_single_pass(
         &mut passes,
         "symbol-osd3",
+        mode,
         &refined.symbol_bit_llrs,
         parity,
         &mut counters,
@@ -482,12 +503,14 @@ fn debug_candidate_pcm_inner(
     if let Some(seed) = extract_candidate_at(
         &long_spectrum,
         &baseband_plan,
-        ACTIVE_MODE.start_seconds_from_dt(dt_seconds),
+        spec,
+        spec.start_seconds_from_dt(dt_seconds),
         freq_hz,
     ) {
         append_debug_passes(
             &mut passes,
             "seed",
+            mode,
             &seed.llr_sets,
             parity,
             &mut counters,
@@ -498,6 +521,7 @@ fn debug_candidate_pcm_inner(
         append_debug_passes(
             &mut passes,
             "seed-osd2",
+            mode,
             &seed.llr_sets,
             parity,
             &mut counters,
@@ -508,6 +532,7 @@ fn debug_candidate_pcm_inner(
         append_debug_passes(
             &mut passes,
             "seed-osd3",
+            mode,
             &seed.llr_sets,
             parity,
             &mut counters,
@@ -523,23 +548,22 @@ fn debug_candidate_pcm_inner(
         .fold(0.0f32, f32::max)
         * 1.01;
     if ap_magnitude > 0.0 {
-        for (name, known_bits) in [
-            ("ap-cq", cq_ap_known_bits()),
-            ("ap-mycall", mycall_ap_known_bits()),
-        ] {
+        for (name, known_bits) in [("ap-cq", cq_ap_known_bits(mode)), ("ap-mycall", mycall_ap_known_bits(mode))] {
             let llrs = llrs_with_known_bits(&refined.llr_sets[0], known_bits, ap_magnitude);
             let mean_abs_llr =
                 llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
             let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
             let decoded =
-                decode_llr_set_with_known_bits(parity, &llrs, known_bits, 0, &mut counters).map(
+                decode_llr_set_with_known_bits(mode, parity, &llrs, known_bits, 0, &mut counters).map(
+                    // The debug path still defaults to FT8 AP semantics until non-FT8 AP
+                    // templates are promoted to public tooling.
                     |(payload, _, iterations)| {
                         let message = payload.to_message(&resolver);
                         (message.to_text(), iterations)
                     },
                 );
             let (truth_hard_errors, truth_weighted_distance) = truth_codeword_bits
-                .and_then(|truth| truth_metrics(&llrs, truth))
+                .and_then(|truth| truth_metrics(spec, &llrs, truth))
                 .unwrap_or((None, None));
             passes.push(CandidatePassDebug {
                 pass_name: name.to_string(),
@@ -554,11 +578,11 @@ fn debug_candidate_pcm_inner(
     }
 
     Some(CandidateDebugReport {
-        coarse_start_seconds: ACTIVE_MODE.start_seconds_from_dt(dt_seconds),
+        coarse_start_seconds: spec.start_seconds_from_dt(dt_seconds),
         coarse_dt_seconds: dt_seconds,
         coarse_freq_hz: freq_hz,
         refined_start_seconds: refined.start_seconds,
-        refined_dt_seconds: ACTIVE_MODE.dt_seconds_from_start(refined.start_seconds),
+        refined_dt_seconds: spec.dt_seconds_from_start(refined.start_seconds),
         refined_freq_hz: refined.freq_hz,
         sync_score: refined.sync_score,
         snr_db: refined.snr_db,
@@ -569,6 +593,7 @@ fn debug_candidate_pcm_inner(
 fn append_debug_passes(
     passes: &mut Vec<CandidatePassDebug>,
     prefix: &str,
+    mode: Mode,
     llr_sets: &[Vec<f32>; 4],
     parity: &ParityMatrix,
     counters: &mut DecodeCounters,
@@ -580,6 +605,7 @@ fn append_debug_passes(
         append_debug_single_pass(
             passes,
             &format!("{prefix}-{}", index + 1),
+            mode,
             llrs,
             parity,
             counters,
@@ -593,6 +619,7 @@ fn append_debug_passes(
 fn append_debug_single_pass(
     passes: &mut Vec<CandidatePassDebug>,
     pass_name: &str,
+    mode: Mode,
     llrs: &[f32],
     parity: &ParityMatrix,
     counters: &mut DecodeCounters,
@@ -600,15 +627,19 @@ fn append_debug_single_pass(
     max_osd: isize,
     truth_codeword_bits: Option<&[u8]>,
 ) {
+    if llrs.is_empty() {
+        return;
+    }
     let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
     let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-    let decoded =
-        decode_llr_set(parity, llrs, max_osd, counters).map(|(payload, _, iterations)| {
+    let decoded = decode_llr_set(mode, parity, llrs, max_osd, counters).map(
+        |(payload, _, iterations)| {
             let message = payload.to_message(resolver);
             (message.to_text(), iterations)
-        });
+        },
+    );
     let (truth_hard_errors, truth_weighted_distance) = truth_codeword_bits
-        .and_then(|truth| truth_metrics(llrs, truth))
+        .and_then(|truth| truth_metrics(mode.spec(), llrs, truth))
         .unwrap_or((None, None));
     passes.push(CandidatePassDebug {
         pass_name: pass_name.to_string(),
@@ -625,6 +656,9 @@ pub fn decode_pcm(
     audio: &AudioBuffer,
     options: &DecodeOptions,
 ) -> Result<DecodeReport, DecoderError> {
+    if options.mode == Mode::Ft2 {
+        return decode_ft2(audio, options);
+    }
     let mut session = DecoderSession::new();
     let mut updates = session.decode_available(audio, options)?;
     if let Some(update) = updates.pop() {
@@ -641,6 +675,10 @@ pub fn decode_pcm_with_state(
     options: &DecodeOptions,
     state: Option<&DecoderState>,
 ) -> Result<(DecodeReport, DecoderState), DecoderError> {
+    if options.mode == Mode::Ft2 {
+        let report = decode_ft2(audio, options)?;
+        return Ok((report, state.cloned().unwrap_or_default()));
+    }
     let mut session = DecoderSession::new();
     let mut updates = session.decode_available_with_state(audio, options, state)?;
     if let Some((update, state)) = updates.pop() {
@@ -655,26 +693,30 @@ pub fn decode_pcm_with_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decoder::session::try_refined_candidate;
     use crate::encode::{
         TxDirectedPayload, TxMessage, TxRttyExchange, WaveformOptions, encode_nonstandard_message,
-        encode_standard_message, synthesize_rectangular_waveform, synthesize_tx_message,
+        encode_standard_message, encode_standard_message_for_mode, synthesize_rectangular_waveform,
+        synthesize_tx_message,
     };
     use crate::message::{GridReport, ReplyWord};
 
     #[test]
     #[ignore = "diagnostic"]
     fn debug_known_real_candidate() {
+        let spec = Mode::Ft8.spec();
         let audio = crate::wave::load_wav(
             "/Users/bgelb/ft8-regr/artifacts/samples/kgoba-ft8-lib/191111_110115/191111_110115.wav",
         )
         .expect("wav");
-        let spectrum = build_long_spectrum(&audio);
-        let baseband_plan = BasebandPlan::new();
-        let refined = refine_candidate(&spectrum, &baseband_plan, 1.4, 1234.0).expect("refined");
+        let spectrum = build_long_spectrum(&audio, spec);
+        let baseband_plan = BasebandPlan::new(spec);
+        let refined =
+            refine_candidate(&spectrum, &baseband_plan, spec, 1.4, 1234.0).expect("refined");
         eprintln!(
             "refined start={:.4} dt={:.4} freq={:.4} sync={:.3} snr={}",
             refined.start_seconds,
-            ACTIVE_MODE.dt_seconds_from_start(refined.start_seconds),
+            spec.dt_seconds_from_start(refined.start_seconds),
             refined.freq_hz,
             refined.sync_score,
             refined.snr_db
@@ -728,11 +770,12 @@ mod tests {
     #[test]
     fn session_emits_stages_for_progressively_longer_buffers() {
         let options = DecodeOptions::default();
+        let spec = options.mode.spec();
         let mut session = DecoderSession::new();
 
         let early41 = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
-            samples: vec![0.0; EARLY_41_SAMPLES],
+            samples: vec![0.0; early_41_samples(spec)],
         };
         let updates = session
             .decode_available(&early41, &options)
@@ -742,7 +785,7 @@ mod tests {
 
         let early47 = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
-            samples: vec![0.0; EARLY_47_SAMPLES],
+            samples: vec![0.0; early_47_samples(spec)],
         };
         let updates = session
             .decode_available(&early47, &options)
@@ -752,7 +795,7 @@ mod tests {
 
         let full = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
-            samples: vec![0.0; LONG_INPUT_SAMPLES],
+            samples: vec![0.0; long_input_samples(spec)],
         };
         let updates = session
             .decode_available(&full, &options)
@@ -772,10 +815,11 @@ mod tests {
             profile: DecodeProfile::Quick,
             ..DecodeOptions::default()
         };
+        let spec = options.mode.spec();
         let mut session = DecoderSession::new();
         let full = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
-            samples: vec![0.0; LONG_INPUT_SAMPLES],
+            samples: vec![0.0; long_input_samples(spec)],
         };
         let updates = session
             .decode_available(&full, &options)
@@ -1042,6 +1086,87 @@ mod tests {
     }
 
     #[test]
+    fn ft4_exact_candidate_round_trips_on_generated_signal() {
+        let spec = Mode::Ft4.spec();
+        let frame = encode_standard_message_for_mode(
+            Mode::Ft4,
+            "K1ABC",
+            "W1XYZ",
+            false,
+            &GridReport::Grid("FN31".to_string()),
+        )
+        .expect("encode ft4");
+        let audio = synthesize_rectangular_waveform(
+            &frame,
+            &WaveformOptions {
+                mode: Mode::Ft4,
+                base_freq_hz: 900.0,
+                start_seconds: 0.1,
+                total_seconds: 7.5,
+                amplitude: 0.8,
+            },
+        )
+        .expect("ft4 waveform");
+        let spectrum = build_long_spectrum(&audio, spec);
+        let baseband_plan = BasebandPlan::new(spec);
+        let refined =
+            refine_candidate(&spectrum, &baseband_plan, spec, 0.1, 900.0).expect("refined");
+        let mut counters = DecodeCounters::default();
+        let success = try_refined_candidate(
+            &refined,
+            Mode::Ft4,
+            1.0,
+            0,
+            false,
+            ParityMatrix::global(),
+            &mut counters,
+        )
+        .expect("decode ft4 candidate");
+        assert_eq!(
+            success.payload.to_message(&HashResolver::default()).to_text(),
+            "K1ABC W1XYZ FN31"
+        );
+    }
+
+    #[test]
+    fn ft4_generated_waveform_round_trips_through_decoder() {
+        let frame = encode_standard_message_for_mode(
+            Mode::Ft4,
+            "K1ABC",
+            "W1XYZ",
+            false,
+            &GridReport::Grid("FN31".to_string()),
+        )
+        .expect("encode ft4");
+        let audio = synthesize_rectangular_waveform(
+            &frame,
+            &WaveformOptions {
+                mode: Mode::Ft4,
+                base_freq_hz: 900.0,
+                start_seconds: 0.1,
+                total_seconds: 7.5,
+                amplitude: 0.8,
+            },
+        )
+        .expect("ft4 waveform");
+        let report = decode_pcm(
+            &audio,
+            &DecodeOptions {
+                mode: Mode::Ft4,
+                max_candidates: 32,
+                max_successes: 4,
+                ..DecodeOptions::default()
+            },
+        )
+        .expect("decode ft4");
+        let decoded: Vec<_> = report.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        assert!(
+            decoded.contains(&"K1ABC W1XYZ FN31"),
+            "expected FT4 decode in {decoded:?}"
+        );
+    }
+
+    #[test]
     fn dxpedition_compound_message_round_trips_with_hash10_resolution() {
         let synthesized = synthesize_tx_message(
             &TxMessage::DxpeditionCompound {
@@ -1107,8 +1232,10 @@ mod tests {
                 "shared decoder module still references FT8_* directly"
             );
             assert!(
-                source.contains("ACTIVE_MODE"),
-                "shared decoder module should route geometry through ACTIVE_MODE"
+                source.contains("options.mode.spec()")
+                    || source.contains("spec: &ModeSpec")
+                    || source.contains("mode.spec()"),
+                "shared decoder module should route geometry through ModeSpec"
             );
         }
     }

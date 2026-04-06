@@ -1,4 +1,4 @@
-use super::{FrameGeometry, ModeSpec, SearchTuning};
+use super::{ChannelCoding, FrameGeometry, Mode, ModeSpec, SearchTuning};
 use crate::protocol::FTX_DATA_SYMBOLS;
 
 // FT8 uses 12 kHz sample rate, 6.25 Hz tone spacing, and 79 total symbols:
@@ -8,6 +8,7 @@ pub const FT8_SYMBOL_SAMPLES: usize = 1_920;
 pub const FT8_TONE_SPACING_HZ: f32 = 6.25;
 pub const FT8_HOPS_PER_SYMBOL: usize = 8;
 pub const FT8_COSTAS: [usize; 7] = [3, 1, 4, 0, 6, 5, 2];
+pub const FT8_SYNC_PATTERNS: [&[usize]; 3] = [&FT8_COSTAS, &FT8_COSTAS, &FT8_COSTAS];
 pub const FT8_SYNC_BLOCK_COUNT: usize = 3;
 pub const FT8_PAYLOAD_SYMBOLS: usize = FTX_DATA_SYMBOLS;
 pub const FT8_DATA_SYMBOLS_PER_HALF: usize = FT8_PAYLOAD_SYMBOLS / 2;
@@ -16,6 +17,10 @@ pub const FT8_MESSAGE_SYMBOLS: usize =
     FT8_PAYLOAD_SYMBOLS + FT8_SYNC_BLOCK_COUNT * FT8_COSTAS.len();
 pub const FT8_SYNC_BLOCK_STARTS: [usize; FT8_SYNC_BLOCK_COUNT] =
     [0, FT8_SYNC_BLOCK_STRIDE, FT8_SYNC_BLOCK_STRIDE * 2];
+pub const FT8_DATA_SYMBOL_GROUP_STARTS: [usize; 2] = [
+    FT8_COSTAS.len(),
+    FT8_COSTAS.len() + FT8_DATA_SYMBOLS_PER_HALF + FT8_COSTAS.len(),
+];
 pub const FT8_HOP_SAMPLES: usize = FT8_SYMBOL_SAMPLES / FT8_HOPS_PER_SYMBOL;
 pub const FT8_DATA_POSITIONS: [usize; FT8_PAYLOAD_SYMBOLS] = build_ft8_data_positions();
 
@@ -66,9 +71,18 @@ pub const FT8_GEOMETRY: FrameGeometry = FrameGeometry {
     tone_spacing_hz: FT8_TONE_SPACING_HZ,
     message_symbols: FT8_MESSAGE_SYMBOLS,
     sync_block_starts: &FT8_SYNC_BLOCK_STARTS,
-    costas_pattern: &FT8_COSTAS,
+    sync_patterns: &FT8_SYNC_PATTERNS,
     data_symbol_positions: &FT8_DATA_POSITIONS,
+    data_symbol_group_starts: &FT8_DATA_SYMBOL_GROUP_STARTS,
     hop_samples: FT8_HOP_SAMPLES,
+};
+
+pub const FT8_CODING: ChannelCoding = ChannelCoding {
+    message_bits: 77,
+    crc_bits: 14,
+    info_bits: 91,
+    codeword_bits: 174,
+    bits_per_symbol: 3,
 };
 
 pub const FT8_TUNING: SearchTuning = SearchTuning {
@@ -114,6 +128,8 @@ pub const FT8_TUNING: SearchTuning = SearchTuning {
 };
 
 pub const FT8_SPEC: ModeSpec = ModeSpec {
+    mode: Mode::Ft8,
+    coding: FT8_CODING,
     geometry: FT8_GEOMETRY,
     tuning: FT8_TUNING,
 };
