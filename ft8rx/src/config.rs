@@ -32,6 +32,7 @@ pub struct TxConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueueConfig {
     pub auto_add_all_decoded_calls_default: bool,
+    pub auto_add_decoded_min_count_5m_default: u32,
     pub auto_add_direct_calls_default: bool,
     pub ignore_direct_calls_from_recently_worked_default: bool,
     pub cq_enabled_default: bool,

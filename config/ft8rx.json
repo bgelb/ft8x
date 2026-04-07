@@ -14,6 +14,7 @@
   },
   "queue": {
     "auto_add_all_decoded_calls_default": false,
+    "auto_add_decoded_min_count_5m_default": 2,
     "auto_add_direct_calls_default": true,
     "ignore_direct_calls_from_recently_worked_default": true,
     "cq_enabled_default": false,
