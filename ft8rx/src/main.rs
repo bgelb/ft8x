@@ -2728,6 +2728,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     let lastSnapshot = null;
     let autoFollowLogs = true;
     let autoFollowQso = true;
+    let autoFollowDirect = true;
     let pendingRigConfig = null;
     function initRigBandOptions() {
       const select = document.getElementById('rig-band');
@@ -3397,6 +3398,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const direct = data.direct_calls || [];
       const count = document.getElementById('direct-count');
       const list = document.getElementById('direct-list');
+      const previousScrollTop = list.scrollTop;
       count.textContent = `${direct.length} msgs`;
       list.innerHTML = `
         <div class="activity-item activity-head">
@@ -3425,7 +3427,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="activity-msg">${escapeHtml(item.text)}</div>`;
         list.appendChild(row);
       }
-      list.scrollTop = list.scrollHeight;
+      if (autoFollowDirect) {
+        list.scrollTop = list.scrollHeight;
+      } else {
+        list.scrollTop = previousScrollTop;
+      }
     }
     function renderQsoHistory(data) {
       const history = (data.qso_history || []).filter((entry) => entry.got_reply || entry.reached_73);
@@ -3549,6 +3555,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const node = event.currentTarget;
       const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
       autoFollowQso = remaining < 12;
+    });
+    document.getElementById('direct-list').addEventListener('scroll', (event) => {
+      const node = event.currentTarget;
+      const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
+      autoFollowDirect = remaining < 12;
     });
     document.getElementById('qso-stop').addEventListener('click', () => {
       stopQso().catch((error) => console.error(error));
