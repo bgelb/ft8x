@@ -12,6 +12,12 @@ DEFAULT_FT2_REF_ROOT = Path("/private/tmp/mode-refs-test/ft2")
 DEFAULT_FT2_REF_DECODE = DEFAULT_FT2_REF_ROOT / "ft2-ref-decode"
 DEFAULT_FT2_REF_GEN = DEFAULT_FT2_REF_ROOT / "ft2-ref-gen"
 DEFAULT_FT2_REF_FRAME = DEFAULT_FT2_REF_ROOT / "ft2-ref-frame"
+DEFAULT_FT2_REF_TRACE = DEFAULT_FT2_REF_ROOT / "ft2-ref-trace"
+DEFAULT_FT4_REF_ROOT = Path("/private/tmp/mode-refs-test/ft4")
+DEFAULT_FT4_STOCK_DEBUG = DEFAULT_FT4_REF_ROOT / "ft4-stock-debug"
+DEFAULT_FT4_STOCK_SUBTRACT = DEFAULT_FT4_REF_ROOT / "ft4-stock-subtract"
+DEFAULT_FT4_STOCK_TRACE = DEFAULT_FT4_REF_ROOT / "ft4-stock-trace"
+DEFAULT_FT4_STOCK_METRICS = DEFAULT_FT4_REF_ROOT / "ft4-stock-metrics"
 
 
 def _resolve_existing(path: Path, label: str) -> Path:
@@ -39,16 +45,46 @@ def locate_ft2_ref_binary(kind: str, explicit: str | None = None) -> Path:
         "decode": "FT2_REF_DECODE",
         "gen": "FT2_REF_GEN",
         "frame": "FT2_REF_FRAME",
+        "trace": "FT2_REF_TRACE",
     }[kind]
     default_path = {
         "decode": DEFAULT_FT2_REF_DECODE,
         "gen": DEFAULT_FT2_REF_GEN,
         "frame": DEFAULT_FT2_REF_FRAME,
+        "trace": DEFAULT_FT2_REF_TRACE,
     }[kind]
     value = explicit or os.environ.get(env_name)
     if value:
         return _resolve_existing(Path(value), f"FT2 reference {kind} helper")
     return _resolve_existing(default_path, f"FT2 reference {kind} helper")
+
+
+def locate_ft4_stock_debug(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("FT4_STOCK_DEBUG")
+    if value:
+        return _resolve_existing(Path(value), "FT4 stock debug helper")
+    return _resolve_existing(DEFAULT_FT4_STOCK_DEBUG, "FT4 stock debug helper")
+
+
+def locate_ft4_stock_subtract(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("FT4_STOCK_SUBTRACT")
+    if value:
+        return _resolve_existing(Path(value), "FT4 stock subtraction helper")
+    return _resolve_existing(DEFAULT_FT4_STOCK_SUBTRACT, "FT4 stock subtraction helper")
+
+
+def locate_ft4_stock_trace(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("FT4_STOCK_TRACE")
+    if value:
+        return _resolve_existing(Path(value), "FT4 stock trace helper")
+    return _resolve_existing(DEFAULT_FT4_STOCK_TRACE, "FT4 stock trace helper")
+
+
+def locate_ft4_stock_metrics(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("FT4_STOCK_METRICS")
+    if value:
+        return _resolve_existing(Path(value), "FT4 stock metrics helper")
+    return _resolve_existing(DEFAULT_FT4_STOCK_METRICS, "FT4 stock metrics helper")
 
 
 def jt9_debug_level(profile: str) -> str:

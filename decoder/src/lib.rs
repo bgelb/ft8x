@@ -11,8 +11,13 @@ pub use crate::modes::Mode;
 pub use decoder::{
     CandidateDebugReport, CandidatePassDebug, DecodeCandidate, DecodeDiagnostics, DecodeOptions,
     DecodeProfile, DecodeReport, DecodeStage, DecodedMessage, DecoderSession, DecoderState,
-    StageDecodeReport, debug_candidate_pcm, debug_candidate_truth_wav_file,
-    debug_candidate_wav_file, decode_pcm, decode_pcm_with_state, decode_wav_file,
+    Ft2CandidateTrace, Ft2SequenceTrace, Ft2TraceReport, Ft4MetricsDebug, Ft4VariantDebug,
+    SearchCandidateTrace, SearchDebugReport, SearchPassTrace, StageDecodeReport,
+    debug_candidate_pcm, debug_candidate_truth_wav_file, debug_candidate_wav_file,
+    debug_ft2_trace_pcm, debug_ft2_trace_wav_file,
+    debug_ft4_metrics_pcm, debug_ft4_metrics_wav_file, debug_ft4_variants_pcm,
+    debug_ft4_variants_wav_file,
+    debug_search_pcm, debug_search_wav_file, decode_pcm, decode_pcm_with_state, decode_wav_file,
     decode_wav_file_with_state, subtract_truth_pcm, subtract_truth_wav_file,
 };
 pub use encode::{

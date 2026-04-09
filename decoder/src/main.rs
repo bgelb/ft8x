@@ -4,7 +4,10 @@ use clap::{ArgAction, Parser, Subcommand};
 
 use ft8_decoder::{
     DecodeOptions, DecodeProfile, GridReport, Mode, WaveformOptions,
-    debug_candidate_truth_wav_file, debug_candidate_wav_file, decode_wav_file,
+    debug_candidate_truth_wav_file, debug_candidate_wav_file, debug_ft4_metrics_wav_file,
+    debug_ft2_trace_wav_file, debug_ft4_variants_wav_file,
+    debug_search_wav_file,
+    decode_wav_file,
     encode_rtty_contest_message, encode_standard_message, encode_standard_message_for_mode,
     parse_standard_info, subtract_truth_wav_file, write_rectangular_standard_wav, write_wav,
     TxRttyExchange,
@@ -70,6 +73,37 @@ enum Command {
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
     },
+    DebugSearch {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long, default_value_t = 200.0)]
+        min_freq_hz: f32,
+
+        #[arg(long, default_value_t = 4000.0)]
+        max_freq_hz: f32,
+
+        #[arg(long, default_value_t = 600)]
+        max_candidates: usize,
+
+        #[arg(long, default_value_t = 200)]
+        max_successes: usize,
+
+        #[arg(long, default_value_t = 3)]
+        search_passes: usize,
+
+        #[arg(long, default_value = "medium")]
+        profile: String,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        no_subtraction: bool,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
     DebugStandardCandidate {
         #[arg(value_name = "WAV")]
         wav: PathBuf,
@@ -85,6 +119,48 @@ enum Command {
 
         #[arg(long)]
         message: String,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugFt4Variants {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugFt4Metrics {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugFt2Trace {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long, default_value_t = 375.0)]
+        min_freq_hz: f32,
+
+        #[arg(long, default_value_t = 3000.0)]
+        max_freq_hz: f32,
+
+        #[arg(long, default_value_t = 10)]
+        max_candidates: usize,
+
+        #[arg(long, default_value = "medium")]
+        profile: String,
 
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
@@ -277,6 +353,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string(&report)?);
             }
         }
+        Command::DebugSearch {
+            wav,
+            min_freq_hz,
+            max_freq_hz,
+            max_candidates,
+            max_successes,
+            search_passes,
+            profile,
+            mode,
+            no_subtraction,
+            pretty,
+        } => {
+            let profile = profile.parse::<DecodeProfile>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let mode = mode.parse::<Mode>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let options = DecodeOptions {
+                mode,
+                profile,
+                min_freq_hz,
+                max_freq_hz,
+                max_candidates,
+                max_successes,
+                search_passes,
+                disable_subtraction: no_subtraction,
+                ..DecodeOptions::default()
+            };
+            let report = debug_search_wav_file(&wav, &options)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
         Command::DebugStandardCandidate {
             wav,
             mode,
@@ -303,6 +415,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 freq_hz,
                 &frame.codeword_bits,
             )?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt4Variants { wav, freq_hz, pretty } => {
+            let report = debug_ft4_variants_wav_file(&wav, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt4Metrics {
+            wav,
+            dt_seconds,
+            freq_hz,
+            pretty,
+        } => {
+            let report = debug_ft4_metrics_wav_file(&wav, dt_seconds, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt2Trace {
+            wav,
+            min_freq_hz,
+            max_freq_hz,
+            max_candidates,
+            profile,
+            pretty,
+        } => {
+            let profile = profile.parse::<DecodeProfile>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let options = DecodeOptions {
+                mode: Mode::Ft2,
+                profile,
+                min_freq_hz,
+                max_freq_hz,
+                max_candidates,
+                ..DecodeOptions::default()
+            };
+            let report = debug_ft2_trace_wav_file(&wav, &options)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

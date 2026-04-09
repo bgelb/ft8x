@@ -34,11 +34,12 @@ pub(super) fn subtract_candidate_with_dt_refinement(
             &channel_symbols,
             success.candidate.freq_hz,
         );
+    let subtraction_dt_seconds = success.candidate.dt_seconds;
     let start_sample = match success.mode {
         Mode::Ft4 => {
-            spec.start_sample_from_dt(success.candidate.dt_seconds) - spec.geometry.symbol_samples as isize
+            spec.start_sample_from_dt(subtraction_dt_seconds) - spec.geometry.symbol_samples as isize
         }
-        Mode::Ft8 | Mode::Ft2 => spec.start_sample_from_dt(success.candidate.dt_seconds),
+        Mode::Ft8 | Mode::Ft2 => spec.start_sample_from_dt(subtraction_dt_seconds),
     };
     let offset_samples = if refine_dt {
         let Some(offset_samples) = refined_subtraction_offset(
@@ -259,14 +260,9 @@ impl SubtractionPlan {
 
         let mut kernel = vec![Complex32::new(0.0, 0.0); long_input_samples];
         for (index, weight) in window.iter().copied().enumerate() {
-            let lag = index as isize - subtract_filter_half as isize;
-            let slot = if lag < 0 {
-                (long_input_samples as isize + lag) as usize
-            } else {
-                lag as usize
-            };
-            kernel[slot] = Complex32::new(weight / sumw, 0.0);
+            kernel[index] = Complex32::new(weight / sumw, 0.0);
         }
+        kernel.rotate_left(subtract_filter_half + 1);
         forward.process(&mut kernel);
 
         let mut edge_correction = Vec::with_capacity(subtract_filter_half + 1);

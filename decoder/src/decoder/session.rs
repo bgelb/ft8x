@@ -3,10 +3,14 @@ use std::collections::HashSet;
 use super::*;
 use crate::encode::encode_standard_message_for_mode;
 use crate::message::{
-    CallField, GridReport, Payload, ReplyWord, StructuredCallField, StructuredCallValue,
-    StructuredInfoValue, StructuredMessage,
+    CallField, GridReport, Payload, ReplyWord, StructuredMessage,
 };
 use crate::protocol::{BitField, copy_known_message_bits};
+
+pub(super) struct DebugSearchTrace {
+    pub(super) search: SearchResult,
+    pub(super) passes: Vec<SearchPassTrace>,
+}
 
 impl DecoderSession {
     pub fn new() -> Self {
@@ -190,11 +194,14 @@ pub(super) fn is_new_success(
     combined.push(candidate.clone());
     let resolver = merged_resolver(base_resolver, &combined);
     let candidate_key = rendered_success_key(candidate, &resolver);
-    let mut seen = HashSet::<String>::new();
     for success in existing.iter().chain(current_pass.iter()) {
-        seen.insert(rendered_success_key(success, &resolver));
+        let success_key = rendered_success_key(success, &resolver);
+        if success_key != candidate_key {
+            continue;
+        }
+        return false;
     }
-    !seen.contains(&candidate_key)
+    true
 }
 
 pub(super) fn validate_audio(audio: &AudioBuffer, spec: &ModeSpec) -> Result<(), DecoderError> {
@@ -324,9 +331,6 @@ pub(super) fn build_decode_report_with_resolver(
     }
 
     let mut decodes: Vec<_> = dedup.into_values().collect();
-    if options.mode == Mode::Ft4 {
-        decodes = apply_ft4_stock_compat_filters(decodes);
-    }
     decodes.sort_by(|left, right| {
         left.freq_hz
             .total_cmp(&right.freq_hz)
@@ -347,100 +351,6 @@ pub(super) fn build_decode_report_with_resolver(
         },
         decodes,
     }
-}
-
-fn apply_ft4_stock_compat_filters(decodes: Vec<DecodedMessage>) -> Vec<DecodedMessage> {
-    let mut keep = vec![true; decodes.len()];
-
-    for left in 0..decodes.len() {
-        if !keep[left] {
-            continue;
-        }
-        for right in (left + 1)..decodes.len() {
-            if !keep[right] {
-                continue;
-            }
-            if ft4_same_pair_nearby_conflict(&decodes[left], &decodes[right]) {
-                let left_loses = ft4_left_should_lose(&decodes[left], &decodes[right]);
-                keep[if left_loses { left } else { right }] = false;
-            }
-        }
-    }
-
-    for index in 0..decodes.len() {
-        if !keep[index] || !is_ft4_marginal_seventy_three(&decodes[index]) {
-            continue;
-        }
-        let has_same_pair_context = decodes.iter().enumerate().any(|(other_index, other)| {
-            keep[other_index]
-                && other_index != index
-                && ft4_same_standard_pair(&decodes[index].message, &other.message)
-        });
-        if has_same_pair_context {
-            keep[index] = false;
-        }
-    }
-
-    decodes
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(decode, keep)| keep.then_some(decode))
-        .collect()
-}
-
-fn ft4_left_should_lose(left: &DecodedMessage, right: &DecodedMessage) -> bool {
-    right
-        .candidate_score
-        .total_cmp(&left.candidate_score)
-        .then_with(|| left.ldpc_iterations.cmp(&right.ldpc_iterations))
-        .then_with(|| left.freq_hz.total_cmp(&right.freq_hz))
-        .is_gt()
-}
-
-fn ft4_same_pair_nearby_conflict(left: &DecodedMessage, right: &DecodedMessage) -> bool {
-    ft4_same_standard_pair(&left.message, &right.message)
-        && (left.dt_seconds - right.dt_seconds).abs() <= 0.12
-        && (left.freq_hz - right.freq_hz).abs() <= 5.0
-}
-
-fn ft4_same_standard_pair(left: &StructuredMessage, right: &StructuredMessage) -> bool {
-    let StructuredMessage::Standard {
-        first: left_first,
-        second: left_second,
-        ..
-    } = left
-    else {
-        return false;
-    };
-    let StructuredMessage::Standard {
-        first: right_first,
-        second: right_second,
-        ..
-    } = right
-    else {
-        return false;
-    };
-    standard_call(left_first) == standard_call(right_first)
-        && standard_call(left_second) == standard_call(right_second)
-}
-
-fn standard_call(field: &StructuredCallField) -> Option<&str> {
-    match &field.value {
-        StructuredCallValue::StandardCall { callsign } => Some(callsign.as_str()),
-        _ => None,
-    }
-}
-
-fn is_ft4_marginal_seventy_three(decode: &DecodedMessage) -> bool {
-    let StructuredMessage::Standard { info, .. } = &decode.message else {
-        return false;
-    };
-    matches!(
-        info.value,
-        StructuredInfoValue::Reply {
-            word: ReplyWord::SeventyThree
-        }
-    ) && decode.ldpc_iterations > 0
 }
 
 pub(super) fn build_decoder_state(
@@ -484,6 +394,47 @@ pub(super) fn run_decode_search(
     sync_threshold: f32,
     allow_ap: bool,
 ) -> SearchResult {
+    debug_run_decode_search_inner(
+        audio,
+        options,
+        residual_override,
+        initial_successes,
+        base_resolver,
+        sync_threshold,
+        allow_ap,
+        false,
+    )
+    .search
+}
+
+pub(super) fn debug_run_decode_search(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+) -> Result<DebugSearchTrace, DecoderError> {
+    let spec = options.mode.spec();
+    validate_audio(audio, spec)?;
+    Ok(debug_run_decode_search_inner(
+        audio,
+        options,
+        None,
+        Vec::new(),
+        None,
+        options.sync_threshold(),
+        true,
+        true,
+    ))
+}
+
+fn debug_run_decode_search_inner(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    residual_override: Option<AudioBuffer>,
+    initial_successes: Vec<SuccessfulDecode>,
+    base_resolver: Option<&HashResolver>,
+    sync_threshold: f32,
+    allow_ap: bool,
+    capture_trace: bool,
+) -> DebugSearchTrace {
     let total_passes = options.search_passes.max(1);
     let has_residual_override = residual_override.is_some();
     let mut residual_audio = residual_override.unwrap_or_else(|| audio.clone());
@@ -496,6 +447,7 @@ pub(super) fn run_decode_search(
     let search_grid = search_grid(audio, options);
     let frame_count = search_grid.frame_count;
     let usable_bins = search_grid.usable_bins;
+    let mut pass_traces = Vec::new();
 
     let mut successes = initial_successes;
     if !options.disable_subtraction && !has_residual_override {
@@ -505,7 +457,11 @@ pub(super) fn run_decode_search(
     }
 
     for pass in 0..total_passes {
-        let long_spectrum = build_long_spectrum(&residual_audio, spec);
+        let cached_long_spectrum = if options.mode == Mode::Ft4 {
+            None
+        } else {
+            Some(build_long_spectrum(&residual_audio, spec))
+        };
         let mut pass_options = options.clone();
         pass_options.max_candidates = options.max_candidates_for_pass(pass);
         let candidates = collect_candidates(&residual_audio, &pass_options, sync_threshold);
@@ -518,12 +474,22 @@ pub(super) fn run_decode_search(
 
         let mut pass_successes = Vec::<SuccessfulDecode>::new();
         let mut pass_changed = false;
+        let mut candidate_traces = Vec::new();
         for candidate in &candidates {
+            let long_spectrum_owned = if options.mode == Mode::Ft4 {
+                Some(build_long_spectrum(&residual_audio, spec))
+            } else {
+                None
+            };
+            let long_spectrum = long_spectrum_owned
+                .as_ref()
+                .or_else(|| cached_long_spectrum.as_ref())
+                .expect("decode pass spectrum should be available");
             let mut local_counters = DecodeCounters::default();
-            let ft4_ap_known_bits = ft4_context_ap_known_bits(&successes, &pass_successes);
+            let ft4_ap_known_bits = Vec::new();
             let (resolver, seen_messages) =
                 current_seen_message_texts(base_resolver, &successes, &pass_successes);
-            let success = try_candidate(
+            let successes_for_candidate = try_candidate(
                 search_grid,
                 &long_spectrum,
                 &baseband_plan,
@@ -540,16 +506,60 @@ pub(super) fn run_decode_search(
             );
             counters.ldpc_codewords += local_counters.ldpc_codewords;
             counters.parsed_payloads += local_counters.parsed_payloads;
-            if let Some(success) = success {
+            let raw_successes: Vec<String> = if capture_trace {
+                successes_for_candidate
+                    .iter()
+                    .map(|success| rendered_success_key(success, &resolver))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut accepted_successes = Vec::new();
+            for success in successes_for_candidate {
+                if options.mode == Mode::Ft4
+                    && ft4_plain_report_after_rr73_conflict(
+                        &success,
+                        successes.iter().chain(pass_successes.iter()),
+                    )
+                {
+                    continue;
+                }
+                let is_new = is_new_success(&successes, &pass_successes, &success, base_resolver);
+                if !is_new {
+                    // A duplicate decode still changes the residual if we subtract it, which can
+                    // expose additional messages on later passes. The pre-debug-search behavior
+                    // did this for all modes, and FT8 depends on it as well.
+                    pass_changed = true;
+                    if !options.disable_subtraction {
+                        subtract_candidate(&mut residual_audio, &success, subtraction_plan);
+                    }
+                    continue;
+                }
                 pass_changed = true;
                 if !options.disable_subtraction {
                     subtract_candidate(&mut residual_audio, &success, subtraction_plan);
                 }
-                if !is_new_success(&successes, &pass_successes, &success, base_resolver) {
-                    continue;
+                if capture_trace {
+                    accepted_successes.push(rendered_success_key(&success, &resolver));
                 }
                 pass_successes.push(success);
             }
+            if capture_trace {
+                candidate_traces.push(SearchCandidateTrace {
+                    coarse_start_seconds: candidate.start_seconds,
+                    coarse_dt_seconds: candidate.dt_seconds,
+                    coarse_freq_hz: candidate.freq_hz,
+                    coarse_score: candidate.score,
+                    raw_successes,
+                    accepted_successes,
+                });
+            }
+        }
+        if capture_trace {
+            pass_traces.push(SearchPassTrace {
+                pass_index: pass,
+                candidates: candidate_traces,
+            });
         }
         if !pass_changed {
             break;
@@ -565,13 +575,64 @@ pub(super) fn run_decode_search(
         successes.extend(pass_successes);
     }
 
-    SearchResult {
-        successes,
-        frame_count,
-        usable_bins,
-        top_candidates,
-        counters,
+    DebugSearchTrace {
+        search: SearchResult {
+            successes,
+            frame_count,
+            usable_bins,
+            top_candidates,
+            counters,
+        },
+        passes: pass_traces,
     }
+}
+
+fn ft4_plain_report_after_rr73_conflict<'a>(
+    candidate: &SuccessfulDecode,
+    mut existing: impl Iterator<Item = &'a SuccessfulDecode>,
+) -> bool {
+    let StructuredMessage::Standard {
+        first: candidate_first,
+        second: candidate_second,
+        acknowledge,
+        info:
+            crate::message::StructuredInfoField {
+                value: crate::message::StructuredInfoValue::SignalReport { .. },
+                ..
+            },
+        ..
+    } = candidate.payload.to_message(&HashResolver::default())
+    else {
+        return false;
+    };
+    if acknowledge {
+        return false;
+    }
+
+    existing.any(|success| {
+        let StructuredMessage::Standard {
+            first,
+            second,
+            acknowledge: false,
+            info:
+                crate::message::StructuredInfoField {
+                    value:
+                        crate::message::StructuredInfoValue::Reply {
+                            word: ReplyWord::Rr73,
+                        },
+                    ..
+                },
+            ..
+        } = success.payload.to_message(&HashResolver::default())
+        else {
+            return false;
+        };
+
+        first.raw == candidate_first.raw
+            && second.raw == candidate_second.raw
+            && (success.candidate.freq_hz - candidate.candidate.freq_hz).abs() <= 5.0
+            && (success.candidate.dt_seconds - candidate.candidate.dt_seconds).abs() <= 0.04
+    })
 }
 
 pub(super) fn try_candidate(
@@ -588,17 +649,37 @@ pub(super) fn try_candidate(
     resolver: &HashResolver,
     seen_messages: &HashSet<String>,
     counters: &mut DecodeCounters,
-) -> Option<SuccessfulDecode> {
+) -> Vec<SuccessfulDecode> {
+    if options.mode == Mode::Ft4 && candidate.dt_seconds == 0.0 {
+        return try_candidate_ft4_ordered(
+            long_spectrum,
+            baseband_plan,
+            candidate,
+            spec,
+            options,
+            outer_pass,
+            parity,
+            allow_ap,
+            ft4_ap_known_bits,
+            resolver,
+            seen_messages,
+            counters,
+        );
+    }
+
     let mut best: Option<SuccessfulDecode> = None;
     let mut refined_basebands = Vec::<(i32, Vec<Complex32>)>::new();
     let coarse_freq_hz = candidate.freq_hz;
     if coarse_freq_hz < options.min_freq_hz || coarse_freq_hz > options.max_freq_hz {
-        return None;
+        return Vec::new();
     }
-    let Some(initial_baseband) =
+    let initial_baseband = if options.mode == Mode::Ft4 {
+        downsample_candidate_ft4_search(long_spectrum, baseband_plan, spec, coarse_freq_hz)
+    } else {
         downsample_candidate(long_spectrum, baseband_plan, spec, coarse_freq_hz)
-    else {
-        return None;
+    };
+    let Some(initial_baseband) = initial_baseband else {
+        return Vec::new();
     };
     if let Some(refined) = refine_candidate_with_cache(
         long_spectrum,
@@ -625,7 +706,9 @@ pub(super) fn try_candidate(
         if options.mode == Mode::Ft4
             && best
                 .as_ref()
-                .is_some_and(|success| !ft4_refinement_is_latched(candidate, success))
+                .is_some_and(|success| {
+                    candidate.dt_seconds != 0.0 && !ft4_refinement_is_latched(candidate, success)
+                })
         {
             best = None;
         }
@@ -680,7 +763,96 @@ pub(super) fn try_candidate(
             counters,
         );
     }
-    best
+    best.into_iter().collect()
+}
+
+fn try_candidate_ft4_ordered(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    candidate: &DecodeCandidate,
+    spec: &ModeSpec,
+    options: &DecodeOptions,
+    outer_pass: usize,
+    parity: &ParityMatrix,
+    allow_ap: bool,
+    ft4_ap_known_bits: &[Vec<Option<u8>>],
+    resolver: &HashResolver,
+    seen_messages: &HashSet<String>,
+    counters: &mut DecodeCounters,
+) -> Vec<SuccessfulDecode> {
+    let coarse_freq_hz = candidate.freq_hz;
+    if coarse_freq_hz < options.min_freq_hz || coarse_freq_hz > options.max_freq_hz {
+        return Vec::new();
+    }
+    let Some(initial_baseband) = downsample_candidate_ft4_search(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        coarse_freq_hz,
+    ) else {
+        return Vec::new();
+    };
+    let mut refined_basebands = Vec::<(i32, Vec<Complex32>)>::new();
+    let refined_candidates = refine_candidate_ft4_variants_with_cache(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        &initial_baseband,
+        &mut refined_basebands,
+        coarse_freq_hz,
+    );
+    let max_osd = options.max_osd_passes(outer_pass, coarse_freq_hz);
+    for refined in refined_candidates {
+        if let Some(success) = try_refined_candidate(
+            &refined,
+            options.mode,
+            candidate.score,
+            max_osd,
+            allow_ap,
+            ft4_ap_known_bits,
+            resolver,
+            seen_messages,
+            parity,
+            counters,
+        ) {
+            return vec![success];
+        }
+    }
+    for refined in [
+        extract_candidate_at(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            candidate.start_seconds,
+            coarse_freq_hz,
+        ),
+        extract_candidate_at_relaxed(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            candidate.start_seconds,
+            coarse_freq_hz,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(success) = try_refined_candidate(
+            &refined,
+            options.mode,
+            candidate.score,
+            max_osd,
+            allow_ap,
+            ft4_ap_known_bits,
+            resolver,
+            seen_messages,
+            parity,
+            counters,
+        ) {
+            return vec![success];
+        }
+    }
+    Vec::new()
 }
 
 fn ft4_refinement_is_latched(coarse: &DecodeCandidate, refined: &SuccessfulDecode) -> bool {
@@ -752,12 +924,11 @@ pub(super) fn try_refined_candidate(
     max_osd: isize,
     allow_ap: bool,
     ft4_ap_known_bits: &[Vec<Option<u8>>],
-    resolver: &HashResolver,
-    seen_messages: &HashSet<String>,
+    _resolver: &HashResolver,
+    _seen_messages: &HashSet<String>,
     parity: &ParityMatrix,
     counters: &mut DecodeCounters,
 ) -> Option<SuccessfulDecode> {
-    let mut duplicate_fallback = None;
     for llrs in &refined.llr_sets {
         let Some((payload, bits, iterations)) =
             decode_llr_set(mode, parity, llrs, max_osd, counters)
@@ -772,12 +943,6 @@ pub(super) fn try_refined_candidate(
             bits,
             iterations,
         );
-        if mode == Mode::Ft4
-            && seen_messages.contains(&success.payload.to_message(resolver).to_text())
-        {
-            duplicate_fallback.get_or_insert(success);
-            continue;
-        }
         return Some(success);
     }
 
@@ -787,11 +952,17 @@ pub(super) fn try_refined_candidate(
         } else {
             &refined.llr_sets[0]
         };
-        let ap_magnitude = ap_llrs
+        let ap_magnitude_source = if mode == Mode::Ft4 {
+            &refined.llr_sets[0]
+        } else {
+            ap_llrs
+        };
+        let ap_magnitude_scale = if mode == Mode::Ft4 { 1.1 } else { 1.01 };
+        let ap_magnitude = ap_magnitude_source
             .iter()
             .map(|value| value.abs())
             .fold(0.0f32, f32::max)
-            * 1.01;
+            * ap_magnitude_scale;
         if ap_magnitude > 0.0 {
             let known_bit_sets: Vec<&[Option<u8>]> = if mode == Mode::Ft4 {
                 std::iter::once(cq_ap_known_bits(mode))
@@ -815,19 +986,13 @@ pub(super) fn try_refined_candidate(
                         bits,
                         iterations,
                     );
-                    if mode == Mode::Ft4
-                        && seen_messages.contains(&success.payload.to_message(resolver).to_text())
-                    {
-                        duplicate_fallback.get_or_insert(success);
-                        continue;
-                    }
                     return Some(success);
                 }
             }
         }
     }
 
-    duplicate_fallback
+    None
 }
 
 fn build_successful_decode(
@@ -915,6 +1080,32 @@ fn ft4_context_ap_known_bits(
                 ),
             );
         }
+
+        match &message.info {
+            GridReport::Blank => {
+                push_ft4_ap_context(
+                    &mut contexts,
+                    &mut seen,
+                    build_ft4_standard_ap_bits("CQ", second, &GridReport::Blank, &[BitField {
+                        start: 0,
+                        len: 77,
+                    }]),
+                );
+            }
+            GridReport::Grid(locator) => {
+                push_ft4_ap_context(
+                    &mut contexts,
+                    &mut seen,
+                    build_ft4_standard_ap_bits(
+                        "CQ",
+                        second,
+                        &GridReport::Grid(locator.clone()),
+                        &[BitField { start: 0, len: 77 }],
+                    ),
+                );
+            }
+            GridReport::Signal(_) | GridReport::Reply(_) => {}
+        }
     }
 
     contexts
@@ -941,7 +1132,7 @@ fn build_ft4_standard_ap_bits(
 ) -> Option<Vec<Option<u8>>> {
     let frame = encode_standard_message_for_mode(Mode::Ft4, first, second, false, info).ok()?;
     let mut known = vec![None; Mode::Ft4.spec().coding.codeword_bits];
-    copy_known_message_bits(&mut known, &frame.message_bits, fields)?;
+    copy_known_message_bits(&mut known, &frame.codeword_bits, fields)?;
     Some(known)
 }
 

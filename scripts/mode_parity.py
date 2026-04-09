@@ -24,6 +24,7 @@ DECODE_PATTERN = re.compile(
     r"^(?:(?P<utc>(?:\d{6}(?:_\d{9})?|\*{6}))\s+)?(?P<snr>-?\d+)\s+(?P<dt>-?\d+(?:\.\d+)?)\s+(?P<freq>\d+)\s+(?:~|\+|RX)\s+(?P<message>.+?)(?:\s+-?\d+\s+-?\d+\s+-?\d+)?\s*$",
     re.IGNORECASE,
 )
+TRAILING_JT9_TAG_PATTERN = re.compile(r"^(?P<message>.*?)(?:\s+(?P<tag>[a-z]\d+))?\s*$")
 
 
 @dataclass
@@ -52,13 +53,17 @@ def parse_decode_records(text: str) -> list[dict]:
         match = DECODE_PATTERN.match(line.strip())
         if not match:
             continue
+        raw_message = match.group("message").rstrip()
+        tag_match = TRAILING_JT9_TAG_PATTERN.match(raw_message)
+        if tag_match:
+            raw_message = tag_match.group("message").rstrip()
         records.append(
             {
                 "utc": match.group("utc") or "",
                 "snr_db": int(match.group("snr")),
                 "dt_seconds": float(match.group("dt")),
                 "freq_hz": float(match.group("freq")),
-                "message": re.sub(r"\s+", " ", match.group("message").strip().upper()),
+                "message": re.sub(r"\s+", " ", raw_message.strip().upper()),
             }
         )
     records.sort(key=lambda record: (record["freq_hz"], record["message"], record["dt_seconds"]))
@@ -549,6 +554,49 @@ def run_json_command(command: list[str]) -> dict:
     return json.loads(completed.stdout)
 
 
+def run_rust_search_debug(
+    decoder_binary: Path,
+    wav_path: str,
+    mode: str,
+    profile: str,
+    *,
+    max_candidates: int,
+    search_passes: int,
+) -> dict | None:
+    if mode == "ft2":
+        return None
+    command = [
+        str(decoder_binary),
+        "debug-search",
+        wav_path,
+        "--mode",
+        mode,
+        "--profile",
+        profile,
+        "--max-candidates",
+        str(max_candidates),
+        "--search-passes",
+        str(search_passes),
+        "--json",
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode != 0:
+        return None
+    return json.loads(completed.stdout)
+
+
+def run_stock_ft4_debug(wav_path: str, freq_hz: float) -> dict | None:
+    script = Path(__file__).resolve().with_name("run_stock_ft4_debug.py")
+    completed = subprocess.run(
+        ["python3", str(script), wav_path, f"--freq-hz={freq_hz}"],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None
+    return json.loads(completed.stdout)
+
+
 def run_decoder_report(
     decoder_binary: Path,
     wav_path: str,
@@ -686,22 +734,59 @@ def closest_decode(report: dict, dt_seconds: float, freq_hz: float) -> dict | No
 
 def classify_stock_only_message(
     *,
+    mode: str,
     stock_record: dict,
     baseline_report: dict,
     raised_report: dict,
     extra_pass_report: dict,
     no_subtraction_report: dict,
     stock_debug: dict | None,
+    stock_stage_debug: dict | None,
+    rust_search_debug: dict | None,
 ) -> str:
     message = stock_record["message"]
     if not has_nearby_top_candidate(raised_report, stock_record["dt_seconds"], stock_record["freq_hz"]):
         return "search/admission"
+    if stock_stage_debug is not None and rust_search_debug is not None:
+        stock_candidate_admitted = any(
+            abs(candidate["freq_hz"] - stock_record["freq_hz"]) <= 7.5
+            for candidate in stock_stage_debug.get("candidates", [])
+        )
+        rust_candidate_admitted = any(
+            abs(candidate["coarse_freq_hz"] - stock_record["freq_hz"]) <= 7.5
+            for pass_trace in rust_search_debug.get("passes", [])
+            for candidate in pass_trace.get("candidates", [])
+        )
+        if stock_candidate_admitted and not rust_candidate_admitted:
+            return "search/admission"
     if message_in_decode_report(no_subtraction_report, message) or message_in_decode_report(
         extra_pass_report, message
     ):
         return "subtraction/pass scheduling"
     if stock_debug is None:
         return "search/admission"
+
+    if stock_stage_debug is not None:
+        stock_variant = min(
+            (
+                variant
+                for variant in stock_stage_debug.get("variants", [])
+                if not variant.get("badsync")
+            ),
+            default=None,
+            key=lambda variant: (
+                abs(variant.get("f1_hz", 0.0) - stock_record["freq_hz"]),
+                abs(variant.get("dt_seconds", 0.0) - stock_record["dt_seconds"]),
+                -variant.get("nsync_qual", -1),
+            ),
+        )
+        if stock_variant is not None:
+            if abs(stock_variant["f1_hz"] - stock_record["freq_hz"]) > 7.5:
+                return "search/admission"
+            if mode != "ft4" and abs(stock_variant["dt_seconds"] - stock_record["dt_seconds"]) > 0.05:
+                return "refine drift"
+            if mode == "ft4":
+                return "metric/LLR extraction"
 
     if any(pass_info.get("decoded_text") == message for pass_info in stock_debug.get("passes", [])):
         return "subtraction/pass scheduling"
@@ -753,6 +838,14 @@ def triage_mismatches(args: argparse.Namespace) -> int:
             search_passes=args.search_passes,
             no_subtraction=False,
         )
+        rust_search_debug = run_rust_search_debug(
+            decoder_binary,
+            wav_path,
+            mode,
+            args.profile,
+            max_candidates=args.raised_max_candidates,
+            search_passes=args.extra_search_passes,
+        )
         raised_report = run_decoder_report(
             decoder_binary,
             wav_path,
@@ -794,6 +887,7 @@ def triage_mismatches(args: argparse.Namespace) -> int:
             "stock_only": [],
             "rust_only": [],
             "baseline_report": baseline_report,
+            "rust_search_debug": rust_search_debug,
             "raised_report": raised_report,
             "extra_pass_report": extra_pass_report,
             "no_subtraction_report": no_subtraction_report,
@@ -809,6 +903,7 @@ def triage_mismatches(args: argparse.Namespace) -> int:
                     stock_record["freq_hz"],
                     message,
                 )
+                stock_stage_debug = run_stock_ft4_debug(wav_path, stock_record["freq_hz"]) if mode == "ft4" else None
                 best_rust_decode = closest_decode(
                     baseline_report, stock_record["dt_seconds"], stock_record["freq_hz"]
                 )
@@ -835,12 +930,15 @@ def triage_mismatches(args: argparse.Namespace) -> int:
                         None,
                     )
                 stage = classify_stock_only_message(
+                    mode=mode,
                     stock_record=stock_record,
                     baseline_report=baseline_report,
                     raised_report=raised_report,
                     extra_pass_report=extra_pass_report,
                     no_subtraction_report=no_subtraction_report,
                     stock_debug=stock_debug,
+                    stock_stage_debug=stock_stage_debug,
+                    rust_search_debug=rust_search_debug,
                 )
                 artifact = {
                     "message": message,
@@ -849,6 +947,7 @@ def triage_mismatches(args: argparse.Namespace) -> int:
                     "stock_record": stock_record,
                     "closest_baseline_decode": best_rust_decode,
                     "closest_raised_top_candidate": best_rust_candidate,
+                    "stock_stage_debug": stock_stage_debug,
                     "stock_coordinate_debug": stock_debug,
                     "best_rust_coordinate_debug": best_rust_debug,
                 }

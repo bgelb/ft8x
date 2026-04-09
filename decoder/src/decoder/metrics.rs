@@ -36,6 +36,174 @@ pub(super) fn compute_bitmetric_passes(spec: &ModeSpec, full_tones: &[[Complex32
     }
 }
 
+pub(super) fn compute_ft4_candidate_metrics(
+    spec: &ModeSpec,
+    baseband: &[Complex32],
+    start_index: isize,
+    enforce_sync_quality: bool,
+) -> Option<([Vec<f32>; 4], Vec<f32>, i32)> {
+    debug_assert_eq!(spec.mode, Mode::Ft4);
+    let nss = spec.baseband_symbol_samples();
+    let nn = spec.geometry.message_symbols;
+    let frame_len = nss * nn;
+    let valid_samples = baseband.len().min(spec.baseband_valid_samples());
+    let mut frame = vec![Complex32::new(0.0, 0.0); frame_len];
+
+    for (offset, slot) in frame.iter_mut().enumerate() {
+        let sample_index = start_index + offset as isize;
+        if (0..valid_samples as isize).contains(&sample_index) {
+            *slot = baseband[sample_index as usize];
+        }
+    }
+
+    let fft = ft4_metric_fft();
+    let mut cs = vec![[Complex32::new(0.0, 0.0); 4]; nn];
+    let mut s4 = vec![[0.0f32; 4]; nn];
+    for symbol_index in 0..nn {
+        let start = symbol_index * nss;
+        let mut spectrum = frame[start..start + nss].to_vec();
+        fft.process(&mut spectrum);
+        for tone in 0..4 {
+            cs[symbol_index][tone] = spectrum[tone];
+            s4[symbol_index][tone] = spectrum[tone].norm();
+        }
+    }
+
+    let sync_patterns = [[0usize, 1, 3, 2], [1, 0, 2, 3], [2, 3, 1, 0], [3, 2, 0, 1]];
+    let sync_offsets = [0usize, 33, 66, 99];
+    let mut nsync = 0usize;
+    for (block_offset, pattern) in sync_offsets.iter().zip(sync_patterns.iter()) {
+        for (symbol_offset, &expected_tone) in pattern.iter().enumerate() {
+            let best_tone = s4[*block_offset + symbol_offset]
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            if best_tone == expected_tone {
+                nsync += 1;
+            }
+        }
+    }
+    if enforce_sync_quality && nsync < 8 {
+        return None;
+    }
+
+    const FT4_MESSAGE_BITS: usize = 206;
+    const FT4_GRAY_MAP: [usize; 4] = [0, 1, 3, 2];
+    let mut raw = [
+        vec![0.0f32; FT4_MESSAGE_BITS],
+        vec![0.0f32; FT4_MESSAGE_BITS],
+        vec![0.0f32; FT4_MESSAGE_BITS],
+    ];
+
+    for (pass_index, nsym) in [1usize, 2, 4].into_iter().enumerate() {
+        let nt = 1usize << (2 * nsym);
+        for ks in (0..=nn.saturating_sub(nsym)).step_by(nsym) {
+            let mut s2 = vec![0.0f32; nt];
+            for (value, metric) in s2.iter_mut().enumerate() {
+                let i1 = value / 64;
+                let i2 = (value & 63) / 16;
+                let i3 = (value & 15) / 4;
+                let i4 = value & 3;
+                *metric = match nsym {
+                    1 => cs[ks][FT4_GRAY_MAP[i4]].norm(),
+                    2 => (cs[ks][FT4_GRAY_MAP[i3]] + cs[ks + 1][FT4_GRAY_MAP[i4]]).norm(),
+                    4 => {
+                        (cs[ks][FT4_GRAY_MAP[i1]]
+                            + cs[ks + 1][FT4_GRAY_MAP[i2]]
+                            + cs[ks + 2][FT4_GRAY_MAP[i3]]
+                            + cs[ks + 3][FT4_GRAY_MAP[i4]])
+                            .norm()
+                    }
+                    _ => unreachable!(),
+                };
+            }
+
+            let ipt = ks * 2;
+            let ibmax = match nsym {
+                1 => 1,
+                2 => 3,
+                4 => 7,
+                _ => unreachable!(),
+            };
+            for ib in 0..=ibmax {
+                let target_bit = ipt + ib;
+                if target_bit >= FT4_MESSAGE_BITS {
+                    continue;
+                }
+                let decision_bit = ibmax - ib;
+                let mut best_one = f32::NEG_INFINITY;
+                let mut best_zero = f32::NEG_INFINITY;
+                for (value, metric) in s2.iter().enumerate() {
+                    if ((value >> decision_bit) & 1) == 1 {
+                        best_one = best_one.max(*metric);
+                    } else {
+                        best_zero = best_zero.max(*metric);
+                    }
+                }
+                raw[pass_index][target_bit] = best_one - best_zero;
+            }
+        }
+    }
+
+    let tail0 = raw[0][204..206].to_vec();
+    let tail1 = raw[1][200..204].to_vec();
+    raw[1][204..206].copy_from_slice(&tail0);
+    raw[2][200..204].copy_from_slice(&tail1);
+    raw[2][204..206].copy_from_slice(&tail0);
+
+    if enforce_sync_quality {
+        let hard_bits: Vec<u8> = raw[0].iter().map(|value| u8::from(*value >= 0.0)).collect();
+        let sync_checks = [
+            (&hard_bits[0..8], [0u8, 0, 0, 1, 1, 0, 1, 1]),
+            (&hard_bits[66..74], [0u8, 1, 0, 0, 1, 1, 1, 0]),
+            (&hard_bits[132..140], [1u8, 1, 1, 0, 0, 1, 0, 0]),
+            (&hard_bits[198..206], [1u8, 0, 1, 1, 0, 0, 0, 1]),
+        ];
+        let nsync_qual = sync_checks
+            .iter()
+            .map(|(observed, expected)| {
+                observed
+                    .iter()
+                    .zip(expected.iter())
+                    .filter(|(left, right)| **left == **right)
+                    .count()
+            })
+            .sum::<usize>();
+        if nsync_qual < 20 {
+            return None;
+        }
+    }
+
+    for pass in &mut raw {
+        normalize_metric_vector(pass);
+    }
+
+    let ranges = [(8, 66), (74, 132), (140, 198)];
+    let mut outputs = std::array::from_fn(|_| vec![0.0f32; spec.coding.codeword_bits]);
+    for (dest, source) in outputs.iter_mut().zip(raw.iter()) {
+        let mut out = 0usize;
+        for (start, end) in ranges {
+            for &value in &source[start..end] {
+                dest[out] = value * spec.tuning.llr_scale_factor;
+                out += 1;
+            }
+        }
+    }
+    outputs[3] = outputs[2].clone();
+
+    let mut full_tones = vec![[Complex32::new(0.0, 0.0); 8]; nn];
+    for (symbol_index, tones) in cs.into_iter().enumerate() {
+        for (tone_index, tone) in tones.into_iter().enumerate() {
+            full_tones[symbol_index][tone_index] = tone;
+        }
+    }
+    let symbol_bit_llrs = compute_symbol_bit_llrs(spec, &full_tones);
+    let snr_db = estimate_snr_db(spec, &full_tones);
+    Some((outputs, symbol_bit_llrs, snr_db))
+}
+
 fn compute_ft8_bitmetric_passes(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) -> [Vec<f32>; 4] {
     let mut bmeta = vec![0.0f32; FTX_CODEWORD_BITS];
     let mut bmetb = vec![0.0f32; FTX_CODEWORD_BITS];
@@ -189,6 +357,14 @@ fn compute_ft4_bitmetric_passes(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) 
     outputs
 }
 
+fn ft4_metric_fft() -> &'static Arc<dyn Fft<f32>> {
+    static FFT: OnceLock<Arc<dyn Fft<f32>>> = OnceLock::new();
+    FFT.get_or_init(|| {
+        let mut planner = FftPlanner::<f32>::new();
+        planner.plan_fft_forward(Mode::Ft4.spec().baseband_symbol_samples())
+    })
+}
+
 // A combined nsym-symbol hypothesis carries nsym * 3 code bits, numbered from the most
 // significant bit down to zero in the legacy FT8 bitmetric walk.
 fn bitmetric_decision_max_bit(nsym: usize) -> usize {
@@ -321,8 +497,21 @@ pub(super) fn cq_ap_known_bits(mode: Mode) -> &'static [Option<u8>] {
         )
         .expect("encode CQ AP template");
         let mut known = vec![None; mode.spec().coding.codeword_bits];
-        copy_known_message_bits(&mut known, &frame.message_bits, &FTX_AP_KNOWN_FIELDS)
-            .expect("copy AP template bits");
+        match mode {
+            Mode::Ft4 => {
+                copy_known_message_bits(
+                    &mut known,
+                    &frame.codeword_bits,
+                    &[crate::protocol::BitField { start: 0, len: 29 }],
+                )
+                .expect("copy AP template bits");
+            }
+            Mode::Ft8 => {
+                copy_known_message_bits(&mut known, &frame.message_bits, &FTX_AP_KNOWN_FIELDS)
+                    .expect("copy AP template bits");
+            }
+            Mode::Ft2 => {}
+        }
         known
     }
 
@@ -350,8 +539,21 @@ pub(super) fn mycall_ap_known_bits(mode: Mode) -> &'static [Option<u8>] {
         )
         .expect("encode MyCall AP template");
         let mut known = vec![None; mode.spec().coding.codeword_bits];
-        copy_known_message_bits(&mut known, &frame.message_bits, &FTX_AP_KNOWN_FIELDS)
-            .expect("copy AP template bits");
+        match mode {
+            Mode::Ft4 => {
+                copy_known_message_bits(
+                    &mut known,
+                    &frame.codeword_bits,
+                    &[crate::protocol::BitField { start: 0, len: 29 }],
+                )
+                .expect("copy AP template bits");
+            }
+            Mode::Ft8 => {
+                copy_known_message_bits(&mut known, &frame.message_bits, &FTX_AP_KNOWN_FIELDS)
+                    .expect("copy AP template bits");
+            }
+            Mode::Ft2 => {}
+        }
         known
     }
 
@@ -402,6 +604,7 @@ pub(super) fn normalize_metric_vector(values: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::FTX_AP_KNOWN_FIELDS;
 
     #[test]
     fn bitmetric_passes_preserve_codeword_bit_order_on_ideal_tones() {
@@ -424,5 +627,18 @@ mod tests {
             .collect();
 
         assert_eq!(hard_bits, frame.codeword_bits);
+    }
+
+    #[test]
+    fn ft4_cq_ap_template_matches_stock_mcq_bits() {
+        let known = cq_ap_known_bits(Mode::Ft4);
+        let first_bits: String = known[FTX_AP_KNOWN_FIELDS[0].start..FTX_AP_KNOWN_FIELDS[0].end()]
+            .iter()
+            .map(|bit| char::from(b'0' + bit.expect("known FT4 CQ AP bit")))
+            .collect();
+        assert_eq!(first_bits, "01001010010111101000100110010");
+        for bit in &known[FTX_AP_KNOWN_FIELDS[1].start..FTX_AP_KNOWN_FIELDS[1].end()] {
+            assert_eq!(*bit, None);
+        }
     }
 }

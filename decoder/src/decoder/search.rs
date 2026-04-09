@@ -67,7 +67,7 @@ pub(super) fn collect_candidates(
 ) -> Vec<DecodeCandidate> {
     let spec = options.mode.spec();
     if spec.mode == Mode::Ft4 {
-        return collect_candidates_legacy(audio, options);
+        return collect_candidates_ft4(audio, options, sync_threshold);
     }
     let geometry = &spec.geometry;
     let tuning = &spec.tuning;
@@ -201,6 +201,228 @@ pub(super) fn collect_candidates(
     } else {
         selected
     }
+}
+
+fn collect_candidates_ft4(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    sync_threshold: f32,
+) -> Vec<DecodeCandidate> {
+    let spec = options.mode.spec();
+    debug_assert_eq!(spec.mode, Mode::Ft4);
+
+    let nfft = spec.sync_fft_samples();
+    let nh1 = nfft / 2;
+    let nstep = spec.geometry.symbol_samples;
+    if audio.samples.len() < nfft {
+        return Vec::new();
+    }
+
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(nfft);
+    let mut input = fft.make_input_vec();
+    let mut spectrum = fft.make_output_vec();
+    let window = ft4_nuttall_window(nfft);
+    let mut savg = vec![0.0f32; nh1 + 1];
+    let fac = 1.0f32 / 300.0;
+    let mut frames = 0usize;
+
+    let mut start = 0usize;
+    while start + nfft <= audio.samples.len() {
+        for (slot, (&sample, &gain)) in input
+            .iter_mut()
+            .zip(audio.samples[start..start + nfft].iter().zip(window.iter()))
+        {
+            *slot = fac * sample * gain;
+        }
+        fft.process(&mut input, &mut spectrum).expect("ft4 coarse fft");
+        for bin in 1..=nh1 {
+            savg[bin] += spectrum[bin].norm_sqr();
+        }
+        frames += 1;
+        start += nstep;
+    }
+    if frames == 0 {
+        return Vec::new();
+    }
+    for value in &mut savg[1..=nh1] {
+        *value /= frames as f32;
+    }
+
+    let mut savsm = vec![0.0f32; nh1 + 1];
+    for bin in 8..=nh1.saturating_sub(7) {
+        savsm[bin] = savg[bin - 7..=bin + 7].iter().copied().sum::<f32>() / 15.0;
+    }
+
+    let df = spec.sync_bin_hz();
+    let nfa = ((options.min_freq_hz / df).round() as usize).max((200.0 / df).round() as usize);
+    let nfb = ((options.max_freq_hz / df).round() as usize).min((4910.0 / df).round() as usize);
+    if nfa >= nfb || nfb > nh1 {
+        return Vec::new();
+    }
+
+    let sbase = ft4_baseline(&savg, nfa, nfb);
+    for bin in nfa..=nfb {
+        if sbase[bin] <= 0.0 {
+            return Vec::new();
+        }
+        savsm[bin] /= sbase[bin];
+    }
+
+    let f_offset = -1.5 * spec.geometry.tone_spacing_hz;
+    let mut near_qso = Vec::new();
+    let mut others = Vec::new();
+    for bin in (nfa + 1)..=(nfb.saturating_sub(1)) {
+        if savsm[bin] < sync_threshold
+            || savsm[bin] < savsm[bin - 1]
+            || savsm[bin] < savsm[bin + 1]
+        {
+            continue;
+        }
+        let den = savsm[bin - 1] - 2.0 * savsm[bin] + savsm[bin + 1];
+        let del = if den != 0.0 {
+            0.5 * (savsm[bin - 1] - savsm[bin + 1]) / den
+        } else {
+            0.0
+        };
+        let freq_hz = (bin as f32 + del) * df + f_offset;
+        if !(200.0..=4910.0).contains(&freq_hz) {
+            continue;
+        }
+        let score = savsm[bin] - 0.25 * (savsm[bin - 1] - savsm[bin + 1]) * del;
+        let candidate = DecodeCandidate {
+            start_seconds: spec.start_seconds_from_dt(0.0),
+            dt_seconds: 0.0,
+            freq_hz,
+            score,
+        };
+        if (freq_hz - spec.tuning.nfqso_hz).abs() <= spec.tuning.nfqso_priority_window_hz {
+            near_qso.push(candidate);
+        } else {
+            others.push(candidate);
+        }
+    }
+
+    near_qso
+        .into_iter()
+        .chain(others)
+        .take(options.max_candidates)
+        .collect()
+}
+
+fn ft4_nuttall_window(nfft: usize) -> &'static [f32] {
+    static WINDOW: OnceLock<Vec<f32>> = OnceLock::new();
+    WINDOW.get_or_init(|| {
+        let pi = std::f32::consts::PI;
+        (0..nfft)
+            .map(|index| {
+                let phase = 2.0 * pi * index as f32 / nfft as f32;
+                0.3635819
+                    - 0.4891775 * phase.cos()
+                    + 0.1365995 * (2.0 * phase).cos()
+                    - 0.0106411 * (3.0 * phase).cos()
+            })
+            .collect()
+    })
+}
+
+fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
+    let nh1 = savg.len().saturating_sub(1);
+    let ia = nfa.max(1);
+    let ib = nfb.min(nh1);
+    let mut spectrum_db = savg.to_vec();
+    for value in &mut spectrum_db[ia..=ib] {
+        *value = 10.0 * value.max(1e-12).log10();
+    }
+
+    let nseg = 10usize;
+    let nlen = ((ib - ia + 1) / nseg).max(1);
+    let i0 = (ib - ia + 1) as f64 / 2.0;
+    let mut xs = Vec::<f64>::new();
+    let mut ys = Vec::<f64>::new();
+
+    for seg in 0..nseg {
+        let ja = ia + seg * nlen;
+        if ja > ib {
+            break;
+        }
+        let jb = (ja + nlen - 1).min(ib);
+        let base = percentile_10(&spectrum_db[ja..=jb]);
+        for (offset, &value) in spectrum_db[ja..=jb].iter().enumerate() {
+            if value <= base {
+                let bin = ja + offset;
+                xs.push(bin as f64 - i0);
+                ys.push(value as f64);
+            }
+        }
+    }
+
+    let coeffs = polyfit_degree4(&xs, &ys).unwrap_or([0.0; 5]);
+    let mut baseline = vec![0.0f32; savg.len()];
+    for (bin, slot) in baseline.iter_mut().enumerate().take(ib + 1).skip(ia) {
+        let t = bin as f64 - i0;
+        let db = coeffs[0]
+            + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4])))
+            + 0.65;
+        *slot = 10.0f64.powf(db / 10.0) as f32;
+    }
+    baseline
+}
+
+fn percentile_10(values: &[f32]) -> f32 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let rank = ((sorted.len() as f32 * 0.10).round() as usize)
+        .clamp(1, sorted.len());
+    let index = rank - 1;
+    sorted[index]
+}
+
+fn polyfit_degree4(xs: &[f64], ys: &[f64]) -> Option<[f64; 5]> {
+    if xs.len() != ys.len() || xs.len() < 5 {
+        return None;
+    }
+
+    let mut a = [[0.0f64; 6]; 5];
+    for row in 0..5 {
+        for col in 0..5 {
+            a[row][col] = xs.iter().map(|&x| x.powi((row + col) as i32)).sum();
+        }
+        a[row][5] = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(&x, &y)| y * x.powi(row as i32))
+            .sum();
+    }
+
+    for pivot in 0..5 {
+        let best = (pivot..5)
+            .max_by(|&left, &right| a[left][pivot].abs().total_cmp(&a[right][pivot].abs()))?;
+        if a[best][pivot].abs() < 1e-12 {
+            return None;
+        }
+        if best != pivot {
+            a.swap(best, pivot);
+        }
+        let scale = a[pivot][pivot];
+        for col in pivot..=5 {
+            a[pivot][col] /= scale;
+        }
+        for row in 0..5 {
+            if row == pivot {
+                continue;
+            }
+            let factor = a[row][pivot];
+            if factor == 0.0 {
+                continue;
+            }
+            for col in pivot..=5 {
+                a[row][col] -= factor * a[pivot][col];
+            }
+        }
+    }
+
+    Some(std::array::from_fn(|index| a[index][5]))
 }
 
 pub(super) fn zero_tail(audio: &AudioBuffer, keep_samples: usize) -> AudioBuffer {
