@@ -1,4 +1,7 @@
-use super::{ChannelCoding, FrameGeometry, Mode, ModeSpec, SearchTuning};
+use super::{
+    ChannelCoding, FrameGeometry, Mode, ModeSpec, RefineSpec, SearchSpec, SubtractionSpec,
+    WaveformSpec,
+};
 
 pub const FT4_SAMPLE_RATE: u32 = 12_000;
 pub const FT4_SYMBOL_SAMPLES: usize = 576;
@@ -13,9 +16,9 @@ pub const FT4_SYNC_B: [usize; FT4_SYNC_LEN] = [1, 0, 2, 3];
 pub const FT4_SYNC_C: [usize; FT4_SYNC_LEN] = [2, 3, 1, 0];
 pub const FT4_SYNC_D: [usize; FT4_SYNC_LEN] = [3, 2, 0, 1];
 pub const FT4_RVEC: [u8; 77] = [
-    0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0,
-    1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1,
-    0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1,
+    0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0, 0,
+    1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1,
 ];
 pub const FT4_SYNC_PATTERNS: [&[usize]; FT4_SYNC_BLOCK_COUNT] =
     [&FT4_SYNC_A, &FT4_SYNC_B, &FT4_SYNC_C, &FT4_SYNC_D];
@@ -75,7 +78,14 @@ pub const FT4_CODING: ChannelCoding = ChannelCoding {
     bits_per_symbol: 2,
 };
 
-pub const FT4_TUNING: SearchTuning = SearchTuning {
+pub const FT4_WAVEFORM: WaveformSpec = WaveformSpec {
+    default_frequency_hz: 1_000.0,
+    default_start_seconds: 0.5,
+    default_total_seconds: 7.5,
+    default_amplitude: 0.8,
+};
+
+pub const FT4_SEARCH: SearchSpec = SearchSpec {
     long_input_samples: FT4_LONG_INPUT_SAMPLES,
     long_fft_samples: FT4_LONG_FFT_SAMPLES,
     downsample_factor: 18,
@@ -89,14 +99,6 @@ pub const FT4_TUNING: SearchTuning = SearchTuning {
     sync_power_scale: 1.0 / 300.0,
     sync_baseline_percentile: 0.40,
     sync_baseline_floor: 1e-6,
-    nominal_start_seconds: 0.5,
-    baseband_taper_len: 0,
-    baseband_valid_samples: FT4_BASEBAND_VALID_SAMPLES,
-    subtract_filter_samples: 1_400,
-    early_block_samples: FT4_EARLY_BLOCK_SAMPLES,
-    subtraction_refine_cutoff_seconds: 0.0,
-    subtraction_refine_probe_step_samples: 0,
-    refine_residual_step_hz: 1.0,
     nfqso_hz: 1_500.0,
     nfqso_priority_window_hz: 20.0,
     candidate_separation_hz: FT4_TONE_SPACING_HZ,
@@ -104,12 +106,29 @@ pub const FT4_TUNING: SearchTuning = SearchTuning {
     legacy_candidate_separation_tone_factor: 1.0,
     band_lower_tone_offset: 1.5,
     band_upper_tone_offset: 3.5,
+};
+
+pub const FT4_REFINE: RefineSpec = RefineSpec {
+    nominal_start_seconds: 0.5,
+    baseband_taper_len: 0,
+    baseband_valid_samples: FT4_BASEBAND_VALID_SAMPLES,
+    early_block_samples: FT4_EARLY_BLOCK_SAMPLES,
+    refine_residual_step_hz: 1.0,
     llr_scale_factor: 2.83,
+};
+
+pub const FT4_SUBTRACTION: SubtractionSpec = SubtractionSpec {
+    filter_samples: 1_400,
+    refine_cutoff_seconds: 0.0,
+    refine_probe_step_samples: 0,
 };
 
 pub const FT4_SPEC: ModeSpec = ModeSpec {
     mode: Mode::Ft4,
     coding: FT4_CODING,
     geometry: FT4_GEOMETRY,
-    tuning: FT4_TUNING,
+    waveform: FT4_WAVEFORM,
+    search: FT4_SEARCH,
+    refine: FT4_REFINE,
+    subtraction: FT4_SUBTRACTION,
 };

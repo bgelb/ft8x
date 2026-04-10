@@ -3,17 +3,15 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 use ft8_decoder::{
-    DecodeOptions, DecodeProfile, GridReport, Mode, WaveformOptions,
-    debug_candidate_truth_wav_file, debug_candidate_wav_file, debug_ft4_metrics_wav_file,
-    debug_ft4_decode174_wav_file,
-    debug_ft4_search_probe_wav_file,
-    debug_ft2_trace_wav_file, debug_ft4_variants_wav_file,
-    debug_search_wav_file,
-    decode_wav_file,
+    DecodeOptions, DecodeProfile, GridReport, Mode, TxRttyExchange, WaveformOptions,
+    debug_candidate_truth_wav_file, debug_candidate_wav_file, debug_ft2_trace_wav_file,
+    debug_ft4_decode174_wav_file, debug_ft4_metrics_wav_file, debug_ft4_search_probe_wav_file,
+    debug_ft4_variants_wav_file, debug_search_wav_file, decode_wav_file,
     encode_rtty_contest_message, encode_standard_message, encode_standard_message_for_mode,
     parse_standard_info, subtract_truth_wav_file, write_rectangular_standard_wav, write_wav,
-    TxRttyExchange,
 };
+
+type CliResult<T> = Result<T, std::io::Error>;
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8-decoder")]
@@ -321,21 +319,64 @@ enum Command {
         #[arg(long, default_value_t = false)]
         acknowledge: bool,
 
-        #[arg(long, default_value_t = 1_000.0)]
-        freq_hz: f32,
+        #[arg(long)]
+        freq_hz: Option<f32>,
 
-        #[arg(long, default_value_t = 0.5)]
-        start_seconds: f32,
+        #[arg(long)]
+        start_seconds: Option<f32>,
 
-        #[arg(long, default_value_t = 15.0)]
-        total_seconds: f32,
+        #[arg(long)]
+        total_seconds: Option<f32>,
 
-        #[arg(long, default_value_t = 0.8)]
-        amplitude: f32,
+        #[arg(long)]
+        amplitude: Option<f32>,
 
         #[arg(long, default_value = "ft8")]
         mode: String,
     },
+}
+
+fn invalid_input(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn parse_mode(mode: &str) -> CliResult<Mode> {
+    mode.parse::<Mode>().map_err(invalid_input)
+}
+
+fn parse_profile(profile: &str) -> CliResult<DecodeProfile> {
+    profile.parse::<DecodeProfile>().map_err(invalid_input)
+}
+
+fn decode_options_for_mode(mode: Mode) -> DecodeOptions {
+    DecodeOptions::for_mode(mode)
+}
+
+fn waveform_options_for_mode(mode: Mode) -> WaveformOptions {
+    WaveformOptions::for_mode(mode)
+}
+
+fn decode_options_with_overrides(
+    mode: Mode,
+    profile: DecodeProfile,
+    min_freq_hz: f32,
+    max_freq_hz: f32,
+    max_candidates: usize,
+    max_successes: usize,
+    search_passes: usize,
+    disable_subtraction: bool,
+) -> DecodeOptions {
+    DecodeOptions {
+        mode,
+        profile,
+        min_freq_hz,
+        max_freq_hz,
+        max_candidates,
+        max_successes,
+        search_passes,
+        disable_subtraction,
+        ..decode_options_for_mode(mode)
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -354,13 +395,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_subtraction,
             pretty,
         } => {
-            let profile = profile.parse::<DecodeProfile>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
-            let options = DecodeOptions {
+            let profile = parse_profile(&profile)?;
+            let mode = parse_mode(&mode)?;
+            let options = decode_options_with_overrides(
                 mode,
                 profile,
                 min_freq_hz,
@@ -368,9 +405,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_candidates,
                 max_successes,
                 search_passes,
-                disable_subtraction: no_subtraction,
-                ..DecodeOptions::default()
-            };
+                no_subtraction,
+            );
 
             let report = decode_wav_file(&wav, &options)?;
             if json {
@@ -396,9 +432,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             freq_hz,
             pretty,
         } => {
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
+            let mode = parse_mode(&mode)?;
             let report = debug_candidate_wav_file(&wav, mode, dt_seconds, freq_hz)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -418,13 +452,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_subtraction,
             pretty,
         } => {
-            let profile = profile.parse::<DecodeProfile>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
-            let options = DecodeOptions {
+            let profile = parse_profile(&profile)?;
+            let mode = parse_mode(&mode)?;
+            let options = decode_options_with_overrides(
                 mode,
                 profile,
                 min_freq_hz,
@@ -432,9 +462,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_candidates,
                 max_successes,
                 search_passes,
-                disable_subtraction: no_subtraction,
-                ..DecodeOptions::default()
-            };
+                no_subtraction,
+            );
             let report = debug_search_wav_file(&wav, &options)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -450,17 +479,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             message,
             pretty,
         } => {
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
-            let (first, second, acknowledge, info) = parse_rendered_standard_message(&message)
-                .map_err(|message| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-                })?;
+            let mode = parse_mode(&mode)?;
+            let (first, second, acknowledge, info) =
+                parse_rendered_standard_message(&message).map_err(invalid_input)?;
             let frame = encode_standard_message_for_mode(mode, &first, &second, acknowledge, &info)
-                .map_err(|error| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-                })?;
+                .map_err(|error| invalid_input(error.to_string()))?;
             let report = debug_candidate_truth_wav_file(
                 &wav,
                 mode,
@@ -474,7 +497,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string(&report)?);
             }
         }
-        Command::DebugFt4Variants { wav, freq_hz, pretty } => {
+        Command::DebugFt4Variants {
+            wav,
+            freq_hz,
+            pretty,
+        } => {
             let report = debug_ft4_variants_wav_file(&wav, freq_hz)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -532,16 +559,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             profile,
             pretty,
         } => {
-            let profile = profile.parse::<DecodeProfile>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
+            let profile = parse_profile(&profile)?;
             let options = DecodeOptions {
                 mode: Mode::Ft2,
                 profile,
                 min_freq_hz,
                 max_freq_hz,
                 max_candidates,
-                ..DecodeOptions::default()
+                ..decode_options_for_mode(Mode::Ft2)
             };
             let report = debug_ft2_trace_wav_file(&wav, &options)?;
             if pretty {
@@ -563,25 +588,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             exchange,
             pretty,
         } => {
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
+            let mode = parse_mode(&mode)?;
             let exchange = if let Ok(serial) = exchange.parse::<u16>() {
                 TxRttyExchange::Serial(serial)
             } else {
                 TxRttyExchange::Multiplier(exchange)
             };
-            let frame = encode_rtty_contest_message(
-                tu,
-                &first,
-                &second,
-                acknowledge,
-                report,
-                &exchange,
-            )
-            .map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-            })?;
+            let frame =
+                encode_rtty_contest_message(tu, &first, &second, acknowledge, report, &exchange)
+                    .map_err(|error| invalid_input(error.to_string()))?;
             let report = debug_candidate_truth_wav_file(
                 &wav,
                 mode,
@@ -608,16 +623,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode,
         } => {
             let info = parse_standard_info(&info)?;
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
-            let options = WaveformOptions {
-                mode,
-                base_freq_hz: freq_hz,
-                start_seconds,
-                total_seconds,
-                amplitude,
-            };
+            let mode = parse_mode(&mode)?;
+            let mut options = waveform_options_for_mode(mode);
+            if let Some(freq_hz) = freq_hz {
+                options.base_freq_hz = freq_hz;
+            }
+            if let Some(start_seconds) = start_seconds {
+                options.start_seconds = start_seconds;
+            }
+            if let Some(total_seconds) = total_seconds {
+                options.total_seconds = total_seconds;
+            }
+            if let Some(amplitude) = amplitude {
+                options.amplitude = amplitude;
+            }
             let frame = write_rectangular_standard_wav(
                 &output_wav,
                 &first,
@@ -649,30 +668,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             freq_hz,
             message,
         } => {
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
-            let (first, second, acknowledge, info) = parse_rendered_standard_message(&message)
-                .map_err(|message| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-                })?;
+            let mode = parse_mode(&mode)?;
+            let (first, second, acknowledge, info) =
+                parse_rendered_standard_message(&message).map_err(invalid_input)?;
             let frame = encode_standard_message_for_mode(mode, &first, &second, acknowledge, &info)
-                .map_err(|error| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-                })?;
-            let residual = subtract_truth_wav_file(
-                &wav,
-                mode,
-                dt_seconds,
-                freq_hz,
-                &frame.codeword_bits,
-            )?
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "unable to build subtraction residual",
-                )
-            })?;
+                .map_err(|error| invalid_input(error.to_string()))?;
+            let residual =
+                subtract_truth_wav_file(&wav, mode, dt_seconds, freq_hz, &frame.codeword_bits)?
+                    .ok_or_else(|| invalid_input("unable to build subtraction residual"))?;
             write_wav(&output_wav, &residual)?;
         }
         Command::SubtractCodewordCandidate {
@@ -683,27 +686,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             freq_hz,
             codeword_bits,
         } => {
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
+            let mode = parse_mode(&mode)?;
             let bits: Vec<u8> = codeword_bits
                 .chars()
                 .map(|ch| match ch {
                     '0' => Ok(0u8),
                     '1' => Ok(1u8),
-                    _ => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "codeword bits must contain only 0/1",
-                    )),
+                    _ => Err(invalid_input("codeword bits must contain only 0/1")),
                 })
                 .collect::<Result<_, _>>()?;
             let residual = subtract_truth_wav_file(&wav, mode, dt_seconds, freq_hz, &bits)?
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "unable to build subtraction residual",
-                    )
-                })?;
+                .ok_or_else(|| invalid_input("unable to build subtraction residual"))?;
             write_wav(&output_wav, &residual)?;
         }
         Command::SubtractRttyContestCandidate {
@@ -719,38 +712,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             report,
             exchange,
         } => {
-            let mode = mode.parse::<Mode>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
+            let mode = parse_mode(&mode)?;
             let exchange = if let Ok(serial) = exchange.parse::<u16>() {
                 TxRttyExchange::Serial(serial)
             } else {
                 TxRttyExchange::Multiplier(exchange)
             };
-            let frame = encode_rtty_contest_message(
-                tu,
-                &first,
-                &second,
-                acknowledge,
-                report,
-                &exchange,
-            )
-            .map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-            })?;
-            let residual = subtract_truth_wav_file(
-                &wav,
-                mode,
-                dt_seconds,
-                freq_hz,
-                &frame.codeword_bits,
-            )?
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "unable to build subtraction residual",
-                )
-            })?;
+            let frame =
+                encode_rtty_contest_message(tu, &first, &second, acknowledge, report, &exchange)
+                    .map_err(|error| invalid_input(error.to_string()))?;
+            let residual =
+                subtract_truth_wav_file(&wav, mode, dt_seconds, freq_hz, &frame.codeword_bits)?
+                    .ok_or_else(|| invalid_input("unable to build subtraction residual"))?;
             write_wav(&output_wav, &residual)?;
         }
     }

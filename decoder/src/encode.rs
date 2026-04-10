@@ -1,28 +1,29 @@
 use std::path::Path;
-use std::sync::OnceLock;
 
 use num_complex::Complex32;
 use thiserror::Error;
 
-use crate::crc::{crc13_ft2, crc14_ft8};
+use crate::coding::ft2_generator_rows;
+use crate::crc::crc13_ft2;
+use crate::ftx;
 use crate::message::{GridReport, ReplyWord, hash_callsign};
-use crate::modes::{Mode, populate_channel_symbols};
-use crate::modes::ft4::FT4_RVEC;
+use crate::modes::Mode;
 use crate::protocol::{
-    CALL_NTOKENS, CALL_STANDARD_BASE, FIELD_DAY_SECTIONS, FTX_DXPEDITION_LAYOUT,
-    FTX_EU_VHF_LAYOUT, FTX_FIELD_DAY_LAYOUT, FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_EU_VHF,
-    FTX_MESSAGE_KIND_NONSTANDARD, FTX_MESSAGE_KIND_RTTY_CONTEST,
-    FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT, FTX_RTTY_CONTEST_LAYOUT,
-    FTX_STANDARD_LAYOUT, RTTY_MULTIPLIERS, alphabet27_index, alphabet36_index,
-    alphabet37_index, alphabet38_index, digit10_index, gray_decode_tone3, gray_encode_3bits,
-    write_bit_field,
+    CALL_NTOKENS, CALL_STANDARD_BASE, FIELD_DAY_SECTIONS, FTX_DXPEDITION_LAYOUT, FTX_EU_VHF_LAYOUT,
+    FTX_FIELD_DAY_LAYOUT, FTX_MESSAGE_BITS, FTX_MESSAGE_KIND_EU_VHF, FTX_MESSAGE_KIND_NONSTANDARD,
+    FTX_MESSAGE_KIND_RTTY_CONTEST, FTX_MESSAGE_KIND_STANDARD_SLASH_R, FTX_NONSTANDARD_LAYOUT,
+    FTX_RTTY_CONTEST_LAYOUT, FTX_STANDARD_LAYOUT, RTTY_MULTIPLIERS, alphabet27_index,
+    alphabet36_index, alphabet37_index, alphabet38_index, digit10_index, write_bit_field,
 };
 use crate::wave::{AudioBuffer, DecoderError, write_wav};
 
 const MESSAGE_BITS: usize = FTX_MESSAGE_BITS;
-const INFO_BITS: usize = 91;
-const FT2_INFO_BITS: usize = 90;
 const GFSK_BT: f32 = 2.0;
+const HALF: f32 = 0.5;
+const CPFSK_SYMBOL_DEVIATION_SCALE: f32 = 2.0;
+const CPFSK_BINARY_TONE_BIAS: f32 = 1.0;
+const GFSK_PULSE_SPAN_SYMBOLS: usize = 3;
+const GFSK_PULSE_CENTER_OFFSET_SYMBOLS: f32 = 1.5;
 
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
@@ -109,12 +110,19 @@ pub enum TxRttyExchange {
 
 impl Default for WaveformOptions {
     fn default() -> Self {
+        Self::for_mode(Mode::Ft8)
+    }
+}
+
+impl WaveformOptions {
+    pub fn for_mode(mode: Mode) -> Self {
+        let spec = mode.spec();
         Self {
-            mode: Mode::Ft8,
-            base_freq_hz: 1_000.0,
-            start_seconds: 0.5,
-            total_seconds: 15.0,
-            amplitude: 0.8,
+            mode,
+            base_freq_hz: spec.default_frequency_hz(),
+            start_seconds: spec.default_start_seconds(),
+            total_seconds: spec.default_total_seconds(),
+            amplitude: spec.default_amplitude(),
         }
     }
 }
@@ -306,7 +314,13 @@ pub fn synthesize_tx_message(
         _ => {
             let (first, second, acknowledge, info, rendered_text) = tx_message_fields(message);
             (
-                encode_standard_message_for_mode(options.mode, &first, &second, acknowledge, &info)?,
+                encode_standard_message_for_mode(
+                    options.mode,
+                    &first,
+                    &second,
+                    acknowledge,
+                    &info,
+                )?,
                 rendered_text,
             )
         }
@@ -570,51 +584,18 @@ fn build_frame_for_mode(
     }
 }
 
-fn build_ftx_frame(mode: Mode, message_bits: [u8; MESSAGE_BITS]) -> Result<EncodedFrame, EncodeError> {
-    let spec = mode.spec();
-    let wire_message_bits = if mode == Mode::Ft4 {
-        std::array::from_fn(|index| message_bits[index] ^ FT4_RVEC[index])
-    } else {
-        message_bits
-    };
-    let crc = crc14_ft8(&wire_message_bits);
-    let mut info_bits = vec![0u8; spec.coding.info_bits];
-    info_bits[..MESSAGE_BITS].copy_from_slice(&wire_message_bits);
-    info_bits[MESSAGE_BITS..].copy_from_slice(&crc);
-
-    let parity_rows = generator_rows();
-    let mut codeword_bits = vec![0u8; spec.coding.codeword_bits];
-    codeword_bits[..spec.coding.info_bits].copy_from_slice(&info_bits);
-    for (row_index, row) in parity_rows.iter().enumerate() {
-        let parity = row
-            .iter()
-            .zip(info_bits.iter())
-            .fold(0u8, |acc, (tap, bit)| acc ^ (*tap & *bit));
-        codeword_bits[spec.coding.info_bits + row_index] = parity;
-    }
-
-    let mut data_symbols = vec![0u8; spec.geometry.data_symbol_positions.len()];
-    for (symbol_index, chunk) in codeword_bits
-        .chunks_exact(spec.coding.bits_per_symbol)
-        .enumerate()
-    {
-        data_symbols[symbol_index] = match mode {
-            Mode::Ft8 => bits_to_tone(chunk),
-            Mode::Ft4 => bits_to_ft4_tone(chunk),
-            Mode::Ft2 => unreachable!(),
-        };
-    }
-
-    let mut channel_symbols = vec![0u8; spec.geometry.message_symbols];
-    populate_channel_symbols(&mut channel_symbols, &spec.geometry, &data_symbols)
-        .expect("ftx channel layout");
+fn build_ftx_frame(
+    mode: Mode,
+    message_bits: [u8; MESSAGE_BITS],
+) -> Result<EncodedFrame, EncodeError> {
+    let frame = ftx::build_frame(mode, message_bits);
 
     Ok(EncodedFrame {
         mode,
         message_bits,
-        codeword_bits,
-        data_symbols,
-        channel_symbols,
+        codeword_bits: frame.codeword_bits,
+        data_symbols: frame.data_symbols,
+        channel_symbols: frame.channel_symbols,
     })
 }
 
@@ -638,7 +619,7 @@ fn build_ft2_frame(message_bits: [u8; MESSAGE_BITS]) -> Result<EncodedFrame, Enc
 
     let data_symbols = codeword_bits.clone();
     let mut channel_symbols = vec![0u8; spec.geometry.message_symbols];
-    populate_channel_symbols(&mut channel_symbols, &spec.geometry, &data_symbols)
+    crate::modes::populate_channel_symbols(&mut channel_symbols, &spec.geometry, &data_symbols)
         .expect("ft2 channel layout");
 
     Ok(EncodedFrame {
@@ -664,8 +645,11 @@ pub fn synthesize_rectangular_waveform(
     }
 
     let mut samples = vec![0.0f32; total_samples];
-    let reference =
-        synthesize_channel_reference_for_mode(frame.mode, &frame.channel_symbols, options.base_freq_hz);
+    let reference = synthesize_channel_reference_for_mode(
+        frame.mode,
+        &frame.channel_symbols,
+        options.base_freq_hz,
+    );
     for (offset, sample) in reference.iter().enumerate() {
         samples[start_sample + offset] = options.amplitude * sample.re;
     }
@@ -694,18 +678,21 @@ pub(crate) fn synthesize_subtraction_reference_for_mode(
 ) -> Vec<Complex32> {
     match mode {
         Mode::Ft4 => synthesize_ft4_subtraction_reference(channel_symbols, base_freq_hz),
-        Mode::Ft8 | Mode::Ft2 => synthesize_channel_reference_for_mode(mode, channel_symbols, base_freq_hz),
+        Mode::Ft8 | Mode::Ft2 => {
+            synthesize_channel_reference_for_mode(mode, channel_symbols, base_freq_hz)
+        }
     }
 }
 
-pub fn synthesize_channel_reference(
-    channel_symbols: &[u8],
-    base_freq_hz: f32,
-) -> Vec<Complex32> {
+pub fn synthesize_channel_reference(channel_symbols: &[u8], base_freq_hz: f32) -> Vec<Complex32> {
     synthesize_channel_reference_for_mode(Mode::Ft8, channel_symbols, base_freq_hz)
 }
 
-fn synthesize_gfsk_reference(mode: Mode, channel_symbols: &[u8], base_freq_hz: f32) -> Vec<Complex32> {
+fn synthesize_gfsk_reference(
+    mode: Mode,
+    channel_symbols: &[u8],
+    base_freq_hz: f32,
+) -> Vec<Complex32> {
     let spec = mode.spec();
     let nsym = spec.geometry.message_symbols;
     let nsps = spec.geometry.symbol_samples;
@@ -724,7 +711,8 @@ fn synthesize_gfsk_reference(mode: Mode, channel_symbols: &[u8], base_freq_hz: f
     }
 
     let mut phase = 0.0f32;
-    let carrier_step = 2.0 * std::f32::consts::PI * base_freq_hz / spec.geometry.sample_rate_hz as f32;
+    let carrier_step =
+        2.0 * std::f32::consts::PI * base_freq_hz / spec.geometry.sample_rate_hz as f32;
     let mut reference = vec![Complex32::new(0.0, 0.0); nsym * nsps];
     for (index, sample) in reference.iter_mut().enumerate() {
         *sample = Complex32::new(phase.cos(), phase.sin());
@@ -755,7 +743,7 @@ fn synthesize_ft4_subtraction_reference(
     let dphi_peak = 2.0 * std::f32::consts::PI / nsps as f32;
     for (symbol_index, tone) in channel_symbols.iter().copied().enumerate() {
         let start = symbol_index * nsps;
-        for offset in 0..(3 * nsps) {
+        for offset in 0..(GFSK_PULSE_SPAN_SYMBOLS * nsps) {
             dphi[start + offset] += dphi_peak * pulse[offset] * tone as f32;
         }
     }
@@ -771,8 +759,8 @@ fn synthesize_ft4_subtraction_reference(
 
     for offset in 0..nsps {
         let phase = std::f32::consts::PI * offset as f32 / nsps as f32;
-        let start_gain = (1.0 - phase.cos()) * 0.5;
-        let end_gain = (1.0 + phase.cos()) * 0.5;
+        let start_gain = (1.0 - phase.cos()) * HALF;
+        let end_gain = (1.0 + phase.cos()) * HALF;
         reference[offset] *= start_gain;
         let tail_index = (nsym + 1) * nsps + offset;
         reference[tail_index] *= end_gain;
@@ -785,13 +773,17 @@ fn synthesize_ft2_reference(channel_symbols: &[u8], base_freq_hz: f32) -> Vec<Co
     let spec = Mode::Ft2.spec();
     let nsps = spec.geometry.symbol_samples as f32;
     let sample_rate_hz = spec.geometry.sample_rate_hz as f32;
-    let hmod = 0.8f32;
+    let hmod = crate::modes::ft2::FT2_SIGNAL_MODULATION_INDEX;
     let twopi = 2.0 * std::f32::consts::PI;
     let mut phase = 0.0f32;
-    let mut reference = vec![Complex32::new(0.0, 0.0); channel_symbols.len() * spec.geometry.symbol_samples];
+    let mut reference =
+        vec![Complex32::new(0.0, 0.0); channel_symbols.len() * spec.geometry.symbol_samples];
     for (symbol_index, tone) in channel_symbols.iter().copied().enumerate() {
-        let delta =
-            twopi * (base_freq_hz / sample_rate_hz + (hmod / 2.0) * (2.0 * tone as f32 - 1.0) / nsps);
+        let delta = twopi
+            * (base_freq_hz / sample_rate_hz
+                + (hmod * HALF)
+                    * (CPFSK_SYMBOL_DEVIATION_SCALE * tone as f32 - CPFSK_BINARY_TONE_BIAS)
+                    / nsps);
         for offset in 0..spec.geometry.symbol_samples {
             let index = symbol_index * spec.geometry.symbol_samples + offset;
             reference[index] = Complex32::new(phase.cos(), phase.sin());
@@ -803,42 +795,52 @@ fn synthesize_ft2_reference(channel_symbols: &[u8], base_freq_hz: f32) -> Vec<Co
 
 fn gfsk_frequency_pulse(bt: f32, nsps: usize) -> Vec<f32> {
     let c = std::f32::consts::PI * (2.0 / std::f32::consts::LN_2).sqrt();
-    (0..(3 * nsps))
+    (0..(GFSK_PULSE_SPAN_SYMBOLS * nsps))
         .map(|index| {
-            let t = (index as f32 + 1.0 - 1.5 * nsps as f32) / nsps as f32;
-            0.5 * (libm::erff(c * bt * (t + 0.5)) - libm::erff(c * bt * (t - 0.5)))
+            let t =
+                (index as f32 + 1.0 - GFSK_PULSE_CENTER_OFFSET_SYMBOLS * nsps as f32) / nsps as f32;
+            HALF * (libm::erff(c * bt * (t + HALF)) - libm::erff(c * bt * (t - HALF)))
         })
         .collect()
 }
 
-pub fn channel_symbols_from_codeword_bits(
-    codeword_bits: &[u8],
-) -> Option<Vec<u8>> {
+pub fn channel_symbols_from_codeword_bits(codeword_bits: &[u8]) -> Option<Vec<u8>> {
     channel_symbols_from_codeword_bits_for_mode(Mode::Ft8, codeword_bits)
 }
 
-pub fn channel_symbols_from_codeword_bits_for_mode(mode: Mode, codeword_bits: &[u8]) -> Option<Vec<u8>> {
+pub fn channel_symbols_from_codeword_bits_for_mode(
+    mode: Mode,
+    codeword_bits: &[u8],
+) -> Option<Vec<u8>> {
     let spec = mode.spec();
     if codeword_bits.len() < spec.coding.codeword_bits {
         return None;
     }
 
-    let mut data_symbols = vec![0u8; spec.geometry.data_symbol_positions.len()];
-    for (symbol_index, chunk) in codeword_bits[..spec.coding.codeword_bits]
-        .chunks_exact(spec.coding.bits_per_symbol)
-        .enumerate()
-    {
-        data_symbols[symbol_index] = match mode {
-            Mode::Ft8 => bits_to_tone(chunk),
-            Mode::Ft4 => bits_to_ft4_tone(chunk),
-            Mode::Ft2 => chunk[0],
-        };
+    match mode {
+        Mode::Ft8 | Mode::Ft4 => {
+            let data_symbols = ftx::ftx_data_symbols_from_codeword_bits(mode, codeword_bits)?;
+            let mut channel_symbols = vec![0u8; spec.geometry.message_symbols];
+            crate::modes::populate_channel_symbols(
+                &mut channel_symbols,
+                &spec.geometry,
+                &data_symbols,
+            )
+            .expect("channel layout");
+            Some(channel_symbols)
+        }
+        Mode::Ft2 => {
+            let data_symbols = codeword_bits[..spec.coding.codeword_bits].to_vec();
+            let mut channel_symbols = vec![0u8; spec.geometry.message_symbols];
+            crate::modes::populate_channel_symbols(
+                &mut channel_symbols,
+                &spec.geometry,
+                &data_symbols,
+            )
+            .expect("channel layout");
+            Some(channel_symbols)
+        }
     }
-
-    let mut channel_symbols = vec![0u8; spec.geometry.message_symbols];
-    populate_channel_symbols(&mut channel_symbols, &spec.geometry, &data_symbols)
-        .expect("channel layout");
-    Some(channel_symbols)
 }
 
 pub fn write_rectangular_standard_wav(
@@ -1057,109 +1059,6 @@ fn map_wave_error(error: DecoderError) -> EncodeError {
         DecoderError::Wav(source) => EncodeError::UnsupportedInfo(source.to_string()),
         DecoderError::UnsupportedFormat(message) => EncodeError::UnsupportedInfo(message),
     }
-}
-
-fn bits_to_ft4_tone(bits: &[u8]) -> u8 {
-    match [bits[0], bits[1]] {
-        [0, 0] => 0,
-        [0, 1] => 1,
-        [1, 1] => 2,
-        [1, 0] => 3,
-        _ => unreachable!(),
-    }
-}
-
-fn generator_rows() -> &'static Vec<[u8; INFO_BITS]> {
-    static ROWS: OnceLock<Vec<[u8; INFO_BITS]>> = OnceLock::new();
-    ROWS.get_or_init(|| {
-        include_str!("../data/generator.dat")
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                if trimmed.len() != INFO_BITS
-                    || !trimmed.bytes().all(|byte| matches!(byte, b'0' | b'1'))
-                {
-                    return None;
-                }
-                let mut row = [0u8; INFO_BITS];
-                for (index, byte) in trimmed.bytes().enumerate() {
-                    row[index] = u8::from(byte == b'1');
-                }
-                Some(row)
-            })
-            .collect()
-    })
-}
-
-fn ft2_generator_rows() -> &'static Vec<[u8; FT2_INFO_BITS]> {
-    static ROWS: OnceLock<Vec<[u8; FT2_INFO_BITS]>> = OnceLock::new();
-    ROWS.get_or_init(|| {
-        const HEX_ROWS: [&str; 38] = [
-            "a08ea80879050a5e94da994",
-            "59f3b48040ca089c81ee880",
-            "e4070262802e31b7b17d3dc",
-            "95cbcbaf032dc3d960bacc8",
-            "c4d79b5dcc21161a254ffbc",
-            "93fde9cdbf2622a70868424",
-            "e73b888bb1b01167379ba28",
-            "45a0d0a0f39a7ad2439949c",
-            "759acef19444bcad79c4964",
-            "71eb4dddf4f5ed9e2ea17e0",
-            "80f0ad76fb247d6b4ca8d38",
-            "184fff3aa1b82dc66640104",
-            "ca4e320bb382ed14cbb1094",
-            "52514447b90e25b9e459e28",
-            "dd10c1666e071956bd0df38",
-            "99c332a0b792a2da8ef1ba8",
-            "7bd9f688e7ed402e231aaac",
-            "00fcad76eb647d6a0ca8c38",
-            "6ac8d0499c43b02eed78d70",
-            "2c2c764baf795b4788db010",
-            "0e907bf9e280d2624823dd0",
-            "b857a6e315afd8c1c925e64",
-            "8deb58e22d73a141cae3778",
-            "22d3cb80d92d6ac132dfe08",
-            "754763877b28c187746855c",
-            "1d1bb7cf6953732e04ebca4",
-            "2c65e0ea4466ab9f5e1deec",
-            "6dc530ca37fc916d1f84870",
-            "49bccbbee152355be7ac984",
-            "e8387f3f4367cf45a150448",
-            "8ce25e03d67d51091c81884",
-            "b798012ffa40a93852752c8",
-            "2e43307933adfca37adc3c8",
-            "ca06e0a42ca1ec782d6c06c",
-            "c02b762927556a7039e638c",
-            "4a3e9b7d08b6807f8619fac",
-            "45e8030f68997bb68544424",
-            "7e79362c16773efc6482e30",
-        ];
-        HEX_ROWS
-            .iter()
-            .map(|value| {
-                let mut row = [0u8; FT2_INFO_BITS];
-                let mut out = 0usize;
-                for ch in value.bytes() {
-                    let nibble = match ch {
-                        b'0'..=b'9' => ch - b'0',
-                        b'a'..=b'f' => 10 + ch - b'a',
-                        b'A'..=b'F' => 10 + ch - b'A',
-                        _ => unreachable!(),
-                    };
-                    let bits = if out + 4 > FT2_INFO_BITS {
-                        2
-                    } else {
-                        4
-                    };
-                    for shift in (4 - bits..4).rev() {
-                        row[out] = u8::from(((nibble >> shift) & 1) != 0);
-                        out += 1;
-                    }
-                }
-                row
-            })
-            .collect()
-    })
 }
 
 fn encode_c28(text: &str) -> Result<u32, EncodeError> {
@@ -1387,13 +1286,6 @@ fn encode_c58(text: &str) -> Result<u128, EncodeError> {
     Ok(value)
 }
 
-fn bits_to_tone(bits: &[u8]) -> u8 {
-    let triad = [bits[0], bits[1], bits[2]];
-    let tone = gray_encode_3bits(triad);
-    debug_assert_eq!(gray_decode_tone3(tone), triad);
-    tone
-}
-
 fn is_grid4(grid: &str) -> bool {
     let bytes = grid.as_bytes();
     bytes.len() == 4
@@ -1414,6 +1306,7 @@ mod tests {
         GridReport, HashResolver, StructuredInfoValue, StructuredMessage, unpack_message,
         unpack_message_for_mode,
     };
+    use crate::modes::ft4::FT4_RVEC;
 
     #[test]
     fn standard_message_codeword_satisfies_parity() {
@@ -1443,7 +1336,10 @@ mod tests {
         assert_eq!(frame.channel_symbols.len(), 103);
         assert!(frame.channel_symbols.iter().all(|tone| *tone <= 3));
         let payload = unpack_message_for_mode(Mode::Ft4, &frame.codeword_bits).expect("payload");
-        assert_eq!(payload.to_message(&HashResolver::default()).to_text(), "K1ABC W1XYZ FN31");
+        assert_eq!(
+            payload.to_message(&HashResolver::default()).to_text(),
+            "K1ABC W1XYZ FN31"
+        );
         assert_eq!(
             channel_symbols_from_codeword_bits_for_mode(Mode::Ft4, &frame.codeword_bits)
                 .expect("channel symbols"),
@@ -1479,7 +1375,10 @@ mod tests {
         assert_eq!(frame.channel_symbols.len(), 144);
         assert!(frame.channel_symbols.iter().all(|tone| *tone <= 1));
         let payload = unpack_message_for_mode(Mode::Ft2, &frame.codeword_bits).expect("payload");
-        assert_eq!(payload.to_message(&HashResolver::default()).to_text(), "K1ABC W1XYZ FN31");
+        assert_eq!(
+            payload.to_message(&HashResolver::default()).to_text(),
+            "K1ABC W1XYZ FN31"
+        );
         assert_eq!(
             channel_symbols_from_codeword_bits_for_mode(Mode::Ft2, &frame.codeword_bits)
                 .expect("channel symbols"),
@@ -1543,14 +1442,9 @@ mod tests {
 
     #[test]
     fn ft4_blank_cq_matches_reference_frame_bits() {
-        let frame = encode_standard_message_for_mode(
-            Mode::Ft4,
-            "CQ",
-            "K1ABC",
-            false,
-            &GridReport::Blank,
-        )
-        .expect("encode ft4 blank cq");
+        let frame =
+            encode_standard_message_for_mode(Mode::Ft4, "CQ", "K1ABC", false, &GridReport::Blank)
+                .expect("encode ft4 blank cq");
 
         let codeword_bits: String = frame
             .codeword_bits
@@ -1754,8 +1648,9 @@ mod tests {
             &TxRttyExchange::Multiplier("WI".to_string()),
         )
         .expect("encode ft4 rtty");
-        let stock_ft4_wire_bits =
-            bits_from_string("01100011000010110010100011111000011110000110011100100110000010100110001001110");
+        let stock_ft4_wire_bits = bits_from_string(
+            "01100011000010110010100011111000011110000110011100100110000010100110001001110",
+        );
         let stock_ft4_raw_bits: Vec<u8> = stock_ft4_wire_bits
             .iter()
             .zip(FT4_RVEC.iter())

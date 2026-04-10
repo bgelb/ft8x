@@ -81,7 +81,9 @@ impl FrameGeometry {
     }
 
     pub fn sync_pattern_len(&self) -> usize {
-        self.sync_patterns.first().map_or(0, |pattern| pattern.len())
+        self.sync_patterns
+            .first()
+            .map_or(0, |pattern| pattern.len())
     }
 
     pub const fn hops_per_symbol(&self) -> usize {
@@ -94,7 +96,15 @@ impl FrameGeometry {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SearchTuning {
+pub struct WaveformSpec {
+    pub default_frequency_hz: f32,
+    pub default_start_seconds: f32,
+    pub default_total_seconds: f32,
+    pub default_amplitude: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SearchSpec {
     pub long_input_samples: usize,
     pub long_fft_samples: usize,
     pub downsample_factor: usize,
@@ -108,14 +118,6 @@ pub struct SearchTuning {
     pub sync_power_scale: f32,
     pub sync_baseline_percentile: f32,
     pub sync_baseline_floor: f32,
-    pub nominal_start_seconds: f32,
-    pub baseband_taper_len: usize,
-    pub baseband_valid_samples: usize,
-    pub subtract_filter_samples: usize,
-    pub early_block_samples: usize,
-    pub subtraction_refine_cutoff_seconds: f32,
-    pub subtraction_refine_probe_step_samples: isize,
-    pub refine_residual_step_hz: f32,
     pub nfqso_hz: f32,
     pub nfqso_priority_window_hz: f32,
     pub candidate_separation_hz: f32,
@@ -123,7 +125,23 @@ pub struct SearchTuning {
     pub legacy_candidate_separation_tone_factor: f32,
     pub band_lower_tone_offset: f32,
     pub band_upper_tone_offset: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RefineSpec {
+    pub nominal_start_seconds: f32,
+    pub baseband_taper_len: usize,
+    pub baseband_valid_samples: usize,
+    pub early_block_samples: usize,
+    pub refine_residual_step_hz: f32,
     pub llr_scale_factor: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SubtractionSpec {
+    pub filter_samples: usize,
+    pub refine_cutoff_seconds: f32,
+    pub refine_probe_step_samples: isize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,20 +149,23 @@ pub struct ModeSpec {
     pub mode: Mode,
     pub coding: ChannelCoding,
     pub geometry: FrameGeometry,
-    pub tuning: SearchTuning,
+    pub waveform: WaveformSpec,
+    pub search: SearchSpec,
+    pub refine: RefineSpec,
+    pub subtraction: SubtractionSpec,
 }
 
 impl ModeSpec {
     pub const fn nominal_start_seconds(&self) -> f32 {
-        self.tuning.nominal_start_seconds
+        self.refine.nominal_start_seconds
     }
 
     pub fn sync_fft_samples(&self) -> usize {
-        self.geometry.symbol_samples * self.tuning.sync_fft_symbol_window
+        self.geometry.symbol_samples * self.search.sync_fft_symbol_window
     }
 
     pub fn sync_step_samples(&self) -> usize {
-        self.geometry.symbol_samples / self.tuning.sync_step_divisor
+        self.geometry.symbol_samples / self.search.sync_step_divisor
     }
 
     pub fn sync_step_seconds(&self) -> f32 {
@@ -161,19 +182,19 @@ impl ModeSpec {
     }
 
     pub fn baseband_rate_hz(&self) -> f32 {
-        self.geometry.sample_rate_hz as f32 / self.tuning.downsample_factor as f32
+        self.geometry.sample_rate_hz as f32 / self.search.downsample_factor as f32
     }
 
     pub const fn baseband_samples(&self) -> usize {
-        self.tuning.long_fft_samples / self.tuning.downsample_factor
+        self.search.long_fft_samples / self.search.downsample_factor
     }
 
     pub const fn baseband_symbol_samples(&self) -> usize {
-        self.geometry.symbol_samples / self.tuning.downsample_factor
+        self.geometry.symbol_samples / self.search.downsample_factor
     }
 
     pub fn fft_bin_hz(&self) -> f32 {
-        self.geometry.sample_rate_hz as f32 / self.tuning.long_fft_samples as f32
+        self.geometry.sample_rate_hz as f32 / self.search.long_fft_samples as f32
     }
 
     pub fn sync_bin_hz(&self) -> f32 {
@@ -189,19 +210,19 @@ impl ModeSpec {
     }
 
     pub fn early41_samples(&self) -> usize {
-        41 * self.tuning.early_block_samples
+        41 * self.refine.early_block_samples
     }
 
     pub fn early47_samples(&self) -> usize {
-        47 * self.tuning.early_block_samples
+        47 * self.refine.early_block_samples
     }
 
     pub const fn baseband_taper_len(&self) -> usize {
-        self.tuning.baseband_taper_len
+        self.refine.baseband_taper_len
     }
 
     pub const fn baseband_valid_samples(&self) -> usize {
-        self.tuning.baseband_valid_samples
+        self.refine.baseband_valid_samples
     }
 
     pub const fn data_symbol_groups(&self) -> usize {
@@ -249,7 +270,7 @@ impl ModeSpec {
 
     /// Shared helper for the half-Hz residual probes used during candidate refinement.
     pub fn residual_hz_from_half_step(&self, step: isize) -> f32 {
-        step as f32 * self.tuning.refine_residual_step_hz
+        step as f32 * self.refine.refine_residual_step_hz
     }
 
     /// Preserve the legacy sample rounding used by subtraction and debug candidate paths.
@@ -260,11 +281,27 @@ impl ModeSpec {
     }
 
     pub fn band_low_hz(&self, freq_hz: f32) -> f32 {
-        freq_hz - self.tuning.band_lower_tone_offset * self.geometry.tone_spacing_hz
+        freq_hz - self.search.band_lower_tone_offset * self.geometry.tone_spacing_hz
     }
 
     pub fn band_high_hz(&self, freq_hz: f32) -> f32 {
-        freq_hz + self.tuning.band_upper_tone_offset * self.geometry.tone_spacing_hz
+        freq_hz + self.search.band_upper_tone_offset * self.geometry.tone_spacing_hz
+    }
+
+    pub const fn default_frequency_hz(&self) -> f32 {
+        self.waveform.default_frequency_hz
+    }
+
+    pub const fn default_start_seconds(&self) -> f32 {
+        self.waveform.default_start_seconds
+    }
+
+    pub const fn default_total_seconds(&self) -> f32 {
+        self.waveform.default_total_seconds
+    }
+
+    pub const fn default_amplitude(&self) -> f32 {
+        self.waveform.default_amplitude
     }
 }
 
@@ -345,7 +382,13 @@ mod tests {
         codeword_bits: 12,
         bits_per_symbol: 3,
     };
-    const MOCK_TUNING: SearchTuning = SearchTuning {
+    const MOCK_WAVEFORM: WaveformSpec = WaveformSpec {
+        default_frequency_hz: 1_000.0,
+        default_start_seconds: 0.25,
+        default_total_seconds: 1.0,
+        default_amplitude: 0.8,
+    };
+    const MOCK_SEARCH: SearchSpec = SearchSpec {
         long_input_samples: 4_000,
         long_fft_samples: 6_400,
         downsample_factor: 8,
@@ -359,14 +402,6 @@ mod tests {
         sync_power_scale: 0.25,
         sync_baseline_percentile: 0.4,
         sync_baseline_floor: 1e-6,
-        nominal_start_seconds: 0.25,
-        baseband_taper_len: 8,
-        baseband_valid_samples: 128,
-        subtract_filter_samples: 160,
-        early_block_samples: 96,
-        subtraction_refine_cutoff_seconds: 0.125,
-        subtraction_refine_probe_step_samples: 12,
-        refine_residual_step_hz: 0.25,
         nfqso_hz: 900.0,
         nfqso_priority_window_hz: 5.0,
         candidate_separation_hz: 2.0,
@@ -374,13 +409,28 @@ mod tests {
         legacy_candidate_separation_tone_factor: 1.5,
         band_lower_tone_offset: 1.0,
         band_upper_tone_offset: 3.0,
+    };
+    const MOCK_REFINE: RefineSpec = RefineSpec {
+        nominal_start_seconds: 0.25,
+        baseband_taper_len: 8,
+        baseband_valid_samples: 128,
+        early_block_samples: 96,
+        refine_residual_step_hz: 0.25,
         llr_scale_factor: 2.0,
+    };
+    const MOCK_SUBTRACTION: SubtractionSpec = SubtractionSpec {
+        filter_samples: 160,
+        refine_cutoff_seconds: 0.125,
+        refine_probe_step_samples: 12,
     };
     const MOCK_SPEC: ModeSpec = ModeSpec {
         mode: Mode::Ft8,
         coding: MOCK_CODING,
         geometry: MOCK_GEOMETRY,
-        tuning: MOCK_TUNING,
+        waveform: MOCK_WAVEFORM,
+        search: MOCK_SEARCH,
+        refine: MOCK_REFINE,
+        subtraction: MOCK_SUBTRACTION,
     };
 
     #[test]

@@ -1,6 +1,9 @@
 use super::*;
 use crate::encode::synthesize_subtraction_reference_for_mode;
 
+const QUADRATIC_FIT_HALF_WEIGHT: f32 = 0.5;
+const QUADRATIC_FIT_CENTER_WEIGHT: f32 = 2.0;
+
 #[derive(Debug, Clone, Copy)]
 struct OverlapWindow {
     reference_start: usize,
@@ -28,16 +31,16 @@ pub(super) fn subtract_candidate_with_dt_refinement(
         return;
     };
     let spec = success.mode.spec();
-    let reference =
-        synthesize_subtraction_reference_for_mode(
-            success.mode,
-            &channel_symbols,
-            success.candidate.freq_hz,
-        );
+    let reference = synthesize_subtraction_reference_for_mode(
+        success.mode,
+        &channel_symbols,
+        success.candidate.freq_hz,
+    );
     let subtraction_dt_seconds = success.candidate.dt_seconds;
     let start_sample = match success.mode {
         Mode::Ft4 => {
-            spec.start_sample_from_dt(subtraction_dt_seconds) - spec.geometry.symbol_samples as isize
+            spec.start_sample_from_dt(subtraction_dt_seconds)
+                - spec.geometry.symbol_samples as isize
         }
         Mode::Ft8 | Mode::Ft2 => spec.start_sample_from_dt(subtraction_dt_seconds),
     };
@@ -66,7 +69,7 @@ pub(super) fn refined_subtraction_offset(
     plan: &SubtractionPlan,
 ) -> Option<isize> {
     let spec = plan.spec;
-    let probe_step = spec.tuning.subtraction_refine_probe_step_samples;
+    let probe_step = spec.subtraction.refine_probe_step_samples;
     let sqm =
         subtraction_residual_band_power(audio, reference, freq_hz, start_sample - probe_step, plan);
     let sq0 = subtraction_residual_band_power(audio, reference, freq_hz, start_sample, plan);
@@ -74,8 +77,8 @@ pub(super) fn refined_subtraction_offset(
         subtraction_residual_band_power(audio, reference, freq_hz, start_sample + probe_step, plan);
     // Fit a parabola through the residual power at -step / 0 / +step and keep the sub-sample
     // offset only when the quadratic minimum falls inside that probe window.
-    let b = (sqp - sqm) * 0.5;
-    let c = (sqp + sqm - 2.0 * sq0) * 0.5;
+    let b = (sqp - sqm) * QUADRATIC_FIT_HALF_WEIGHT;
+    let c = (sqp + sqm - QUADRATIC_FIT_CENTER_WEIGHT * sq0) * QUADRATIC_FIT_HALF_WEIGHT;
     if c == 0.0 {
         return None;
     }
@@ -248,7 +251,7 @@ impl SubtractionPlan {
         let long_input_samples = long_input_samples(spec);
         let forward = planner.plan_fft_forward(long_input_samples);
         let inverse = planner.plan_fft_inverse(long_input_samples);
-        let subtract_filter_samples = spec.tuning.subtract_filter_samples;
+        let subtract_filter_samples = spec.subtraction.filter_samples;
         let subtract_filter_half = subtract_filter_samples / 2;
 
         let mut window = Vec::with_capacity(subtract_filter_samples);
@@ -303,8 +306,11 @@ mod tests {
             },
         )
         .expect("audio");
-        let reference =
-            crate::encode::synthesize_channel_reference_for_mode(mode, &frame.channel_symbols, 1_234.0);
+        let reference = crate::encode::synthesize_channel_reference_for_mode(
+            mode,
+            &frame.channel_symbols,
+            1_234.0,
+        );
         let start_sample = mode.spec().start_sample_from_dt(0.0);
 
         assert_eq!(

@@ -168,10 +168,13 @@ pub(super) fn refine_candidate_ft4_variants_with_cache(
 
         for (_, coarse_ibest, coarse_residual_hz) in coarse_seeds {
             let coarse_freq_hz_seed = coarse_freq_hz + coarse_residual_hz;
-            let coarse_duplicate = segment_winners.iter().any(|(existing_ibest, existing_freq_hz, _)| {
-                (*existing_ibest - coarse_ibest).abs() <= 24
-                    && (*existing_freq_hz - coarse_freq_hz_seed).abs() <= 5.0
-            });
+            let coarse_duplicate =
+                segment_winners
+                    .iter()
+                    .any(|(existing_ibest, existing_freq_hz, _)| {
+                        (*existing_ibest - coarse_ibest).abs() <= 24
+                            && (*existing_freq_hz - coarse_freq_hz_seed).abs() <= 5.0
+                    });
             if coarse_duplicate {
                 continue;
             }
@@ -179,8 +182,8 @@ pub(super) fn refine_candidate_ft4_variants_with_cache(
             let mut fine_best_score = f32::NEG_INFINITY;
             let mut fine_ibest = coarse_ibest;
             let mut fine_residual_hz = coarse_residual_hz;
-            for residual_hz in
-                ((coarse_residual_hz as i32 - 4)..=(coarse_residual_hz as i32 + 4)).map(|v| v as f32)
+            for residual_hz in ((coarse_residual_hz as i32 - 4)..=(coarse_residual_hz as i32 + 4))
+                .map(|v| v as f32)
             {
                 for start_index in (coarse_ibest - 5)..=(coarse_ibest + 5) {
                     let score = sync4d(spec, initial_baseband, start_index, residual_hz);
@@ -202,10 +205,12 @@ pub(super) fn refine_candidate_ft4_variants_with_cache(
                 continue;
             }
             let freq_hz = coarse_freq_hz + fine_residual_hz;
-            let duplicate = segment_winners.iter().any(|(existing_ibest, existing_freq_hz, _)| {
-                (*existing_ibest - fine_ibest).abs() <= 8
-                    && (*existing_freq_hz - freq_hz).abs() <= 5.0
-            });
+            let duplicate = segment_winners
+                .iter()
+                .any(|(existing_ibest, existing_freq_hz, _)| {
+                    (*existing_ibest - fine_ibest).abs() <= 8
+                        && (*existing_freq_hz - freq_hz).abs() <= 5.0
+                });
             if duplicate {
                 continue;
             }
@@ -383,7 +388,7 @@ impl LongSpectrumPlan {
     fn new(spec: &ModeSpec) -> Self {
         let mut planner = RealFftPlanner::<f32>::new();
         Self {
-            forward: planner.plan_fft_forward(spec.tuning.long_fft_samples),
+            forward: planner.plan_fft_forward(spec.search.long_fft_samples),
         }
     }
 }
@@ -411,7 +416,7 @@ pub(super) fn downsample_candidate(
     let i0 = (freq_hz / fft_bin_hz).round() as isize;
     let ib = ((spec.band_low_hz(freq_hz) / fft_bin_hz).round() as isize).max(1);
     let it = ((spec.band_high_hz(freq_hz) / fft_bin_hz).round() as isize)
-        .min((spec.tuning.long_fft_samples / 2) as isize);
+        .min((spec.search.long_fft_samples / 2) as isize);
     if i0 <= 0 || ib >= it {
         return None;
     }
@@ -434,7 +439,7 @@ pub(super) fn downsample_candidate(
     baseband.rotate_left(rotate);
 
     baseband_plan.inverse.process(&mut baseband);
-    let scale = 1.0 / (spec.tuning.long_fft_samples as f32 * spec.baseband_samples() as f32).sqrt();
+    let scale = 1.0 / (spec.search.long_fft_samples as f32 * spec.baseband_samples() as f32).sqrt();
     for sample in &mut baseband {
         *sample *= scale;
     }
@@ -505,9 +510,8 @@ fn downsample_candidate_ft4_with_normalization(
     }
     baseband_plan.inverse.process(&mut baseband);
 
-    let rms = (baseband.iter().map(|value| value.norm_sqr()).sum::<f32>()
-        / norm_samples as f32)
-        .sqrt();
+    let rms =
+        (baseband.iter().map(|value| value.norm_sqr()).sum::<f32>() / norm_samples as f32).sqrt();
     if rms > 0.0 {
         for value in &mut baseband {
             *value /= rms;
@@ -536,8 +540,7 @@ pub(super) fn sync8d(
         for (offset, tone) in pattern.iter().copied().enumerate() {
             let symbol_start =
                 start_index + ((block_start + offset) * baseband_symbol_samples) as isize;
-            if symbol_start < 0 || symbol_start as usize + baseband_symbol_samples > valid_samples
-            {
+            if symbol_start < 0 || symbol_start as usize + baseband_symbol_samples > valid_samples {
                 continue;
             }
             let segment =
@@ -762,21 +765,30 @@ pub(super) fn sync8d_waveforms(mode: Mode) -> &'static [Vec<Complex32>] {
     match mode {
         Mode::Ft8 => {
             static WAVEFORMS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
-            WAVEFORMS.get_or_init(|| sync8d_basis(mode).iter().map(|row| {
-                row.iter().map(|sample| sample.conj()).collect()
-            }).collect())
+            WAVEFORMS.get_or_init(|| {
+                sync8d_basis(mode)
+                    .iter()
+                    .map(|row| row.iter().map(|sample| sample.conj()).collect())
+                    .collect()
+            })
         }
         Mode::Ft4 => {
             static WAVEFORMS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
-            WAVEFORMS.get_or_init(|| sync8d_basis(mode).iter().map(|row| {
-                row.iter().map(|sample| sample.conj()).collect()
-            }).collect())
+            WAVEFORMS.get_or_init(|| {
+                sync8d_basis(mode)
+                    .iter()
+                    .map(|row| row.iter().map(|sample| sample.conj()).collect())
+                    .collect()
+            })
         }
         Mode::Ft2 => {
             static WAVEFORMS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
-            WAVEFORMS.get_or_init(|| sync8d_basis(mode).iter().map(|row| {
-                row.iter().map(|sample| sample.conj()).collect()
-            }).collect())
+            WAVEFORMS.get_or_init(|| {
+                sync8d_basis(mode)
+                    .iter()
+                    .map(|row| row.iter().map(|sample| sample.conj()).collect())
+                    .collect()
+            })
         }
     }
 }
@@ -786,11 +798,11 @@ pub(super) fn sync8d_tweak(spec: &ModeSpec, residual_hz: f32) -> Vec<Complex32> 
     let delta = 2.0 * std::f32::consts::PI * residual_hz / spec.baseband_rate_hz();
     (0..spec.baseband_symbol_samples())
         .map(|index| {
-        let sample = Complex32::new(phase.cos(), phase.sin());
-        if index + 1 < spec.baseband_symbol_samples() {
-            phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
-        }
-        sample
+            let sample = Complex32::new(phase.cos(), phase.sin());
+            if index + 1 < spec.baseband_symbol_samples() {
+                phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
+            }
+            sample
         })
         .collect()
 }
@@ -919,7 +931,7 @@ mod tests {
     #[test]
     fn tail_samples_past_valid_window_do_not_change_extracted_tones() {
         let spec = Mode::Ft8.spec();
-        let valid = spec.tuning.baseband_valid_samples;
+        let valid = spec.refine.baseband_valid_samples;
         let len = valid + spec.baseband_symbol_samples() * 4;
         let clean = vec![Complex32::new(0.0, 0.0); len];
         let mut dirty = clean.clone();

@@ -566,7 +566,8 @@ pub fn unpack_message_for_mode(mode: Mode, codeword: &[u8]) -> Option<Payload> {
     parse_message_bits(&decoded_message_bits)
 }
 
-pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
+#[cfg(test)]
+pub(crate) fn unpack_message(codeword: &[u8]) -> Option<Payload> {
     unpack_message_for_mode(Mode::Ft8, codeword)
 }
 

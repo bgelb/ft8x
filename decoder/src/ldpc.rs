@@ -211,25 +211,6 @@ impl ParityMatrix {
         self.decode_bp_osd(llrs, Some(known_bits), maxosd, 2)
     }
 
-    pub fn decode_with_maxosd_and_norder(
-        &self,
-        llrs: &[f32],
-        maxosd: isize,
-        norder: usize,
-    ) -> Option<(Vec<u8>, usize)> {
-        self.decode_bp_osd(llrs, None, maxosd, norder)
-    }
-
-    pub fn decode_with_known_bits_and_maxosd_and_norder(
-        &self,
-        llrs: &[f32],
-        known_bits: &[Option<u8>],
-        maxosd: isize,
-        norder: usize,
-    ) -> Option<(Vec<u8>, usize)> {
-        self.decode_bp_osd(llrs, Some(known_bits), maxosd, norder)
-    }
-
     fn decode_bp_osd(
         &self,
         llrs: &[f32],
@@ -623,7 +604,11 @@ impl ParityMatrix {
                                 .sum::<f32>()
                     } else {
                         cached_d1
-                            + if codeword[n1] == hard[n1] { 0.0 } else { reliabilities[n1] }
+                            + if codeword[n1] == hard[n1] {
+                                0.0
+                            } else {
+                                reliabilities[n1]
+                            }
                             + parity_tail
                                 .iter()
                                 .zip(reliabilities[K..].iter())
@@ -716,7 +701,13 @@ fn build_osd_probe_result(
             .filter_map(|(index, (&left, &right))| (left != right).then_some(index))
             .collect(),
         codeword_bits: restored.as_ref().map(|bits| bit_string(bits)),
-        hard_errors: Some(codeword.iter().zip(hard.iter()).filter(|(left, right)| left != right).count()),
+        hard_errors: Some(
+            codeword
+                .iter()
+                .zip(hard.iter())
+                .filter(|(left, right)| left != right)
+                .count(),
+        ),
         weighted_distance: Some(weighted_distance(codeword, hard, reliabilities)),
     }
 }
@@ -889,7 +880,10 @@ fn indexx_descending_by_abs(llrs: &[f32]) -> Vec<usize> {
             indices[l] = indices[j];
             indices[j] = indxt;
             jstack += 2;
-            assert!(jstack <= NSTACK, "NSTACK too small in indexx_descending_by_abs");
+            assert!(
+                jstack <= NSTACK,
+                "NSTACK too small in indexx_descending_by_abs"
+            );
             if ir - i + 1 >= j - l {
                 istack[jstack - 1] = ir;
                 istack[jstack - 2] = i;

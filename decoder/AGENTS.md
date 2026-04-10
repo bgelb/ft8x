@@ -37,6 +37,7 @@
 - Confine raw slice/index math to small named helpers or hot numeric kernels. Orchestration code should work in terms of named fields, windows, and typed geometry.
 - Add derived constants or helpers when a protocol shape matters. Examples: symbol-group starts, bit-field ranges, valid baseband windows, taper reach, and sync spans.
 - Prefer named conversion helpers over arrays or maps as the public face of an algorithm. Tables are fine internally, but callers should use `gray_*`, `alphabet_*`, `read_bit_field`, or similar helpers.
+- Prefer named constants for semantically meaningful numeric values even inside hot kernels. Keep those constants local to the kernel when that is the clearest representation, and add a short note about source, derivation, or effect when the value is not obvious.
 - Preserve computation order in numeric kernels unless parity and performance are both revalidated.
 - Run `cargo test`, `cargo build --release`, and the full `medium` regression after each material decoder cleanup.
 
@@ -46,6 +47,7 @@
 - Don’t add raw FT8 timing arithmetic like `dt + 0.5`, `start - 0.5`, or coarse-lag half-step math outside mode/helper code.
 - Don’t duplicate message, codeword, or channel-symbol layout logic across encode, decode, and message-render paths.
 - Don’t rewrite hot DSP, LDPC, subtraction, or FFT loops into iterator-heavy forms just for style. Keep hot loops explicit when that is the clearest and safest representation of the computation.
+- Don’t leave unexplained numeric literals in hot kernels when they encode protocol or algorithm semantics. If a value must stay local for clarity or performance, name it locally and document why it exists.
 
 ## Future Modes
 

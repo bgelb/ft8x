@@ -13,7 +13,9 @@ pub(super) fn truth_metrics(
     llrs: &[f32],
     truth_codeword_bits: &[u8],
 ) -> Option<(Option<usize>, Option<f32>)> {
-    if llrs.len() != spec.coding.codeword_bits || truth_codeword_bits.len() < spec.coding.codeword_bits {
+    if llrs.len() != spec.coding.codeword_bits
+        || truth_codeword_bits.len() < spec.coding.codeword_bits
+    {
         return None;
     }
     let mut hard_errors = 0usize;
@@ -28,7 +30,10 @@ pub(super) fn truth_metrics(
     Some((Some(hard_errors), Some(weighted_distance)))
 }
 
-pub(super) fn compute_bitmetric_passes(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) -> [Vec<f32>; 4] {
+pub(super) fn compute_bitmetric_passes(
+    spec: &ModeSpec,
+    full_tones: &[[Complex32; 8]],
+) -> [Vec<f32>; 4] {
     match spec.mode {
         Mode::Ft8 => compute_ft8_bitmetric_passes(spec, full_tones),
         Mode::Ft4 => compute_ft4_bitmetric_passes(spec, full_tones),
@@ -109,13 +114,11 @@ pub(super) fn compute_ft4_candidate_metrics(
                 *metric = match nsym {
                     1 => cs[ks][FT4_GRAY_MAP[i4]].norm(),
                     2 => (cs[ks][FT4_GRAY_MAP[i3]] + cs[ks + 1][FT4_GRAY_MAP[i4]]).norm(),
-                    4 => {
-                        (cs[ks][FT4_GRAY_MAP[i1]]
-                            + cs[ks + 1][FT4_GRAY_MAP[i2]]
-                            + cs[ks + 2][FT4_GRAY_MAP[i3]]
-                            + cs[ks + 3][FT4_GRAY_MAP[i4]])
-                            .norm()
-                    }
+                    4 => (cs[ks][FT4_GRAY_MAP[i1]]
+                        + cs[ks + 1][FT4_GRAY_MAP[i2]]
+                        + cs[ks + 2][FT4_GRAY_MAP[i3]]
+                        + cs[ks + 3][FT4_GRAY_MAP[i4]])
+                        .norm(),
                     _ => unreachable!(),
                 };
             }
@@ -186,7 +189,7 @@ pub(super) fn compute_ft4_candidate_metrics(
         let mut out = 0usize;
         for (start, end) in ranges {
             for &value in &source[start..end] {
-                dest[out] = value * spec.tuning.llr_scale_factor;
+                dest[out] = value * spec.refine.llr_scale_factor;
                 out += 1;
             }
         }
@@ -279,7 +282,7 @@ fn compute_ft8_bitmetric_passes(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) 
 
     for metric_set in [&mut bmeta, &mut bmetb, &mut bmetc, &mut bmetd] {
         for value in metric_set.iter_mut() {
-            *value *= spec.tuning.llr_scale_factor;
+            *value *= spec.refine.llr_scale_factor;
         }
     }
 
@@ -348,7 +351,7 @@ fn compute_ft4_bitmetric_passes(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) 
         let mut out = 0usize;
         for (start, end) in ranges {
             for &value in &source[start..end] {
-                dest[out] = value * spec.tuning.llr_scale_factor;
+                dest[out] = value * spec.refine.llr_scale_factor;
                 out += 1;
             }
         }
@@ -615,8 +618,7 @@ mod tests {
         let channel_symbols =
             crate::encode::channel_symbols_from_codeword_bits(&frame.codeword_bits)
                 .expect("channel symbols");
-        let mut full_tones =
-            vec![[Complex32::new(1.0, 0.0); 8]; spec.geometry.message_symbols];
+        let mut full_tones = vec![[Complex32::new(1.0, 0.0); 8]; spec.geometry.message_symbols];
         for (symbol_index, tone) in channel_symbols.iter().copied().enumerate() {
             full_tones[symbol_index][tone as usize] = Complex32::new(9.0, 0.0);
         }

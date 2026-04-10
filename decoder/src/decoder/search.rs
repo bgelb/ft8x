@@ -1,5 +1,8 @@
 use super::*;
 
+const HANN_WINDOW_WEIGHT: f32 = 0.5;
+const PARABOLIC_PEAK_WEIGHT: f32 = 0.5;
+
 pub(super) fn search_grid(audio: &AudioBuffer, options: &DecodeOptions) -> SearchGrid {
     let spec = options.mode.spec();
     let geometry = &spec.geometry;
@@ -35,7 +38,7 @@ pub(super) fn build_spectrogram(audio: &AudioBuffer, options: &DecodeOptions) ->
         .map(|index| {
             let phase =
                 2.0 * std::f32::consts::PI * index as f32 / (geometry.symbol_samples - 1) as f32;
-            0.5 - 0.5 * phase.cos()
+            HANN_WINDOW_WEIGHT - HANN_WINDOW_WEIGHT * phase.cos()
         })
         .collect();
 
@@ -70,7 +73,7 @@ pub(super) fn collect_candidates(
         return collect_candidates_ft4(audio, options, sync_threshold);
     }
     let geometry = &spec.geometry;
-    let tuning = &spec.tuning;
+    let search = &spec.search;
     let sync_step_samples = spec.sync_step_samples();
     let sync_fft_samples = spec.sync_fft_samples();
     let sync_bin_hz = spec.sync_bin_hz();
@@ -86,7 +89,7 @@ pub(super) fn collect_candidates(
 
     let min_bin = ((options.min_freq_hz / sync_bin_hz).round() as usize).max(1);
     let max_bin = ((options.max_freq_hz / sync_bin_hz).round() as usize)
-        .min(sync_fft_samples / 2 - tuning.sync_guard_bins);
+        .min(sync_fft_samples / 2 - search.sync_guard_bins);
     if min_bin >= max_bin {
         return Vec::new();
     }
@@ -96,7 +99,7 @@ pub(super) fn collect_candidates(
     let mut input = fft.make_input_vec();
     let mut spectrum = fft.make_output_vec();
     let mut symbol_power = vec![0.0f32; nhsym * (sync_fft_samples / 2 + 1)];
-    let scale = tuning.sync_power_scale;
+    let scale = search.sync_power_scale;
 
     for step in 0..nhsym {
         let start = step * sync_step_samples;
@@ -120,9 +123,9 @@ pub(super) fn collect_candidates(
     for bin in min_bin..=max_bin {
         let mut best_local = (f32::NEG_INFINITY, 0isize);
         let mut best_wide = (f32::NEG_INFINITY, 0isize);
-        for lag in -tuning.sync_max_lag..=tuning.sync_max_lag {
+        for lag in -search.sync_max_lag..=search.sync_max_lag {
             let score = sync8_score(spec, &symbol_power, nhsym, bin, lag, nominal_start);
-            if (-tuning.sync_local_lag..=tuning.sync_local_lag).contains(&lag)
+            if (-search.sync_local_lag..=search.sync_local_lag).contains(&lag)
                 && score > best_local.0
             {
                 best_local = (score, lag);
@@ -173,19 +176,19 @@ pub(super) fn collect_candidates(
     prioritized.extend(
         raw.iter()
             .filter(|candidate| {
-                (candidate.freq_hz - tuning.nfqso_hz).abs() <= tuning.nfqso_priority_window_hz
+                (candidate.freq_hz - search.nfqso_hz).abs() <= search.nfqso_priority_window_hz
             })
             .cloned(),
     );
     prioritized.extend(raw.into_iter().filter(|candidate| {
-        (candidate.freq_hz - tuning.nfqso_hz).abs() > tuning.nfqso_priority_window_hz
+        (candidate.freq_hz - search.nfqso_hz).abs() > search.nfqso_priority_window_hz
     }));
 
     let mut selected = Vec::new();
     for candidate in prioritized {
         let too_close = selected.iter().any(|existing: &DecodeCandidate| {
             (existing.dt_seconds - candidate.dt_seconds).abs() < sync_step_seconds
-                && (existing.freq_hz - candidate.freq_hz).abs() < tuning.candidate_separation_hz
+                && (existing.freq_hz - candidate.freq_hz).abs() < search.candidate_separation_hz
         });
         if too_close {
             continue;
@@ -233,9 +236,11 @@ pub(super) fn debug_ft4_search_probe_pcm(
             })?
             .clone();
         let target_bin = (((target_freq_hz - probe.f_offset_hz) / probe.df_hz).round() as isize)
-            .clamp(0, probe.raw_savg.len().saturating_sub(1) as isize) as usize;
+            .clamp(0, probe.raw_savg.len().saturating_sub(1) as isize)
+            as usize;
         let candidate_bin = (((best.freq_hz - probe.f_offset_hz) / probe.df_hz).round() as isize)
-            .clamp(0, probe.raw_savg.len().saturating_sub(1) as isize) as usize;
+            .clamp(0, probe.raw_savg.len().saturating_sub(1) as isize)
+            as usize;
         let probe_bins = ((target_bin as isize - 3)..=(target_bin as isize + 3))
             .filter_map(|bin| {
                 let index = usize::try_from(bin).ok()?;
@@ -257,7 +262,7 @@ pub(super) fn debug_ft4_search_probe_pcm(
             let right = probe.raw_savsm[candidate_bin + 1];
             let den = left - 2.0 * center + right;
             if den != 0.0 {
-                0.5 * (left - right) / den
+                PARABOLIC_PEAK_WEIGHT * (left - right) / den
             } else {
                 0.0
             }
@@ -322,7 +327,8 @@ fn collect_candidates_ft4_with_probe(
         {
             *slot = fac * sample * gain;
         }
-        fft.process(&mut input, &mut spectrum).expect("ft4 coarse fft");
+        fft.process(&mut input, &mut spectrum)
+            .expect("ft4 coarse fft");
         for bin in 1..=nh1 {
             savg[bin] += spectrum[bin].norm_sqr();
         }
@@ -359,15 +365,13 @@ fn collect_candidates_ft4_with_probe(
     let mut near_qso = Vec::new();
     let mut others = Vec::new();
     for bin in (nfa + 1)..=(nfb.saturating_sub(1)) {
-        if savsm[bin] < sync_threshold
-            || savsm[bin] < savsm[bin - 1]
-            || savsm[bin] < savsm[bin + 1]
+        if savsm[bin] < sync_threshold || savsm[bin] < savsm[bin - 1] || savsm[bin] < savsm[bin + 1]
         {
             continue;
         }
         let den = savsm[bin - 1] - 2.0 * savsm[bin] + savsm[bin + 1];
         let del = if den != 0.0 {
-            0.5 * (savsm[bin - 1] - savsm[bin + 1]) / den
+            PARABOLIC_PEAK_WEIGHT * (savsm[bin - 1] - savsm[bin + 1]) / den
         } else {
             0.0
         };
@@ -382,7 +386,7 @@ fn collect_candidates_ft4_with_probe(
             freq_hz,
             score,
         };
-        if (freq_hz - spec.tuning.nfqso_hz).abs() <= spec.tuning.nfqso_priority_window_hz {
+        if (freq_hz - spec.search.nfqso_hz).abs() <= spec.search.nfqso_priority_window_hz {
             near_qso.push(candidate);
         } else {
             others.push(candidate);
@@ -413,9 +417,7 @@ fn ft4_nuttall_window(nfft: usize) -> &'static [f32] {
         (0..nfft)
             .map(|index| {
                 let phase = 2.0 * pi * index as f32 / nfft as f32;
-                0.3635819
-                    - 0.4891775 * phase.cos()
-                    + 0.1365995 * (2.0 * phase).cos()
+                0.3635819 - 0.4891775 * phase.cos() + 0.1365995 * (2.0 * phase).cos()
                     - 0.0106411 * (3.0 * phase).cos()
             })
             .collect()
@@ -461,9 +463,8 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
     let mut baseline = vec![0.0f32; savg.len()];
     for (bin, slot) in baseline.iter_mut().enumerate().take(ib + 1).skip(ia) {
         let t = bin as f64 - i0;
-        let db = coeffs[0]
-            + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4])))
-            + 0.65;
+        let db =
+            coeffs[0] + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4]))) + 0.65;
         *slot = 10.0f64.powf(db / 10.0) as f32;
     }
     baseline
@@ -472,8 +473,7 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
 fn percentile_10(values: &[f32]) -> f32 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|left, right| left.total_cmp(right));
-    let rank = ((sorted.len() as f32 * 0.10).round() as usize)
-        .clamp(1, sorted.len());
+    let rank = ((sorted.len() as f32 * 0.10).round() as usize).clamp(1, sorted.len());
     let index = rank - 1;
     sorted[index]
 }
@@ -570,7 +570,7 @@ pub(super) fn collect_candidates_legacy(
 ) -> Vec<DecodeCandidate> {
     let spec = options.mode.spec();
     let geometry = &spec.geometry;
-    let tuning = &spec.tuning;
+    let search = &spec.search;
     let hops_per_symbol = geometry.hops_per_symbol();
     let spectrogram = build_spectrogram(audio, options);
     let costas = all_costas_positions(geometry);
@@ -618,9 +618,9 @@ pub(super) fn collect_candidates_legacy(
     for candidate in raw {
         let too_close = selected.iter().any(|existing: &DecodeCandidate| {
             (existing.dt_seconds - candidate.dt_seconds).abs()
-                < tuning.legacy_candidate_separation_dt_seconds
+                < search.legacy_candidate_separation_dt_seconds
                 && (existing.freq_hz - candidate.freq_hz).abs()
-                    < geometry.tone_spacing_hz * tuning.legacy_candidate_separation_tone_factor
+                    < geometry.tone_spacing_hz * search.legacy_candidate_separation_tone_factor
         });
         if too_close {
             continue;
@@ -669,7 +669,7 @@ pub(super) fn sync8_score(
 ) -> f32 {
     let geometry = &spec.geometry;
     let row_len = spec.sync_fft_samples() / 2 + 1;
-    let sync_steps_per_symbol = spec.tuning.sync_step_divisor;
+    let sync_steps_per_symbol = spec.search.sync_step_divisor;
     let tone_bin_stride = spec.sync_tone_bin_stride();
     let tone_count = spec.tone_count();
     let mut block_signal = vec![0.0f32; geometry.sync_block_starts.len()];
@@ -727,11 +727,11 @@ pub(super) fn normalize_sync_scores(spec: &ModeSpec, scores: &mut [(usize, isize
         return;
     }
     values.sort_by(|left, right| left.total_cmp(right));
-    let percentile =
-        ((values.len() as f32 * spec.tuning.sync_baseline_percentile).round() as usize)
-            .clamp(1, values.len())
-            - 1;
-    let baseline = values[percentile].max(spec.tuning.sync_baseline_floor);
+    let percentile = ((values.len() as f32 * spec.search.sync_baseline_percentile).round()
+        as usize)
+        .clamp(1, values.len())
+        - 1;
+    let baseline = values[percentile].max(spec.search.sync_baseline_floor);
     for (_, _, score) in scores.iter_mut() {
         *score /= baseline;
     }
@@ -758,8 +758,8 @@ mod tests {
             .zip(geometry.sync_patterns.iter().copied())
         {
             for (offset, costas) in pattern.iter().copied().enumerate() {
-                let row_start =
-                    nominal_start + ((block_start + offset) * spec.tuning.sync_step_divisor) as isize;
+                let row_start = nominal_start
+                    + ((block_start + offset) * spec.search.sync_step_divisor) as isize;
                 let row = (row_start as usize - 1) * row_len;
                 for tone in 0..spec.tone_count() {
                     symbol_power[row + bin + spec.sync_tone_bin_stride() * tone] = 1.0;

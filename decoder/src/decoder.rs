@@ -8,9 +8,7 @@ use realfft::{RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftPlanner};
 use serde::Serialize;
 
-use crate::encode::{
-    channel_symbols_from_codeword_bits_for_mode,
-};
+use crate::encode::channel_symbols_from_codeword_bits_for_mode;
 use crate::ldpc::{LdpcDebugState, ParityMatrix};
 use crate::message::{
     GridReport, HashResolver, Payload, StructuredMessage, unpack_message_for_mode,
@@ -22,18 +20,18 @@ use crate::wave::{AudioBuffer, DecoderError, load_wav};
 #[cfg(test)]
 use crate::modes::ft8::FT8_SAMPLE_RATE;
 
+mod ft2;
 mod metrics;
 mod refine;
 mod search;
 mod session;
 mod subtract;
-mod ft2;
 
+use ft2::*;
 use metrics::*;
 use refine::*;
 use search::*;
 use subtract::*;
-use ft2::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -91,23 +89,26 @@ pub struct DecodeOptions {
 
 impl Default for DecodeOptions {
     fn default() -> Self {
+        Self::for_mode(Mode::Ft8)
+    }
+}
+
+impl DecodeOptions {
+    pub fn for_mode(mode: Mode) -> Self {
         Self {
-            mode: Mode::Ft8,
+            mode,
             profile: DecodeProfile::Medium,
             min_freq_hz: 200.0,
             max_freq_hz: 4_000.0,
             max_candidates: 600,
             max_successes: 200,
             search_passes: 3,
-            target_freq_hz: 1_500.0,
-            tx_freq_hz: 1_500.0,
+            target_freq_hz: mode.spec().search.nfqso_hz,
+            tx_freq_hz: mode.spec().search.nfqso_hz,
             ap_width_hz: 75.0,
             disable_subtraction: false,
         }
     }
-}
-
-impl DecodeOptions {
     fn uses_early_decodes(&self) -> bool {
         self.mode == Mode::Ft8 && !matches!(self.profile, DecodeProfile::Quick)
     }
@@ -116,7 +117,7 @@ impl DecodeOptions {
         if matches!(self.profile, DecodeProfile::Deepest) && self.mode != Mode::Ft4 {
             1.3
         } else {
-            self.mode.spec().tuning.sync_threshold
+            self.mode.spec().search.sync_threshold
         }
     }
 
@@ -458,11 +459,11 @@ struct SubtractionPlan {
 }
 
 fn long_input_samples(spec: &ModeSpec) -> usize {
-    spec.tuning.long_input_samples
+    spec.search.long_input_samples
 }
 
 fn stock_window_audio<'a>(audio: &'a AudioBuffer, mode: Mode) -> Cow<'a, AudioBuffer> {
-    let max_samples = mode.spec().tuning.long_input_samples;
+    let max_samples = mode.spec().search.long_input_samples;
     if audio.samples.len() <= max_samples {
         Cow::Borrowed(audio)
     } else {
@@ -473,7 +474,7 @@ fn stock_window_audio<'a>(audio: &'a AudioBuffer, mode: Mode) -> Cow<'a, AudioBu
 }
 
 fn sync8_early_threshold(spec: &ModeSpec) -> f32 {
-    spec.tuning.sync_early_threshold
+    spec.search.sync_early_threshold
 }
 
 fn early_41_samples(spec: &ModeSpec) -> usize {
@@ -707,7 +708,10 @@ fn debug_candidate_pcm_inner(
         .fold(0.0f32, f32::max)
         * 1.01;
     if ap_magnitude > 0.0 {
-        for (name, known_bits) in [("ap-cq", cq_ap_known_bits(mode)), ("ap-mycall", mycall_ap_known_bits(mode))] {
+        for (name, known_bits) in [
+            ("ap-cq", cq_ap_known_bits(mode)),
+            ("ap-mycall", mycall_ap_known_bits(mode)),
+        ] {
             for (suffix, max_osd) in [("", 0), ("-osd2", 2), ("-osd3", 3)] {
                 let llrs = llrs_with_known_bits(&refined.llr_sets[0], known_bits, ap_magnitude);
                 let mean_abs_llr =
@@ -740,7 +744,9 @@ fn debug_candidate_pcm_inner(
             }
         }
 
-        if mode == Mode::Ft4 && let Some(truth) = truth_codeword_bits {
+        if mode == Mode::Ft4
+            && let Some(truth) = truth_codeword_bits
+        {
             let mut truth_known = vec![None; mode.spec().coding.codeword_bits];
             let truth_message_bits = &truth[..crate::protocol::FTX_MESSAGE_BITS];
             copy_known_message_bits(
@@ -756,20 +762,14 @@ fn debug_candidate_pcm_inner(
             let mean_abs_llr =
                 llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
             let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-            let decoded = decode_llr_set_with_known_bits(
-                mode,
-                parity,
-                &llrs,
-                &truth_known,
-                0,
-                &mut counters,
-            )
-            .map(|(payload, _, iterations)| {
-                let message = payload.to_message(&resolver);
-                (message.to_text(), iterations)
-            });
-            let (truth_hard_errors, truth_weighted_distance) = truth_metrics(spec, &llrs, truth)
-                .unwrap_or((None, None));
+            let decoded =
+                decode_llr_set_with_known_bits(mode, parity, &llrs, &truth_known, 0, &mut counters)
+                    .map(|(payload, _, iterations)| {
+                        let message = payload.to_message(&resolver);
+                        (message.to_text(), iterations)
+                    });
+            let (truth_hard_errors, truth_weighted_distance) =
+                truth_metrics(spec, &llrs, truth).unwrap_or((None, None));
             passes.push(CandidatePassDebug {
                 pass_name: "ap-truth77".to_string(),
                 mean_abs_llr,
@@ -998,7 +998,10 @@ pub fn debug_ft4_search_probe_wav_file(
 ) -> Result<Option<Ft4SearchProbeDebug>, DecoderError> {
     let audio = load_wav(path)?;
     let prepared = stock_window_audio(&audio, Mode::Ft4);
-    Ok(search::debug_ft4_search_probe_pcm(&prepared, target_freq_hz))
+    Ok(search::debug_ft4_search_probe_pcm(
+        &prepared,
+        target_freq_hz,
+    ))
 }
 
 pub fn debug_search_wav_file(
@@ -1120,12 +1123,11 @@ fn append_debug_single_pass(
     }
     let mean_abs_llr = llrs.iter().map(|value| value.abs()).sum::<f32>() / llrs.len() as f32;
     let max_abs_llr = llrs.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
-    let decoded = decode_llr_set(mode, parity, llrs, max_osd, counters).map(
-        |(payload, _, iterations)| {
+    let decoded =
+        decode_llr_set(mode, parity, llrs, max_osd, counters).map(|(payload, _, iterations)| {
             let message = payload.to_message(resolver);
             (message.to_text(), iterations)
-        },
-    );
+        });
     let (truth_hard_errors, truth_weighted_distance) = truth_codeword_bits
         .and_then(|truth| truth_metrics(mode.spec(), llrs, truth))
         .unwrap_or((None, None));
@@ -1627,7 +1629,10 @@ mod tests {
         )
         .expect("decode ft4 candidate");
         assert_eq!(
-            success.payload.to_message(&HashResolver::default()).to_text(),
+            success
+                .payload
+                .to_message(&HashResolver::default())
+                .to_text(),
             "K1ABC W1XYZ FN31"
         );
     }
@@ -1663,7 +1668,11 @@ mod tests {
             },
         )
         .expect("decode ft4");
-        let decoded: Vec<_> = report.decodes.iter().map(|decode| decode.text.as_str()).collect();
+        let decoded: Vec<_> = report
+            .decodes
+            .iter()
+            .map(|decode| decode.text.as_str())
+            .collect();
         assert!(
             decoded.contains(&"K1ABC W1XYZ FN31"),
             "expected FT4 decode in {decoded:?}"

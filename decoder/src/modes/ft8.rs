@@ -1,4 +1,7 @@
-use super::{ChannelCoding, FrameGeometry, Mode, ModeSpec, SearchTuning};
+use super::{
+    ChannelCoding, FrameGeometry, Mode, ModeSpec, RefineSpec, SearchSpec, SubtractionSpec,
+    WaveformSpec,
+};
 use crate::protocol::FTX_DATA_SYMBOLS;
 
 // FT8 uses 12 kHz sample rate, 6.25 Hz tone spacing, and 79 total symbols:
@@ -85,7 +88,14 @@ pub const FT8_CODING: ChannelCoding = ChannelCoding {
     bits_per_symbol: 3,
 };
 
-pub const FT8_TUNING: SearchTuning = SearchTuning {
+pub const FT8_WAVEFORM: WaveformSpec = WaveformSpec {
+    default_frequency_hz: 1_000.0,
+    default_start_seconds: 0.5,
+    default_total_seconds: 15.0,
+    default_amplitude: 0.8,
+};
+
+pub const FT8_SEARCH: SearchSpec = SearchSpec {
     long_input_samples: 15 * FT8_SAMPLE_RATE as usize,
     // Legacy 100-symbol analysis window; at 12 kHz this gives 0.0625 Hz FFT bins.
     long_fft_samples: FT8_LONG_FFT_SAMPLES,
@@ -101,19 +111,6 @@ pub const FT8_TUNING: SearchTuning = SearchTuning {
     sync_power_scale: 1.0 / 300.0,
     sync_baseline_percentile: 0.40,
     sync_baseline_floor: 1e-6,
-    nominal_start_seconds: 0.5,
-    baseband_taper_len: 100,
-    // Legacy usable downsampled window after discarding the zero-padded tail.
-    baseband_valid_samples: FT8_BASEBAND_VALID_SAMPLES,
-    subtract_filter_samples: 4_000,
-    // Legacy early decode gate at 3_456 / 12_000 = 0.288 s per block.
-    early_block_samples: FT8_EARLY_BLOCK_SAMPLES,
-    // Legacy "close enough to nominal start" threshold for dt-refined subtraction.
-    subtraction_refine_cutoff_seconds: FT8_SUBTRACTION_REFINE_CUTOFF_SECONDS,
-    // Legacy +/-90-sample quadratic probe spacing (7.5 ms at 12 kHz).
-    subtraction_refine_probe_step_samples: FT8_SUBTRACTION_REFINE_PROBE_STEP_SAMPLES,
-    // Refinement probes half-Hz residual offsets around the coarse candidate.
-    refine_residual_step_hz: FT8_REFINE_RESIDUAL_STEP_HZ,
     nfqso_hz: 1_500.0,
     nfqso_priority_window_hz: 10.0,
     candidate_separation_hz: 4.0,
@@ -123,13 +120,35 @@ pub const FT8_TUNING: SearchTuning = SearchTuning {
     // Keep 1.5 tones below and 8.5 tones above the candidate to cover all 8 FSK tones.
     band_lower_tone_offset: FT8_BAND_LOWER_TONE_OFFSET,
     band_upper_tone_offset: FT8_BAND_UPPER_TONE_OFFSET,
+};
+
+pub const FT8_REFINE: RefineSpec = RefineSpec {
+    nominal_start_seconds: 0.5,
+    baseband_taper_len: 100,
+    // Legacy usable downsampled window after discarding the zero-padded tail.
+    baseband_valid_samples: FT8_BASEBAND_VALID_SAMPLES,
+    // Legacy early decode gate at 3_456 / 12_000 = 0.288 s per block.
+    early_block_samples: FT8_EARLY_BLOCK_SAMPLES,
+    // Refinement probes half-Hz residual offsets around the coarse candidate.
+    refine_residual_step_hz: FT8_REFINE_RESIDUAL_STEP_HZ,
     // Legacy post-normalization bitmetric scale retained for bit-exact parity.
     llr_scale_factor: FT8_LLR_SCALE_FACTOR,
+};
+
+pub const FT8_SUBTRACTION: SubtractionSpec = SubtractionSpec {
+    filter_samples: 4_000,
+    // Legacy "close enough to nominal start" threshold for dt-refined subtraction.
+    refine_cutoff_seconds: FT8_SUBTRACTION_REFINE_CUTOFF_SECONDS,
+    // Legacy +/-90-sample quadratic probe spacing (7.5 ms at 12 kHz).
+    refine_probe_step_samples: FT8_SUBTRACTION_REFINE_PROBE_STEP_SAMPLES,
 };
 
 pub const FT8_SPEC: ModeSpec = ModeSpec {
     mode: Mode::Ft8,
     coding: FT8_CODING,
     geometry: FT8_GEOMETRY,
-    tuning: FT8_TUNING,
+    waveform: FT8_WAVEFORM,
+    search: FT8_SEARCH,
+    refine: FT8_REFINE,
+    subtraction: FT8_SUBTRACTION,
 };
