@@ -21,6 +21,7 @@ DEFAULT_FT4_STOCK_SUBTRACT = DEFAULT_FT4_REF_ROOT / "ft4-stock-subtract"
 DEFAULT_FT4_STOCK_SUBTRACT_BITS = DEFAULT_FT4_REF_ROOT / "ft4-stock-subtract-bits"
 DEFAULT_FT4_STOCK_TRACE = DEFAULT_FT4_REF_ROOT / "ft4-stock-trace"
 DEFAULT_FT4_STOCK_METRICS = DEFAULT_FT4_REF_ROOT / "ft4-stock-metrics"
+DEFAULT_FT4_STOCK_DECODE174 = DEFAULT_FT4_REF_ROOT / "ft4-stock-decode174"
 
 
 def _resolve_existing(path: Path, label: str) -> Path:
@@ -109,6 +110,13 @@ def locate_ft4_stock_metrics(explicit: str | None = None) -> Path:
     if value:
         return _resolve_existing(Path(value), "FT4 stock metrics helper")
     return _resolve_existing(DEFAULT_FT4_STOCK_METRICS, "FT4 stock metrics helper")
+
+
+def locate_ft4_stock_decode174(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("FT4_STOCK_DECODE174")
+    if value:
+        return _resolve_existing(Path(value), "FT4 stock decode174 helper")
+    return _resolve_existing(DEFAULT_FT4_STOCK_DECODE174, "FT4 stock decode174 helper")
 
 
 def jt9_debug_level(profile: str) -> str:

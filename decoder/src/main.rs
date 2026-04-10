@@ -5,6 +5,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use ft8_decoder::{
     DecodeOptions, DecodeProfile, GridReport, Mode, WaveformOptions,
     debug_candidate_truth_wav_file, debug_candidate_wav_file, debug_ft4_metrics_wav_file,
+    debug_ft4_decode174_wav_file,
     debug_ft4_search_probe_wav_file,
     debug_ft2_trace_wav_file, debug_ft4_variants_wav_file,
     debug_search_wav_file,
@@ -143,6 +144,28 @@ enum Command {
 
         #[arg(long)]
         freq_hz: f32,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugFt4Decode174 {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, default_value_t = 1)]
+        llr_set: usize,
+
+        #[arg(long, default_value_t = 2)]
+        max_osd: isize,
+
+        #[arg(long, default_value_t = 2)]
+        norder: usize,
 
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
@@ -466,6 +489,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pretty,
         } => {
             let report = debug_ft4_metrics_wav_file(&wav, dt_seconds, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt4Decode174 {
+            wav,
+            dt_seconds,
+            freq_hz,
+            llr_set,
+            max_osd,
+            norder,
+            pretty,
+        } => {
+            let report =
+                debug_ft4_decode174_wav_file(&wav, dt_seconds, freq_hz, llr_set, max_osd, norder)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::encode::{
     channel_symbols_from_codeword_bits_for_mode,
 };
-use crate::ldpc::ParityMatrix;
+use crate::ldpc::{LdpcDebugState, ParityMatrix};
 use crate::message::{
     GridReport, HashResolver, Payload, StructuredMessage, unpack_message_for_mode,
 };
@@ -113,7 +113,7 @@ impl DecodeOptions {
     }
 
     fn sync_threshold(&self) -> f32 {
-        if matches!(self.profile, DecodeProfile::Deepest) {
+        if matches!(self.profile, DecodeProfile::Deepest) && self.mode != Mode::Ft4 {
             1.3
         } else {
             self.mode.spec().tuning.sync_threshold
@@ -290,6 +290,20 @@ pub struct Ft4MetricsDebug {
     pub snr_db: i32,
     pub llr_sets: [Vec<f32>; 4],
     pub symbol_bit_llrs: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Ft4Decode174Debug {
+    pub coarse_start_seconds: f32,
+    pub coarse_dt_seconds: f32,
+    pub coarse_freq_hz: f32,
+    pub refined_start_seconds: f32,
+    pub refined_dt_seconds: f32,
+    pub refined_freq_hz: f32,
+    pub sync_score: f32,
+    pub snr_db: i32,
+    pub llr_set_index: usize,
+    pub ldpc: LdpcDebugState,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -856,6 +870,25 @@ pub fn debug_ft4_metrics_wav_file(
     Ok(debug_ft4_metrics_pcm(&audio, dt_seconds, freq_hz))
 }
 
+pub fn debug_ft4_decode174_wav_file(
+    path: impl AsRef<Path>,
+    dt_seconds: f32,
+    freq_hz: f32,
+    llr_set_index: usize,
+    max_osd: isize,
+    norder: usize,
+) -> Result<Option<Ft4Decode174Debug>, DecoderError> {
+    let audio = load_wav(path)?;
+    Ok(debug_ft4_decode174_pcm(
+        &audio,
+        dt_seconds,
+        freq_hz,
+        llr_set_index,
+        max_osd,
+        norder,
+    ))
+}
+
 pub fn debug_ft4_metrics_pcm(
     audio: &AudioBuffer,
     dt_seconds: f32,
@@ -900,6 +933,62 @@ pub fn debug_ft4_metrics_pcm(
         snr_db: refined.snr_db,
         llr_sets: refined.llr_sets.clone(),
         symbol_bit_llrs: refined.symbol_bit_llrs.clone(),
+    })
+}
+
+pub fn debug_ft4_decode174_pcm(
+    audio: &AudioBuffer,
+    dt_seconds: f32,
+    freq_hz: f32,
+    llr_set_index: usize,
+    max_osd: isize,
+    norder: usize,
+) -> Option<Ft4Decode174Debug> {
+    let prepared = stock_window_audio(audio, Mode::Ft4);
+    let audio = prepared.as_ref();
+    let spec = Mode::Ft4.spec();
+    if audio.sample_rate_hz != spec.geometry.sample_rate_hz
+        || audio.samples.len() < spec.geometry.symbol_samples
+    {
+        return None;
+    }
+
+    let long_spectrum = build_long_spectrum(audio, spec);
+    let baseband_plan = BasebandPlan::new(spec);
+    let refined = refine_candidate(
+        &long_spectrum,
+        &baseband_plan,
+        spec,
+        spec.start_seconds_from_dt(dt_seconds),
+        freq_hz,
+    )
+    .or_else(|| {
+        extract_candidate_at_relaxed(
+            &long_spectrum,
+            &baseband_plan,
+            spec,
+            spec.start_seconds_from_dt(dt_seconds),
+            freq_hz,
+        )
+    })?;
+    let llrs = refined
+        .llr_sets
+        .get(llr_set_index.saturating_sub(1))
+        .cloned()
+        .filter(|set| !set.is_empty())?;
+    let ldpc = ParityMatrix::global().debug_bp_osd_state(&llrs, None, max_osd, norder)?;
+
+    Some(Ft4Decode174Debug {
+        coarse_start_seconds: spec.start_seconds_from_dt(dt_seconds),
+        coarse_dt_seconds: dt_seconds,
+        coarse_freq_hz: freq_hz,
+        refined_start_seconds: refined.start_seconds,
+        refined_dt_seconds: spec.dt_seconds_from_start(refined.start_seconds),
+        refined_freq_hz: refined.freq_hz,
+        sync_score: refined.sync_score,
+        snr_db: refined.snr_db,
+        llr_set_index,
+        ldpc,
     })
 }
 

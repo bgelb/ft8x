@@ -572,7 +572,7 @@ pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
 
 fn parse_message_bits(message_bits: &[u8]) -> Option<Payload> {
     let i3 = read_bit_field(message_bits, FTX_STANDARD_LAYOUT.kind) as u8;
-    match i3 {
+    let payload = match i3 {
         0 => {
             let n3 = read_bit_field(message_bits, FTX_FREE_TEXT_SUBTYPE_FIELD) as u8;
             match n3 {
@@ -731,6 +731,44 @@ fn parse_message_bits(message_bits: &[u8]) -> Option<Payload> {
             n3: None,
             message_bits: message_bits.to_vec(),
         })),
+    }?;
+
+    validate_payload(&payload).then_some(payload)
+}
+
+fn validate_payload(payload: &Payload) -> bool {
+    fn valid_standard_call(callsign: &str) -> bool {
+        !callsign.is_empty()
+            && !callsign.contains(' ')
+            && callsign
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    }
+
+    fn valid_call_field(field: &CallField) -> bool {
+        match field {
+            CallField::Standard(callsign) => valid_standard_call(callsign),
+            _ => true,
+        }
+    }
+
+    match payload {
+        Payload::Standard(message) => {
+            valid_call_field(&message.first) && valid_call_field(&message.second)
+        }
+        Payload::FieldDay(message) => {
+            valid_call_field(&message.first) && valid_call_field(&message.second)
+        }
+        Payload::RttyContest(message) => {
+            valid_call_field(&message.first) && valid_call_field(&message.second)
+        }
+        Payload::Dxpedition(message) => {
+            valid_call_field(&message.completed_call) && valid_call_field(&message.next_call)
+        }
+        Payload::EuVhf(_)
+        | Payload::Nonstandard(_)
+        | Payload::FreeText(_)
+        | Payload::Unsupported(_) => true,
     }
 }
 

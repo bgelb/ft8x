@@ -1378,6 +1378,419 @@ end program ft4_stock_metrics
 """
 
 
+FT4_DECODE174_WRAPPER = r"""
+program ft4_stock_decode174
+  use wavhdr
+  use packjt77
+  implicit none
+  integer, parameter :: NS=16
+  integer, parameter :: ND=87
+  integer, parameter :: NN=NS+ND
+  integer, parameter :: NSPS=576
+  integer, parameter :: NMAX=21*3456
+  integer, parameter :: NDOWN=18
+  integer, parameter :: NSS=NSPS/NDOWN
+  integer, parameter :: NDMAX=NMAX/NDOWN
+  integer, parameter :: N=174
+  integer, parameter :: K=91
+  integer, parameter :: M=N-K
+  interface
+     subroutine ft4_downsample(dd, newdata, f0, c)
+       real, intent(in) :: dd(72576), f0
+       logical, intent(in) :: newdata
+       complex, intent(out) :: c(0:4031)
+     end subroutine ft4_downsample
+     subroutine get_ft4_bitmetrics(cd, bitmetrics, badsync)
+       complex, intent(in) :: cd(0:3295)
+       real, intent(out) :: bitmetrics(206,3)
+       logical, intent(out) :: badsync
+     end subroutine get_ft4_bitmetrics
+     subroutine encode174_91_nocrc(message91, cw)
+       integer*1, intent(in) :: message91(91)
+       integer*1, intent(out) :: cw(174)
+     end subroutine encode174_91_nocrc
+     subroutine osd174_91(llr, k, apmask, ndeep, message91, cw, nhardmin, dmin)
+       integer, intent(in) :: k, ndeep
+       real, intent(in) :: llr(174)
+       integer*1, intent(in) :: apmask(174)
+       integer*1, intent(out) :: message91(91), cw(174)
+       integer, intent(out) :: nhardmin
+       real, intent(out) :: dmin
+     end subroutine osd174_91
+     subroutine get_crc14(msg, n, ncrc)
+       integer*1, intent(inout) :: msg(n)
+       integer, intent(out) :: ncrc
+     end subroutine get_crc14
+     subroutine platanh(x, y)
+       real, intent(in) :: x
+       real, intent(out) :: y
+     end subroutine platanh
+  end interface
+
+  character(len=256) :: wav_path, arg
+  character(len=37) :: decoded
+  character(len=77) :: c77
+  integer*2 :: iwave(NMAX)
+  real :: dd(NMAX), bitmetrics(206,3), llra(174), llrb(174), llrc(174), sum2, f0, dt
+  real :: llr(174), zsave(174,3), dmin, osd_dmin
+  integer :: ios, nsamp, ibest, i, llr_index, maxosd, norder, Keff
+  integer :: ntype, nharderror, bp_iter, nbadcrc, ncheck, nclast, ncnt, ncheck_delta
+  integer :: nrw(M), ncw, synd(M), iter, j, kk, i_saved
+  integer :: Nm(7,M), Mn(3,N)
+  integer*1 :: message91(91), cw(174), apmask(174), m96(96), hdec(174), nxor(174)
+  integer*1 :: osd_message91(91), osd_cw(174), message77(77), rvec(77)
+  integer*1 :: basis_cw(174)
+  integer :: sorted_indices(174), permuted_indices(174), pivot_failure
+  logical :: badsync, unpk77_success
+  real :: tov(3,174), toc(7,83), tanhtoc(7,83), zn(174), zsum(174), Tmn
+  complex :: cb(0:NDMAX-1), cd(0:NN*NSS-1)
+  type(hdr) :: h
+  data rvec/0,1,0,0,1,0,1,0,0,1,0,1,1,1,1,0,1,0,0,0,1,0,0,1,1,0,1,1,0, &
+     1,0,0,1,0,1,1,0,0,0,0,1,0,0,0,1,0,1,0,0,1,1,1,1,0,0,1,0,1, &
+     0,1,0,1,0,1,1,0,1,1,1,1,1,0,0,0,1,0,1/
+
+  include "ldpc_174_91_c_parity.f90"
+
+  call get_command_argument(1, wav_path)
+  call get_command_argument(2, arg)
+  read(arg, *) f0
+  call get_command_argument(3, arg)
+  read(arg, *) dt
+  call get_command_argument(4, arg)
+  read(arg, *) llr_index
+  call get_command_argument(5, arg)
+  read(arg, *) maxosd
+  call get_command_argument(6, arg)
+  read(arg, *) norder
+
+  open(10, file=trim(wav_path), status='old', access='stream', iostat=ios)
+  if (ios .ne. 0) stop 1
+  read(10) h
+  iwave = 0
+  nsamp = min(h%ndata / 2, NMAX)
+  read(10) iwave(1:nsamp)
+  close(10)
+
+  dd = 0.0
+  dd(1:nsamp) = iwave(1:nsamp)
+  call ft4_downsample(dd, .true., f0, cb)
+  sum2 = sum(abs(cb)**2) / (real(NSS) * NN)
+  if (sum2 .gt. 0.0) cb = cb / sqrt(sum2)
+
+  ibest = nint((dt + 0.5) * 666.67)
+  cd = 0.0
+  if (ibest .ge. 0) then
+     cd(0:NN*NSS-1) = cb(ibest:ibest+NN*NSS-1)
+  else
+     cd(-ibest:ibest+NN*NSS-1) = cb(0:NN*NSS+2*ibest-1)
+  endif
+
+  call get_ft4_bitmetrics(cd, bitmetrics, badsync)
+  if (badsync) then
+     print '(a)', 'badsync=T'
+     stop 0
+  endif
+  llra(  1: 58)=bitmetrics(  9: 66, 1)
+  llra( 59:116)=bitmetrics( 75:132, 1)
+  llra(117:174)=bitmetrics(141:198, 1)
+  llrb(  1: 58)=bitmetrics(  9: 66, 2)
+  llrb( 59:116)=bitmetrics( 75:132, 2)
+  llrb(117:174)=bitmetrics(141:198, 2)
+  llrc(  1: 58)=bitmetrics(  9: 66, 3)
+  llrc( 59:116)=bitmetrics( 75:132, 3)
+  llrc(117:174)=bitmetrics(141:198, 3)
+  llra = 2.83 * llra
+  llrb = 2.83 * llrb
+  llrc = 2.83 * llrc
+  if (llr_index .eq. 1) llr = llra
+  if (llr_index .eq. 2) llr = llrb
+  if (llr_index .eq. 3) llr = llrc
+
+  apmask = 0
+  Keff = 91
+  call probe_decode174_91(llr, Keff, maxosd, norder, apmask, message91, cw, ntype, nharderror, dmin, zsave, bp_iter)
+
+  do i_saved=1,91
+     if (i_saved .gt. 3 .and. i_saved .lt. 89) cycle
+     message91 = 0
+     message91(i_saved) = 1
+     call encode174_91_nocrc(message91, basis_cw)
+     write(*,'(a,i0,a)',advance='no') 'basis_row=', i_saved-1, ' '
+     do i=1,174
+        write(*,'(i1)',advance='no') basis_cw(i)
+     enddo
+     write(*,*)
+  enddo
+
+  print '(a,i0)', 'bp_iter=', bp_iter
+  print '(a,i0)', 'ntype=', ntype
+  print '(a,i0)', 'nharderror=', nharderror
+  print '(a,es16.8)', 'dmin=', dmin
+  write(*,'(a)',advance='no') 'saved_count='
+  if (maxosd .eq. 0) then
+     write(*,'(i0)') 1
+  elseif (maxosd .gt. 0) then
+     write(*,'(i0)') min(maxosd,3)
+  else
+     write(*,'(i0)') 0
+  endif
+  if (sum(message91) .gt. 0 .and. nharderror .ge. 0) then
+     message77 = mod(message91(1:77) + rvec, 2)
+     write(c77,'(77i1)') message77
+     call unpack77(c77, 1, decoded, unpk77_success)
+     if (unpk77_success) print '(a,a)', 'decoded=', trim(decoded)
+     write(*,'(a)',advance='no') 'message_bits='
+     do i=1,77
+        write(*,'(i1)',advance='no') message77(i)
+     enddo
+     write(*,*)
+  endif
+
+  do i_saved = 1, 3
+     if (maxosd .lt. i_saved) cycle
+     if (maxosd .eq. 0 .and. i_saved .gt. 1) cycle
+     write(*,'(a,i0,a)',advance='no') 'zsave', i_saved, '='
+     do i=1,174
+        write(*,'(f0.6,1x)',advance='no') zsave(i,i_saved)
+     enddo
+     write(*,*)
+     call probe_osd_order(zsave(:,i_saved), Keff, sorted_indices, permuted_indices, pivot_failure)
+     write(*,'(a,i0,a,i0)') 'pivot_failure=', i_saved, ' ', pivot_failure
+     write(*,'(a,i0,a)',advance='no') 'sorted_indices=', i_saved, ' '
+     do i=1,174
+        write(*,'(i0,1x)',advance='no') sorted_indices(i)
+     enddo
+     write(*,*)
+     write(*,'(a,i0,a)',advance='no') 'permuted_indices=', i_saved, ' '
+     do i=1,174
+        write(*,'(i0,1x)',advance='no') permuted_indices(i)
+     enddo
+     write(*,*)
+     osd_message91 = 0
+     osd_cw = 0
+     osd_dmin = 0.0
+     call osd174_91(zsave(:,i_saved), Keff, apmask, norder, osd_message91, osd_cw, nharderror, osd_dmin)
+     print '(a,i0,a,i0)', 'osd_index=', i_saved, ' nharderror=', nharderror
+     print '(a,i0,a,es16.8)', 'osd_index=', i_saved, ' dmin=', osd_dmin
+     if (sum(osd_message91) .gt. 0 .and. nharderror .ge. 0) then
+        message77 = mod(osd_message91(1:77) + rvec, 2)
+        write(c77,'(77i1)') message77
+        call unpack77(c77, 1, decoded, unpk77_success)
+        if (unpk77_success) print '(a,i0,a,a)', 'osd_index=', i_saved, ' decoded=', trim(decoded)
+        write(*,'(a,i0,a)',advance='no') 'osd_bits=', i_saved, ' '
+        do i=1,77
+           write(*,'(i1)',advance='no') message77(i)
+        enddo
+        write(*,*)
+        write(*,'(a,i0,a)',advance='no') 'osd_codeword=', i_saved, ' '
+        do i=1,174
+           write(*,'(i1)',advance='no') osd_cw(i)
+        enddo
+        write(*,*)
+     endif
+  enddo
+
+contains
+
+  subroutine probe_decode174_91(llr, Keff, maxosd, norder, apmask, message91, cw, ntype, nharderror, dmin, zsave, bp_iter)
+    integer, intent(in) :: Keff, maxosd, norder
+    real, intent(in) :: llr(174)
+    integer*1, intent(in) :: apmask(174)
+    integer*1, intent(out) :: message91(91), cw(174)
+    integer, intent(out) :: ntype, nharderror, bp_iter
+    real, intent(out) :: dmin, zsave(174,3)
+    integer :: nosd, maxiterations
+
+    maxiterations = 30
+    nosd = 0
+    if (maxosd .eq. 0) then
+       nosd = 1
+       zsave(:,1) = llr
+    elseif (maxosd .gt. 0) then
+       nosd = min(maxosd, 3)
+    endif
+
+    toc = 0.0
+    tov = 0.0
+    tanhtoc = 0.0
+    do j=1,M
+       do i=1,nrw(j)
+          toc(i,j)=llr(Nm(i,j))
+       enddo
+    enddo
+
+    ncnt = 0
+    nclast = 0
+    zsum = 0.0
+    message91 = 0
+    cw = 0
+    dmin = 0.0
+    ntype = 0
+    nharderror = -1
+    bp_iter = -1
+
+    do iter=0,maxiterations
+       do i=1,N
+          if (apmask(i) .ne. 1) then
+             zn(i) = llr(i) + sum(tov(1:ncw,i))
+          else
+             zn(i) = llr(i)
+          endif
+       enddo
+       zsum = zsum + zn
+       if (iter .gt. 0 .and. iter .le. maxosd .and. iter .le. 3) then
+          zsave(:,iter) = zsum
+       endif
+
+       cw = 0
+       where(zn .gt. 0.0) cw = 1
+       ncheck = 0
+       do i=1,M
+          synd(i) = sum(cw(Nm(1:nrw(i),i)))
+          if (mod(synd(i), 2) .ne. 0) ncheck = ncheck + 1
+       enddo
+       if (ncheck .eq. 0) then
+          m96 = 0
+          m96(1:77)=cw(1:77)
+          m96(83:96)=cw(78:91)
+          call get_crc14(m96, 96, nbadcrc)
+          nharderror = count((2*cw-1)*llr .lt. 0.0)
+          if (nbadcrc .eq. 0) then
+             message91 = cw(1:91)
+             hdec = 0
+             where(llr .ge. 0.0) hdec = 1
+             nxor = ieor(hdec, cw)
+             dmin = sum(nxor*abs(llr))
+             ntype = 1
+             bp_iter = iter
+             return
+          endif
+       endif
+
+       if (iter .gt. 0) then
+          ncheck_delta = ncheck - nclast
+          if (ncheck_delta .lt. 0) then
+             ncnt = 0
+          else
+             ncnt = ncnt + 1
+          endif
+          if (ncnt .ge. 5 .and. iter .ge. 10 .and. ncheck .gt. 15) exit
+       endif
+       nclast = ncheck
+
+       do j=1,M
+          do i=1,nrw(j)
+             toc(i,j)=zn(Nm(i,j))
+             do kk=1,ncw
+                if (Mn(kk,Nm(i,j)) .eq. j) then
+                   toc(i,j)=toc(i,j)-tov(kk,Nm(i,j))
+                endif
+             enddo
+          enddo
+       enddo
+
+       do i=1,M
+          tanhtoc(1:7,i)=tanh(-toc(1:7,i)/2.0)
+       enddo
+
+       do j=1,N
+          do i=1,ncw
+             Tmn = product(tanhtoc(1:nrw(Mn(i,j)), Mn(i,j)), mask=Nm(1:nrw(Mn(i,j)), Mn(i,j)) .ne. j)
+             call platanh(-Tmn, tov(i,j))
+             tov(i,j)=2.0*tov(i,j)
+          enddo
+       enddo
+    enddo
+
+    do i=1,nosd
+       osd_message91 = 0
+       osd_cw = 0
+       osd_dmin = 0.0
+       call osd174_91(zsave(:,i), Keff, apmask, norder, osd_message91, osd_cw, nharderror, osd_dmin)
+       if (nharderror .gt. 0) then
+          message91 = osd_message91
+          cw = osd_cw
+          hdec = 0
+          where(llr .ge. 0.0) hdec = 1
+          nxor = ieor(hdec, cw)
+          dmin = sum(nxor*abs(llr))
+          ntype = 2
+          bp_iter = maxiterations + i
+          return
+       endif
+    enddo
+
+    nharderror = -1
+    bp_iter = maxiterations
+  end subroutine probe_decode174_91
+
+  subroutine probe_osd_order(llr, k, sorted_indices, permuted_indices, pivot_failure)
+    integer, intent(in) :: k
+    real, intent(in) :: llr(174)
+    integer, intent(out) :: sorted_indices(174), permuted_indices(174), pivot_failure
+    character*14 c14
+    integer*1 :: gen(91,174), genmrb(91,174), temp(91), message91(91), m96(96), cw(174)
+    integer :: indices(174), indx(174), i, id, icol, ii, itmp, nbadcrc
+    real :: rx(174), absrx(174)
+
+    do i=1,k
+       message91 = 0
+       message91(i) = 1
+       if (i .le. 77) then
+          m96 = 0
+          m96(1:91)=message91
+          call get_crc14(m96,96,nbadcrc)
+          write(c14,'(b14.14)') nbadcrc
+          read(c14,'(14i1)') message91(78:91)
+          message91(78:k)=0
+       endif
+       call encode174_91_nocrc(message91, cw)
+       gen(i,:) = cw
+    enddo
+
+    rx = llr
+    absrx = abs(rx)
+    call indexx(absrx,174,indx)
+    do i=1,174
+       genmrb(1:k,i)=gen(1:k,indx(175-i))
+       indices(i)=indx(175-i)
+       sorted_indices(i)=indices(i)-1
+       permuted_indices(i)=indices(i)-1
+    enddo
+
+    pivot_failure = -1
+    do id=1,k
+       do icol=id,min(k+20,174)
+          if (genmrb(id,icol) .eq. 1) then
+             if (icol .ne. id) then
+                temp(1:k)=genmrb(1:k,id)
+                genmrb(1:k,id)=genmrb(1:k,icol)
+                genmrb(1:k,icol)=temp(1:k)
+                itmp=indices(id)
+                indices(id)=indices(icol)
+                indices(icol)=itmp
+             endif
+             do ii=1,k
+                if (ii .ne. id .and. genmrb(ii,id) .eq. 1) then
+                   genmrb(ii,1:174)=ieor(genmrb(ii,1:174),genmrb(id,1:174))
+                endif
+             enddo
+             exit
+          endif
+       enddo
+       if (icol .gt. min(k+20,174)) then
+          pivot_failure = id-1
+          exit
+       endif
+    enddo
+    do i=1,174
+       permuted_indices(i)=indices(i)-1
+    enddo
+  end subroutine probe_osd_order
+end program ft4_stock_decode174
+"""
+
+
 FT2_FRAME_WRAPPER = r"""
 program ft2_ref_frame
   use packjt77
@@ -1826,7 +2239,7 @@ def build_ft2_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     return gen_bin, decode_bin, frame_bin, trace_bin
 
 
-def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path]:
+def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     ft4_root = source_root / "lib" / "ft4"
     ft8_root = source_root / "lib" / "ft8"
     lib_root = source_root / "lib"
@@ -1841,6 +2254,7 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     subtract_bits_src = build_root / "ft4_stock_subtract_bits.f90"
     trace_src = build_root / "ft4_stock_trace.f90"
     metrics_src = build_root / "ft4_stock_metrics.f90"
+    decode174_src = build_root / "ft4_stock_decode174.f90"
     normalize_src = build_root / "normalizebmet.f90"
     fftw_shim_src = build_root / "fftw3_shim.f90"
     write_text(gen_src, FT4_GEN_WRAPPER)
@@ -1852,6 +2266,7 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     write_text(subtract_bits_src, FT4_SUBTRACT_BITS_WRAPPER)
     write_text(trace_src, FT4_TRACE_WRAPPER)
     write_text(metrics_src, FT4_METRICS_WRAPPER)
+    write_text(decode174_src, FT4_DECODE174_WRAPPER)
     write_text(normalize_src, NORMALIZE_BMET)
     write_text(fftw_shim_src, FFTW3_SHIM)
 
@@ -1957,6 +2372,7 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     subtract_bits_bin = build_root / "ft4-stock-subtract-bits"
     trace_bin = build_root / "ft4-stock-trace"
     metrics_bin = build_root / "ft4-stock-metrics"
+    decode174_bin = build_root / "ft4-stock-decode174"
     link_flags = [
         "-L",
         str(fftw_lib),
@@ -1983,6 +2399,7 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     )
     run(common_cmd + include_flags + ["-o", str(trace_bin), str(trace_src)] + objects + link_flags)
     run(common_cmd + include_flags + ["-o", str(metrics_bin), str(metrics_src)] + objects + link_flags)
+    run(common_cmd + include_flags + ["-o", str(decode174_bin), str(decode174_src)] + objects + link_flags)
     return (
         gen_bin,
         frame_bin,
@@ -1993,6 +2410,7 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
         subtract_bits_bin,
         trace_bin,
         metrics_bin,
+        decode174_bin,
     )
 
 
@@ -2030,6 +2448,7 @@ def main() -> int:
         ft4_subtract_bits,
         ft4_trace,
         ft4_metrics,
+        ft4_decode174,
     ) = build_ft4_refs(source_root, output_dir / "ft4")
     print(f"output_dir={output_dir}")
     print(f"ft4_ref_gen={ft4_gen}")
@@ -2041,6 +2460,7 @@ def main() -> int:
     print(f"ft4_stock_subtract_bits={ft4_subtract_bits}")
     print(f"ft4_stock_trace={ft4_trace}")
     print(f"ft4_stock_metrics={ft4_metrics}")
+    print(f"ft4_stock_decode174={ft4_decode174}")
     print(f"ft2_ref_gen={ft2_gen}")
     print(f"ft2_ref_decode={ft2_decode}")
     print(f"ft2_ref_frame={ft2_frame}")

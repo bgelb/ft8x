@@ -666,8 +666,8 @@ fn ft4_plain_report_after_rr73_conflict<'a>(
 
         first.raw == candidate_first.raw
             && second.raw == candidate_second.raw
-            && (success.candidate.freq_hz - candidate.candidate.freq_hz).abs() <= 5.0
-            && (success.candidate.dt_seconds - candidate.candidate.dt_seconds).abs() <= 0.04
+            && (success.candidate.freq_hz - candidate.candidate.freq_hz).abs() <= 0.25
+            && (success.candidate.dt_seconds - candidate.candidate.dt_seconds).abs() <= 0.008
     })
 }
 
@@ -783,22 +783,6 @@ pub(super) fn try_candidate(
             }
         }
     }
-    if best.is_none() && options.mode == Mode::Ft4 {
-        best = try_ft4_local_rescue(
-            long_spectrum,
-            baseband_plan,
-            candidate,
-            spec,
-            options,
-            outer_pass,
-            parity,
-            allow_ap,
-            ft4_ap_known_bits,
-            resolver,
-            seen_messages,
-            counters,
-        );
-    }
     best.into_iter().collect()
 }
 
@@ -854,103 +838,12 @@ fn try_candidate_ft4_ordered(
             return vec![success];
         }
     }
-    for refined in [
-        extract_candidate_at(
-            long_spectrum,
-            baseband_plan,
-            spec,
-            candidate.start_seconds,
-            coarse_freq_hz,
-        ),
-        extract_candidate_at_relaxed(
-            long_spectrum,
-            baseband_plan,
-            spec,
-            candidate.start_seconds,
-            coarse_freq_hz,
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(success) = try_refined_candidate(
-            &refined,
-            options.mode,
-            candidate.score,
-            max_osd,
-            allow_ap,
-            ft4_ap_known_bits,
-            resolver,
-            seen_messages,
-            parity,
-            counters,
-        ) {
-            return vec![success];
-        }
-    }
     Vec::new()
 }
 
 fn ft4_refinement_is_latched(coarse: &DecodeCandidate, refined: &SuccessfulDecode) -> bool {
     (refined.candidate.freq_hz - coarse.freq_hz).abs() <= 4.5
         && (refined.candidate.dt_seconds - coarse.dt_seconds).abs() <= 0.03
-}
-
-fn try_ft4_local_rescue(
-    long_spectrum: &LongSpectrum,
-    baseband_plan: &BasebandPlan,
-    candidate: &DecodeCandidate,
-    spec: &ModeSpec,
-    options: &DecodeOptions,
-    outer_pass: usize,
-    parity: &ParityMatrix,
-    allow_ap: bool,
-    ft4_ap_known_bits: &[Vec<Option<u8>>],
-    resolver: &HashResolver,
-    seen_messages: &HashSet<String>,
-    counters: &mut DecodeCounters,
-) -> Option<SuccessfulDecode> {
-    let hop_seconds = spec.geometry.hop_samples as f32 / spec.geometry.sample_rate_hz as f32;
-    let freq_probe_hz = spec.geometry.tone_spacing_hz / 8.0;
-    let max_osd = options.max_osd_passes(outer_pass, candidate.freq_hz);
-
-    for start_offset in [hop_seconds, 0.0, -hop_seconds] {
-        for freq_offset in [-freq_probe_hz, freq_probe_hz, -2.0 * freq_probe_hz, 2.0 * freq_probe_hz]
-        {
-            let start_seconds = candidate.start_seconds + start_offset;
-            let freq_hz = candidate.freq_hz + freq_offset;
-            for refined in [
-                extract_candidate_at(long_spectrum, baseband_plan, spec, start_seconds, freq_hz),
-                extract_candidate_at_relaxed(
-                    long_spectrum,
-                    baseband_plan,
-                    spec,
-                    start_seconds,
-                    freq_hz,
-                ),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Some(success) = try_refined_candidate(
-                    &refined,
-                    options.mode,
-                    candidate.score,
-                    max_osd,
-                    allow_ap,
-                    ft4_ap_known_bits,
-                    resolver,
-                    seen_messages,
-                    parity,
-                    counters,
-                ) {
-                    return Some(success);
-                }
-            }
-        }
-    }
-
-    None
 }
 
 pub(super) fn try_refined_candidate(

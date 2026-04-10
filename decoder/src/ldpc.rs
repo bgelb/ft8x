@@ -6,6 +6,27 @@ use crate::protocol::GRAY_TONES_TO_BITS;
 const MAX_ITERS: usize = 30;
 const OSD_NT: usize = 40;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LdpcOsdProbeResult {
+    pub input_index: usize,
+    pub sorted_indices: Vec<usize>,
+    pub ordered_indices: Vec<usize>,
+    pub mrb_message_bits: String,
+    pub mrb_message_flips: Vec<usize>,
+    pub mrb_flips: Vec<usize>,
+    pub codeword_bits: Option<String>,
+    pub hard_errors: Option<usize>,
+    pub weighted_distance: Option<f32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LdpcDebugState {
+    pub bp_codeword_bits: Option<String>,
+    pub bp_iterations: Option<usize>,
+    pub saved_llrs: Vec<Vec<f32>>,
+    pub osd_results: Vec<LdpcOsdProbeResult>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct OsdConfig {
     nord: usize,
@@ -330,14 +351,154 @@ impl ParityMatrix {
         None
     }
 
+    pub fn debug_bp_osd_state(
+        &self,
+        llrs: &[f32],
+        known_bits: Option<&[Option<u8>]>,
+        maxosd: isize,
+        norder: usize,
+    ) -> Option<LdpcDebugState> {
+        if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
+            return None;
+        }
+        let maxosd = maxosd.clamp(-1, 3);
+        let mut tov = [[0.0f32; 3]; 174];
+        let mut toc = [[0.0f32; 7]; 83];
+        let mut tanhtoc = [[0.0f32; 7]; 83];
+        let mut zsum = [0.0f32; 174];
+        let mut saved_llrs = Vec::<Vec<f32>>::new();
+        if maxosd == 0 {
+            saved_llrs.push(llrs.to_vec());
+        }
+
+        for (row_index, columns) in self.row_columns.iter().enumerate() {
+            for (slot, &column) in columns.iter().enumerate() {
+                toc[row_index][slot] = llrs[column];
+            }
+        }
+
+        let mut hard_bits = [0u8; 174];
+        let mut zn = [0.0f32; 174];
+        let mut ncnt = 0isize;
+        let mut nclast = 0usize;
+        let mut bp_codeword_bits = None;
+        let mut bp_iterations = None;
+        for iteration in 0..=MAX_ITERS {
+            for column in 0..174 {
+                zn[column] = if known_bits.and_then(|bits| bits[column]).is_some() {
+                    llrs[column]
+                } else {
+                    llrs[column] + tov[column][0] + tov[column][1] + tov[column][2]
+                };
+            }
+            if maxosd > 0 {
+                for (acc, value) in zsum.iter_mut().zip(zn.iter().copied()) {
+                    *acc += value;
+                }
+                if iteration > 0 && iteration as isize <= maxosd {
+                    saved_llrs.push(zsum.to_vec());
+                }
+            }
+
+            for (column, value) in zn.iter().copied().enumerate() {
+                hard_bits[column] = u8::from(value >= 0.0);
+            }
+            let ncheck = self
+                .rows
+                .iter()
+                .filter(|row| row.iter().fold(0u8, |acc, &column| acc ^ hard_bits[column]) != 0)
+                .count();
+            if ncheck == 0 && crc::crc_matches(&hard_bits[..77], &hard_bits[77..91]) {
+                bp_codeword_bits = Some(bit_string(&hard_bits));
+                bp_iterations = Some(iteration);
+                break;
+            }
+
+            if iteration > 0 {
+                let nd = ncheck as isize - nclast as isize;
+                if nd < 0 {
+                    ncnt = 0;
+                } else {
+                    ncnt += 1;
+                }
+                if ncnt >= 5 && iteration >= 10 && ncheck > 15 {
+                    break;
+                }
+            }
+            nclast = ncheck;
+
+            for (row_index, columns) in self.row_columns.iter().enumerate() {
+                for (slot, &column) in columns.iter().enumerate() {
+                    let col_slot = self.row_column_slots[row_index][slot];
+                    toc[row_index][slot] = zn[column] - tov[column][col_slot];
+                }
+            }
+
+            for row_index in 0..83 {
+                for slot in 0..self.row_columns[row_index].len() {
+                    tanhtoc[row_index][slot] = (-toc[row_index][slot] / 2.0).tanh();
+                }
+            }
+
+            for column in 0..174 {
+                for (slot, &row_index) in self.column_rows[column].iter().enumerate() {
+                    let mut product = 1.0f32;
+                    for (row_slot, &other_column) in self.row_columns[row_index].iter().enumerate()
+                    {
+                        if other_column == column {
+                            continue;
+                        }
+                        product *= tanhtoc[row_index][row_slot];
+                    }
+                    tov[column][slot] = 2.0 * platanh_approx(-product);
+                }
+            }
+        }
+
+        let osd_config = OsdConfig::from_norder(norder);
+        let osd_results = saved_llrs
+            .iter()
+            .enumerate()
+            .map(|(index, saved)| self.debug_osd(saved, known_bits, osd_config, index + 1))
+            .collect();
+        Some(LdpcDebugState {
+            bp_codeword_bits,
+            bp_iterations,
+            saved_llrs,
+            osd_results,
+        })
+    }
+
     fn decode_osd(
         &self,
         llrs: &[f32],
         known_bits: Option<&[Option<u8>]>,
         config: OsdConfig,
     ) -> Option<Vec<u8>> {
+        self.debug_osd(llrs, known_bits, config, 0)
+            .codeword_bits
+            .map(|bits| bits.bytes().map(|byte| u8::from(byte == b'1')).collect())
+    }
+
+    fn debug_osd(
+        &self,
+        llrs: &[f32],
+        known_bits: Option<&[Option<u8>]>,
+        config: OsdConfig,
+        input_index: usize,
+    ) -> LdpcOsdProbeResult {
         if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
-            return None;
+            return LdpcOsdProbeResult {
+                input_index,
+                sorted_indices: Vec::new(),
+                ordered_indices: Vec::new(),
+                mrb_message_bits: String::new(),
+                mrb_message_flips: Vec::new(),
+                mrb_flips: Vec::new(),
+                codeword_bits: None,
+                hard_errors: None,
+                weighted_distance: None,
+            };
         }
 
         const K: usize = 91;
@@ -345,6 +506,7 @@ impl ParityMatrix {
         const MRB_SEARCH_EXTRA: usize = 20;
 
         let indices = indexx_descending_by_abs(llrs);
+        let sorted_indices = indices.clone();
         let mut genmrb: Vec<Vec<u8>> = self
             .generator_rows
             .iter()
@@ -354,20 +516,18 @@ impl ParityMatrix {
 
         for pivot in 0..K {
             let search_end = (K + MRB_SEARCH_EXTRA).min(N);
-            let Some(column) = (pivot..search_end).find(|&column| genmrb[pivot][column] == 1)
-            else {
-                return None;
-            };
-            if column != pivot {
-                for row in &mut genmrb {
-                    row.swap(pivot, column);
+            if let Some(column) = (pivot..search_end).find(|&column| genmrb[pivot][column] == 1) {
+                if column != pivot {
+                    for row in &mut genmrb {
+                        row.swap(pivot, column);
+                    }
+                    permuted_indices.swap(pivot, column);
                 }
-                permuted_indices.swap(pivot, column);
-            }
-            for row in 0..K {
-                if row != pivot && genmrb[row][pivot] == 1 {
-                    for column in 0..N {
-                        genmrb[row][column] ^= genmrb[pivot][column];
+                for row in 0..K {
+                    if row != pivot && genmrb[row][pivot] == 1 {
+                        for column in 0..N {
+                            genmrb[row][column] ^= genmrb[pivot][column];
+                        }
                     }
                 }
             }
@@ -390,11 +550,21 @@ impl ParityMatrix {
             .map(|&index| known_bits.and_then(|bits| bits[index]).is_some())
             .collect();
 
-        let mut best_codeword = encode_mrb(&hard[..K], &genmrb);
-        let mut best_distance = weighted_distance(&best_codeword, &hard, &reliabilities);
+        let mut best_message = hard[..K].to_vec();
+        let mut best_codeword = encode_mrb(&best_message, &genmrb);
+        let mut best_selection_distance = weighted_distance(&best_codeword, &hard, &reliabilities);
 
         if config.nord == 0 {
-            return restore_osd_codeword(self, &best_codeword, &permuted_indices);
+            return build_osd_probe_result(
+                self,
+                &best_message,
+                &best_codeword,
+                &hard,
+                &reliabilities,
+                &sorted_indices,
+                &permuted_indices,
+                input_index,
+            );
         }
 
         for iorder in 1..=config.nord {
@@ -408,6 +578,7 @@ impl ParityMatrix {
                     0
                 };
                 let mut cached_tail = Vec::<u8>::new();
+                let mut cached_d1 = 0.0f32;
                 for n1 in (iend..=iflag).rev() {
                     let mut mi = misub.clone();
                     mi[n1] = 1;
@@ -425,6 +596,7 @@ impl ParityMatrix {
                     let codeword = encode_mrb(&me, &genmrb);
                     let parity_tail = if n1 == iflag {
                         cached_tail = xor_tail(&codeword, &hard, K);
+                        cached_d1 = weighted_distance(&me, &hard[..K], &reliabilities[..K]);
                         cached_tail.clone()
                     } else {
                         cached_tail
@@ -442,9 +614,25 @@ impl ParityMatrix {
                     if ndkpt > config.ntheta {
                         continue;
                     }
-                    let distance = weighted_distance(&codeword, &hard, &reliabilities);
-                    if distance < best_distance {
-                        best_distance = distance;
+                    let selection_distance = if n1 == iflag {
+                        cached_d1
+                            + parity_tail
+                                .iter()
+                                .zip(reliabilities[K..].iter())
+                                .map(|(&bit, &weight)| if bit == 0 { 0.0 } else { weight })
+                                .sum::<f32>()
+                    } else {
+                        cached_d1
+                            + if codeword[n1] == hard[n1] { 0.0 } else { reliabilities[n1] }
+                            + parity_tail
+                                .iter()
+                                .zip(reliabilities[K..].iter())
+                                .map(|(&bit, &weight)| if bit == 0 { 0.0 } else { weight })
+                                .sum::<f32>()
+                    };
+                    if selection_distance < best_selection_distance {
+                        best_selection_distance = selection_distance;
+                        best_message = me;
                         best_codeword = codeword;
                     }
                 }
@@ -455,7 +643,16 @@ impl ParityMatrix {
             }
         }
 
-        restore_osd_codeword(self, &best_codeword, &permuted_indices)
+        build_osd_probe_result(
+            self,
+            &best_message,
+            &best_codeword,
+            &hard,
+            &reliabilities,
+            &sorted_indices,
+            &permuted_indices,
+            input_index,
+        )
     }
 
     #[allow(dead_code)]
@@ -487,6 +684,47 @@ impl ParityMatrix {
         }
         llrs
     }
+}
+
+fn build_osd_probe_result(
+    parity: &ParityMatrix,
+    best_message: &[u8],
+    codeword: &[u8],
+    hard: &[u8],
+    reliabilities: &[f32],
+    sorted_indices: &[usize],
+    permuted_indices: &[usize],
+    input_index: usize,
+) -> LdpcOsdProbeResult {
+    let restored = restore_osd_codeword(parity, codeword, permuted_indices);
+    let k = parity.generator_rows.len();
+    LdpcOsdProbeResult {
+        input_index,
+        sorted_indices: sorted_indices.to_vec(),
+        ordered_indices: permuted_indices.to_vec(),
+        mrb_message_bits: bit_string(best_message),
+        mrb_message_flips: best_message
+            .iter()
+            .zip(hard[..k].iter())
+            .enumerate()
+            .filter_map(|(index, (&left, &right))| (left != right).then_some(index))
+            .collect(),
+        mrb_flips: codeword[..k]
+            .iter()
+            .zip(hard[..k].iter())
+            .enumerate()
+            .filter_map(|(index, (&left, &right))| (left != right).then_some(index))
+            .collect(),
+        codeword_bits: restored.as_ref().map(|bits| bit_string(bits)),
+        hard_errors: Some(codeword.iter().zip(hard.iter()).filter(|(left, right)| left != right).count()),
+        weighted_distance: Some(weighted_distance(codeword, hard, reliabilities)),
+    }
+}
+
+fn bit_string(bits: &[u8]) -> String {
+    bits.iter()
+        .map(|bit| if *bit == 0 { '0' } else { '1' })
+        .collect()
 }
 
 fn platanh_approx(x: f32) -> f32 {
@@ -586,16 +824,23 @@ fn indexx_descending_by_abs(llrs: &[f32]) -> Vec<usize> {
     let mut ir = n.saturating_sub(1);
 
     loop {
-        if ir <= l + M {
+        if ir.saturating_sub(l) < M {
             for j in (l + 1)..=ir {
                 let indxt = indices[j];
                 let a = abs_llrs[indxt];
-                let mut i = j;
-                while i > 0 && abs_llrs[indices[i - 1]] > a {
-                    indices[i] = indices[i - 1];
+                let mut i = j - 1;
+                loop {
+                    if abs_llrs[indices[i]] <= a {
+                        break;
+                    }
+                    indices[i + 1] = indices[i];
+                    if i == 0 {
+                        i = usize::MAX;
+                        break;
+                    }
                     i -= 1;
                 }
-                indices[i] = indxt;
+                indices[i.wrapping_add(1)] = indxt;
             }
             if jstack == 0 {
                 break;
