@@ -24,7 +24,7 @@ DECODE_PATTERN = re.compile(
     r"^(?:(?P<utc>(?:\d{6}(?:_\d{9})?|\*{6}))\s+)?(?P<snr>-?\d+)\s+(?P<dt>-?\d+(?:\.\d+)?)\s+(?P<freq>\d+)\s+(?:~|\+|RX)\s+(?P<message>.+?)(?:\s+-?\d+\s+-?\d+\s+-?\d+)?\s*$",
     re.IGNORECASE,
 )
-TRAILING_JT9_TAG_PATTERN = re.compile(r"^(?P<message>.*?)(?:\s+(?P<tag>[a-z]\d+))?\s*$")
+TRAILING_JT9_TAG_PATTERN = re.compile(r"^(?P<message>.*?)(?:\s+\??\s*(?P<tag>[a-z]\d+))?\s*$", re.IGNORECASE)
 
 
 @dataclass
@@ -71,6 +71,21 @@ def parse_decode_records(text: str) -> list[dict]:
 
 
 def parse_decode_lines(text: str) -> list[str]:
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        else:
+            decodes = payload.get("decodes", [])
+            return sorted(
+                {
+                    re.sub(r"\s+", " ", decode["text"].strip().upper())
+                    for decode in decodes
+                    if decode.get("text")
+                }
+            )
     return sorted({record["message"] for record in parse_decode_records(text)})
 
 

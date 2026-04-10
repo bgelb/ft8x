@@ -128,7 +128,11 @@ fn refine_candidate_ft4_with_cache(
 
 fn ft4_start_seconds_from_ibest(spec: &ModeSpec, ibest: isize) -> f32 {
     debug_assert_eq!(spec.mode, Mode::Ft4);
-    ibest as f32 / spec.baseband_rate_hz()
+    // WSJT-X uses the literal constant 666.67 for FT4 `ibest -> dt` conversion.
+    // Matching that truncation path exactly matters because subtraction rounds the
+    // resulting start sample, and the exact downsample rate (12000/18) differs by
+    // enough to shift some candidates by one sample.
+    ibest as f32 / 666.67
 }
 
 pub(super) fn refine_candidate_ft4_variants_with_cache(
@@ -949,6 +953,6 @@ mod tests {
         let spec = Mode::Ft4.spec();
         let ibest = 65;
         let expected = 65.0 / 666.67;
-        assert!((ft4_start_seconds_from_ibest(spec, ibest) - expected).abs() < 5e-6);
+        assert!((ft4_start_seconds_from_ibest(spec, ibest) - expected).abs() < 1e-8);
     }
 }

@@ -14,11 +14,18 @@ CAND_RE = re.compile(
     r"^pass=(?P<pass>\d+)\s+cand=(?P<cand>\d+)\s+freq=\s*(?P<freq>-?\d+(?:\.\d+)?)\s+score=\s*(?P<score>-?\d+(?:\.\d+)?)$"
 )
 DECODE_RE = re.compile(
-    r"^decode pass=(?P<pass>\d+)\s+cand=(?P<cand>\d+)\s+segment=(?P<segment>\d+)\s+ipass=(?P<ipass>\d+)\s+ntype=(?P<ntype>-?\d+)\s+nharderror=(?P<nharderror>-?\d+)\s+dt=\s*(?P<dt>-?\d+(?:\.\d+)?)\s+freq=\s*(?P<freq>-?\d+(?:\.\d+)?)\s+message=(?P<message>.+)$"
+    r"^decode pass=(?P<pass>\d+)\s+cand=(?P<cand>\d+)\s+segment=(?P<segment>\d+)\s+ipass=(?P<ipass>\d+)\s+ntype=(?P<ntype>-?\d+)\s+nharderror=(?P<nharderror>-?\d+)\s+dt=\s*(?P<dt>-?\d+(?:\.\d+)?)\s+freq=\s*(?P<freq>\*+|-?\d+(?:\.\d+)?)\s+message=(?P<message>.+)$"
+)
+SUBTRACT_RE = re.compile(
+    r"^subtract pass=(?P<pass>\d+)\s+cand=(?P<cand>\d+)\s+dt_internal=\s*(?P<dt>-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s+freq_exact=\s*(?P<freq>-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s+bits=(?P<bits>[01]{77})$"
+)
+RESIDUAL_RE = re.compile(
+    r"^residual pass=(?P<pass>\d+)\s+sum=\s*(?P<sum>-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s+sqsum=\s*(?P<sqsum>-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s+probes=(?P<probes>.+)$"
 )
 
 
 def parse_output(stdout: str) -> dict:
+    scale = 32767.0
     result: dict = {"passes": [], "raw_stdout": stdout}
     current_pass: dict | None = None
     for raw_line in stdout.splitlines():
@@ -45,6 +52,7 @@ def parse_output(stdout: str) -> dict:
         if match := DECODE_RE.match(line):
             if current_pass is None:
                 continue
+            freq_token = match.group("freq")
             current_pass["decodes"].append(
                 {
                     "candidate_index": int(match.group("cand")),
@@ -53,10 +61,35 @@ def parse_output(stdout: str) -> dict:
                     "ntype": int(match.group("ntype")),
                     "nharderror": int(match.group("nharderror")),
                     "dt_seconds": float(match.group("dt")),
-                    "freq_hz": float(match.group("freq")),
+                    "freq_hz": None if set(freq_token) == {"*"} else float(freq_token),
                     "message": re.sub(r"\s+", " ", match.group("message").strip().upper()),
                 }
             )
+            continue
+        if match := SUBTRACT_RE.match(line):
+            if current_pass is None:
+                continue
+            current_pass.setdefault("subtract_events", []).append(
+                {
+                    "candidate_index": int(match.group("cand")),
+                    "dt_internal_seconds": float(match.group("dt")),
+                    "freq_exact_hz": float(match.group("freq")),
+                    "message_bits": match.group("bits"),
+                }
+            )
+            continue
+        if match := RESIDUAL_RE.match(line):
+            pass_index = int(match.group("pass"))
+            target_pass = next((entry for entry in result["passes"] if entry["pass_index"] == pass_index), None)
+            if target_pass is None:
+                continue
+            target_pass["residual_signature"] = {
+                "sample_sum": float(match.group("sum")) / scale,
+                "sample_sq_sum": float(match.group("sqsum")) / (scale * scale),
+                "probe_values": [
+                    float(token) / scale for token in match.group("probes").split(",") if token
+                ],
+            }
     return result
 
 

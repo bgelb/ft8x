@@ -208,14 +208,101 @@ fn collect_candidates_ft4(
     options: &DecodeOptions,
     sync_threshold: f32,
 ) -> Vec<DecodeCandidate> {
+    collect_candidates_ft4_with_probe(audio, options, sync_threshold).0
+}
+
+pub(super) fn debug_ft4_search_probe_pcm(
+    audio: &AudioBuffer,
+    target_freq_hz: f32,
+) -> Option<Ft4SearchProbeDebug> {
+    let options = DecodeOptions {
+        mode: Mode::Ft4,
+        min_freq_hz: 200.0,
+        max_freq_hz: 4000.0,
+        ..DecodeOptions::default()
+    };
+    let (_, probe) = collect_candidates_ft4_with_probe(audio, &options, 1.2);
+    probe.and_then(|probe| {
+        let best = probe
+            .top_candidates
+            .iter()
+            .min_by(|left, right| {
+                (left.freq_hz - target_freq_hz)
+                    .abs()
+                    .total_cmp(&(right.freq_hz - target_freq_hz).abs())
+            })?
+            .clone();
+        let target_bin = (((target_freq_hz - probe.f_offset_hz) / probe.df_hz).round() as isize)
+            .clamp(0, probe.raw_savg.len().saturating_sub(1) as isize) as usize;
+        let candidate_bin = (((best.freq_hz - probe.f_offset_hz) / probe.df_hz).round() as isize)
+            .clamp(0, probe.raw_savg.len().saturating_sub(1) as isize) as usize;
+        let probe_bins = ((target_bin as isize - 3)..=(target_bin as isize + 3))
+            .filter_map(|bin| {
+                let index = usize::try_from(bin).ok()?;
+                let savg = *probe.raw_savg.get(index)?;
+                let sbase = *probe.raw_sbase.get(index)?;
+                let savsm = *probe.raw_savsm.get(index)?;
+                Some(Ft4SearchProbeBin {
+                    bin: index,
+                    freq_hz: index as f32 * probe.df_hz + probe.f_offset_hz,
+                    savg,
+                    sbase,
+                    savsm,
+                })
+            })
+            .collect();
+        let del = if candidate_bin > 0 && candidate_bin + 1 < probe.raw_savsm.len() {
+            let left = probe.raw_savsm[candidate_bin - 1];
+            let center = probe.raw_savsm[candidate_bin];
+            let right = probe.raw_savsm[candidate_bin + 1];
+            let den = left - 2.0 * center + right;
+            if den != 0.0 {
+                0.5 * (left - right) / den
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        Some(Ft4SearchProbeDebug {
+            target_freq_hz,
+            df_hz: probe.df_hz,
+            f_offset_hz: probe.f_offset_hz,
+            target_bin,
+            candidate_bin,
+            candidate_freq_hz: best.freq_hz,
+            candidate_score: best.score,
+            del,
+            probe_bins,
+            top_candidates: probe.top_candidates,
+        })
+    })
+}
+
+struct Ft4SearchProbeState {
+    df_hz: f32,
+    f_offset_hz: f32,
+    raw_savg: Vec<f32>,
+    raw_sbase: Vec<f32>,
+    raw_savsm: Vec<f32>,
+    top_candidates: Vec<DecodeCandidate>,
+}
+
+fn collect_candidates_ft4_with_probe(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    sync_threshold: f32,
+) -> (Vec<DecodeCandidate>, Option<Ft4SearchProbeState>) {
     let spec = options.mode.spec();
     debug_assert_eq!(spec.mode, Mode::Ft4);
+    const FT4_STOCK_SEARCH_SAMPLES: usize = 21 * 3456;
 
     let nfft = spec.sync_fft_samples();
     let nh1 = nfft / 2;
     let nstep = spec.geometry.symbol_samples;
-    if audio.samples.len() < nfft {
-        return Vec::new();
+    let sample_len = audio.samples.len().min(FT4_STOCK_SEARCH_SAMPLES);
+    if sample_len < nfft {
+        return (Vec::new(), None);
     }
 
     let mut planner = RealFftPlanner::<f32>::new();
@@ -225,10 +312,10 @@ fn collect_candidates_ft4(
     let window = ft4_nuttall_window(nfft);
     let mut savg = vec![0.0f32; nh1 + 1];
     let fac = 1.0f32 / 300.0;
+    let frame_limit = sample_len.saturating_sub(nfft) / nstep;
     let mut frames = 0usize;
-
-    let mut start = 0usize;
-    while start + nfft <= audio.samples.len() {
+    for frame in 0..frame_limit {
+        let start = frame * nstep;
         for (slot, (&sample, &gain)) in input
             .iter_mut()
             .zip(audio.samples[start..start + nfft].iter().zip(window.iter()))
@@ -240,10 +327,9 @@ fn collect_candidates_ft4(
             savg[bin] += spectrum[bin].norm_sqr();
         }
         frames += 1;
-        start += nstep;
     }
     if frames == 0 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     for value in &mut savg[1..=nh1] {
         *value /= frames as f32;
@@ -258,13 +344,13 @@ fn collect_candidates_ft4(
     let nfa = ((options.min_freq_hz / df).round() as usize).max((200.0 / df).round() as usize);
     let nfb = ((options.max_freq_hz / df).round() as usize).min((4910.0 / df).round() as usize);
     if nfa >= nfb || nfb > nh1 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let sbase = ft4_baseline(&savg, nfa, nfb);
     for bin in nfa..=nfb {
         if sbase[bin] <= 0.0 {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         savsm[bin] /= sbase[bin];
     }
@@ -303,11 +389,21 @@ fn collect_candidates_ft4(
         }
     }
 
-    near_qso
+    let selected: Vec<_> = near_qso
         .into_iter()
         .chain(others)
         .take(options.max_candidates)
-        .collect()
+        .collect();
+
+    let probe = Some(Ft4SearchProbeState {
+        df_hz: df,
+        f_offset_hz: f_offset,
+        raw_savg: savg,
+        raw_sbase: sbase,
+        raw_savsm: savsm,
+        top_candidates: selected.iter().take(8).cloned().collect(),
+    });
+    (selected, probe)
 }
 
 fn ft4_nuttall_window(nfft: usize) -> &'static [f32] {
@@ -336,20 +432,24 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
     }
 
     let nseg = 10usize;
-    let nlen = ((ib - ia + 1) / nseg).max(1);
-    let i0 = (ib - ia + 1) as f64 / 2.0;
-    let mut xs = Vec::<f64>::new();
-    let mut ys = Vec::<f64>::new();
+    let nlen = (ib - ia + 1) / nseg;
+    if nlen == 0 {
+        return vec![0.0f32; savg.len()];
+    }
+    // Match WSJT-X ft4_baseline.f90 exactly: integer midpoint, not half-bin midpoint.
+    let i0 = ((ib - ia + 1) / 2) as f64;
+    let mut xs = Vec::<f64>::with_capacity(1000);
+    let mut ys = Vec::<f64>::with_capacity(1000);
 
     for seg in 0..nseg {
         let ja = ia + seg * nlen;
-        if ja > ib {
-            break;
-        }
-        let jb = (ja + nlen - 1).min(ib);
+        let jb = ja + nlen - 1;
         let base = percentile_10(&spectrum_db[ja..=jb]);
         for (offset, &value) in spectrum_db[ja..=jb].iter().enumerate() {
             if value <= base {
+                if xs.len() >= 1000 {
+                    continue;
+                }
                 let bin = ja + offset;
                 xs.push(bin as f64 - i0);
                 ys.push(value as f64);
@@ -382,47 +482,78 @@ fn polyfit_degree4(xs: &[f64], ys: &[f64]) -> Option<[f64; 5]> {
     if xs.len() != ys.len() || xs.len() < 5 {
         return None;
     }
+    const NTERMS: usize = 5;
+    const NMAX: usize = 2 * NTERMS - 1;
 
-    let mut a = [[0.0f64; 6]; 5];
-    for row in 0..5 {
-        for col in 0..5 {
-            a[row][col] = xs.iter().map(|&x| x.powi((row + col) as i32)).sum();
+    let mut sumx = [0.0f64; NMAX];
+    let mut sumy = [0.0f64; NTERMS];
+    for (&x, &y) in xs.iter().zip(ys.iter()) {
+        let mut xterm = 1.0f64;
+        for value in &mut sumx {
+            *value += xterm;
+            xterm *= x;
         }
-        a[row][5] = xs
-            .iter()
-            .zip(ys.iter())
-            .map(|(&x, &y)| y * x.powi(row as i32))
-            .sum();
-    }
-
-    for pivot in 0..5 {
-        let best = (pivot..5)
-            .max_by(|&left, &right| a[left][pivot].abs().total_cmp(&a[right][pivot].abs()))?;
-        if a[best][pivot].abs() < 1e-12 {
-            return None;
-        }
-        if best != pivot {
-            a.swap(best, pivot);
-        }
-        let scale = a[pivot][pivot];
-        for col in pivot..=5 {
-            a[pivot][col] /= scale;
-        }
-        for row in 0..5 {
-            if row == pivot {
-                continue;
-            }
-            let factor = a[row][pivot];
-            if factor == 0.0 {
-                continue;
-            }
-            for col in pivot..=5 {
-                a[row][col] -= factor * a[pivot][col];
-            }
+        let mut yterm = y;
+        for value in &mut sumy {
+            *value += yterm;
+            yterm *= x;
         }
     }
 
-    Some(std::array::from_fn(|index| a[index][5]))
+    let mut normal = [[0.0f64; NTERMS]; NTERMS];
+    for row in 0..NTERMS {
+        for col in 0..NTERMS {
+            normal[row][col] = sumx[row + col];
+        }
+    }
+    let delta = determ(normal, NTERMS);
+    if delta == 0.0 {
+        return None;
+    }
+
+    let mut coeffs = [0.0f64; NTERMS];
+    for column in 0..NTERMS {
+        let mut replaced = normal;
+        for row in 0..NTERMS {
+            replaced[row][column] = sumy[row];
+        }
+        coeffs[column] = determ(replaced, NTERMS) / delta;
+    }
+    Some(coeffs)
+}
+
+fn determ(mut array: [[f64; 5]; 5], norder: usize) -> f64 {
+    let mut determ = 1.0f64;
+    let mut k = 0usize;
+    while k < norder {
+        if array[k][k] == 0.0 {
+            let mut swap_col = None;
+            for col in k..norder {
+                if array[k][col] != 0.0 {
+                    swap_col = Some(col);
+                    break;
+                }
+            }
+            let Some(col) = swap_col else {
+                return 0.0;
+            };
+            for row in k..norder {
+                array[row].swap(col, k);
+            }
+            determ = -determ;
+        }
+        determ *= array[k][k];
+        if k + 1 < norder {
+            let k1 = k + 1;
+            for row in k1..norder {
+                for col in k1..norder {
+                    array[row][col] -= array[row][k] * array[k][col] / array[k][k];
+                }
+            }
+        }
+        k += 1;
+    }
+    determ
 }
 
 pub(super) fn zero_tail(audio: &AudioBuffer, keep_samples: usize) -> AudioBuffer {

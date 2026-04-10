@@ -5,6 +5,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use ft8_decoder::{
     DecodeOptions, DecodeProfile, GridReport, Mode, WaveformOptions,
     debug_candidate_truth_wav_file, debug_candidate_wav_file, debug_ft4_metrics_wav_file,
+    debug_ft4_search_probe_wav_file,
     debug_ft2_trace_wav_file, debug_ft4_variants_wav_file,
     debug_search_wav_file,
     decode_wav_file,
@@ -146,6 +147,16 @@ enum Command {
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
     },
+    DebugFt4SearchProbe {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
     DebugFt2Trace {
         #[arg(value_name = "WAV")]
         wav: PathBuf,
@@ -217,6 +228,25 @@ enum Command {
 
         #[arg(long)]
         message: String,
+    },
+    SubtractCodewordCandidate {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(value_name = "OUTPUT_WAV")]
+        output_wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long)]
+        codeword_bits: String,
     },
     SubtractRttyContestCandidate {
         #[arg(value_name = "WAV")]
@@ -442,6 +472,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string(&report)?);
             }
         }
+        Command::DebugFt4SearchProbe {
+            wav,
+            freq_hz,
+            pretty,
+        } => {
+            let report = debug_ft4_search_probe_wav_file(&wav, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
         Command::DebugFt2Trace {
             wav,
             min_freq_hz,
@@ -591,6 +633,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "unable to build subtraction residual",
                 )
             })?;
+            write_wav(&output_wav, &residual)?;
+        }
+        Command::SubtractCodewordCandidate {
+            wav,
+            output_wav,
+            mode,
+            dt_seconds,
+            freq_hz,
+            codeword_bits,
+        } => {
+            let mode = mode.parse::<Mode>().map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let bits: Vec<u8> = codeword_bits
+                .chars()
+                .map(|ch| match ch {
+                    '0' => Ok(0u8),
+                    '1' => Ok(1u8),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "codeword bits must contain only 0/1",
+                    )),
+                })
+                .collect::<Result<_, _>>()?;
+            let residual = subtract_truth_wav_file(&wav, mode, dt_seconds, freq_hz, &bits)?
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "unable to build subtraction residual",
+                    )
+                })?;
             write_wav(&output_wav, &residual)?;
         }
         Command::SubtractRttyContestCandidate {

@@ -218,6 +218,8 @@ program ft4_stock_debug
   integer, parameter :: NSS=NSPS/NDOWN
   integer, parameter :: NDMAX=NMAX/NDOWN
   integer, parameter :: MAXCAND=200
+  integer, parameter :: NSTEP=NSPS
+  integer, parameter :: NHSYM=(NMAX-NFFT1)/NSTEP
 
   interface
      subroutine getcandidates4(dd, fa, fb, syncmin, nfqso, maxcand, savg, candidate, ncand, sbase)
@@ -260,29 +262,32 @@ program ft4_stock_debug
   character(len=256) :: wav_path, arg
   integer*2 :: iwave(NMAX)
   real :: dd(NMAX)
-  real :: savg(NH1), sbase(NH1)
+  real :: savg(NH1), savg_raw(NH1), savsm(NH1), sbase(NH1), sbase_probe(NH1)
   real :: candidate(2,MAXCAND)
-  real :: syncmin, nfqso, fa, fb, f0, f1, sync, smax, smax1, sum2
+  real :: syncmin, nfqso, fa, fb, f0, f1, sync, smax, smax1, sum2, df, f_offset
   real :: bitmetrics(2*NN,3)
   real :: llr(174), llra(174), llrb(174), llrc(174), llrd(174), dmin, apmag
-  real :: fs, a(5)
-  integer :: ncand, i, ios, nsamp, ipass, Keff, maxosd, norder, ntype, nharderror
+  real :: fs, a(5), x(NFFT1), window(NFFT1), fac
+  integer :: ncand, i, ios, nsamp, ipass, Keff, maxosd, norder, ntype, nharderror, nfa, nfb
   integer :: idf, iseg, isync, idfmin, idfmax, idfstp
-  integer :: ibmin, ibmax, ibstp, ibest, idfbest, istart, it, np
+  integer :: ibmin, ibmax, ibstp, ibest, idfbest, istart, it, np, j, ia, ib
   integer :: hbits(2*NN), ns1, ns2, ns3, ns4, nsync_qual
   integer :: mcq(29)
+  integer :: target_bin, probe_bin
   integer*1 :: apmask(174), message91(91), cw(174), message77(77), rvec(77)
-  logical :: badsync
+  logical :: badsync, first_window
   logical :: unpk77_success
   character(len=37) :: decoded
   character(len=77) :: c77
-  complex :: ctwk(2*NSS), ctwk2(2*NSS,-16:16)
+  complex :: ctwk(2*NSS), ctwk2(2*NSS,-16:16), cx(0:NH1)
   complex :: cd2(0:NDMAX-1), cb(0:NDMAX-1), cd(0:NN*NSS-1)
   type(hdr) :: h
+  equivalence (x,cx)
   data mcq/0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0/
   data rvec/0,1,0,0,1,0,1,0,0,1,0,1,1,1,1,0,1,0,0,0,1,0,0,1,1,0,1,1,0, &
      1,0,0,1,0,1,1,0,0,0,0,1,0,0,0,1,0,1,0,0,1,1,1,1,0,0,1,0,1, &
      0,1,0,1,0,1,1,0,1,1,1,1,1,0,0,0,1,0,1/
+  data first_window/.true./
 
   mcq = 2*mod(mcq + rvec(1:29), 2) - 1
 
@@ -307,11 +312,27 @@ program ft4_stock_debug
      ctwk = 1.0
      call twkfreq1(ctwk, 2*NSS, fs/2.0, a, ctwk2(:,idf))
   end do
+  if(first_window) then
+     first_window=.false.
+     call nuttal_window(window,NFFT1)
+  endif
 
   syncmin = 1.2
   nfqso = 1500.0
   fa = 200.0
   fb = 4000.0
+  df = 12000.0/NFFT1
+  fac = 1.0/300.0
+  savg_raw = 0.0
+  do j=1,NHSYM
+     ia=(j-1)*NSTEP + 1
+     ib=ia+NFFT1-1
+     if(ib.gt.NMAX) exit
+     x=fac*dd(ia:ib)*window
+     call four2a(x,NFFT1,1,-1,0)
+     savg_raw=savg_raw + abs(cx(1:NH1))**2
+  enddo
+  savg_raw=savg_raw/NHSYM
   savg = 0.0
   sbase = 0.0
   candidate = 0.0
@@ -320,6 +341,28 @@ program ft4_stock_debug
   do i = 1, min(ncand, 16)
      print '(a,i0,a,f10.4,a,f10.4)', 'cand(', i, ')=freq:', candidate(1,i), ' score:', candidate(2,i)
   end do
+
+  savsm = 0.0
+  do i=8,NH1-7
+     savsm(i)=sum(savg_raw(i-7:i+7))/15.0
+  enddo
+  nfa=fa/df
+  if(nfa.lt.nint(200.0/df)) nfa=nint(200.0/df)
+  nfb=fb/df
+  if(nfb.gt.nint(4910.0/df)) nfb=nint(4910.0/df)
+  sbase_probe = 0.0
+  call ft4_baseline(savg_raw,nfa,nfb,sbase_probe)
+  do i=nfa,nfb
+     if(sbase_probe(i).gt.0.0) savsm(i)=savsm(i)/sbase_probe(i)
+  enddo
+  f_offset = -1.5*12000.0/NSPS
+  target_bin = nint((f0 - f_offset) / df)
+  print '(a,es16.8,a,es16.8,a,i0)', 'probe_target_freq=', f0, ' df=', df, ' target_bin=', target_bin
+  do probe_bin=max(1,target_bin-3),min(NH1,target_bin+3)
+     print '(a,i0,a,es16.8,a,es16.8,a,es16.8,a,es16.8)', 'probe_bin=', probe_bin, &
+        ' freq=', probe_bin*df+f_offset, ' savg=', savg_raw(probe_bin), &
+        ' sbase=', sbase_probe(probe_bin), ' savsm=', savsm(probe_bin)
+  enddo
 
   call ft4_downsample(dd, .true., f0, cd2)
   sum2 = sum(cd2*conjg(cd2)) / (real(NMAX) / real(NDOWN))
@@ -444,6 +487,319 @@ end program ft4_stock_debug
 """
 
 
+FT4_SEARCH_WRAPPER = r"""
+program ft4_stock_search
+  use wavhdr
+  implicit none
+  integer, parameter :: NSPS=576
+  integer, parameter :: NMAX=21*3456
+  integer, parameter :: NFFT1=2304
+  integer, parameter :: NH1=NFFT1/2
+  integer, parameter :: MAXCAND=200
+
+  interface
+     subroutine getcandidates4(dd, fa, fb, syncmin, nfqso, maxcand, savg, candidate, ncand, sbase)
+       real, intent(in) :: dd(72576), fa, fb, syncmin, nfqso
+       integer, intent(in) :: maxcand
+       real, intent(out) :: savg(1152), candidate(2,maxcand), sbase(1152)
+       integer, intent(out) :: ncand
+     end subroutine getcandidates4
+  end interface
+
+  character(len=256) :: wav_path
+  integer*2 :: iwave(NMAX)
+  real :: dd(NMAX)
+  real :: savg(NH1), sbase(NH1), candidate(2,MAXCAND)
+  real :: syncmin, nfqso, fa, fb
+  integer :: ncand, i, ios, nsamp, probe_index
+  type(hdr) :: h
+
+  call get_command_argument(1, wav_path)
+
+  open(10, file=trim(wav_path), status='old', access='stream', iostat=ios)
+  if (ios .ne. 0) stop 1
+  read(10) h
+  iwave = 0
+  nsamp = min(h%ndata / 2, NMAX)
+  read(10) iwave(1:nsamp)
+  close(10)
+  dd = 0.0
+  dd(1:nsamp) = iwave(1:nsamp)
+
+  syncmin = 1.2
+  nfqso = 1500.0
+  fa = 200.0
+  fb = 4000.0
+  savg = 0.0
+  sbase = 0.0
+  candidate = 0.0
+  call getcandidates4(dd, fa, fb, syncmin, nfqso, MAXCAND, savg, candidate, ncand, sbase)
+  print '(a,i0)', 'ncand=', ncand
+  do i = 1, min(ncand, 64)
+     print '(a,i0,a,f10.4,a,f10.4)', 'cand(', i, ')=freq:', candidate(1,i), ' score:', candidate(2,i)
+  end do
+
+  write(*,'(a,es16.8,a,es16.8,a)',advance='no') 'residual sum=', sum(dd), ' sqsum=', sum(dd*dd), ' probes='
+  do probe_index = 1, 10
+     select case (probe_index)
+     case (1)
+        write(*,'(es16.8)',advance='no') dd(1)
+     case (2)
+        write(*,'(a,es16.8)',advance='no') ',', dd(2)
+     case (3)
+        write(*,'(a,es16.8)',advance='no') ',', dd(3)
+     case (4)
+        write(*,'(a,es16.8)',advance='no') ',', dd(4)
+     case (5)
+        write(*,'(a,es16.8)',advance='no') ',', dd(577)
+     case (6)
+        write(*,'(a,es16.8)',advance='no') ',', dd(1153)
+     case (7)
+        write(*,'(a,es16.8)',advance='no') ',', dd(4097)
+     case (8)
+        write(*,'(a,es16.8)',advance='no') ',', dd(24001)
+     case (9)
+        write(*,'(a,es16.8)',advance='no') ',', dd(48001)
+     case (10)
+        write(*,'(a,es16.8)',advance='no') ',', dd(72576)
+     end select
+  end do
+  write(*,*)
+end program ft4_stock_search
+"""
+
+
+FT4_FIXED_WRAPPER = r"""
+program ft4_stock_fixed
+  use wavhdr
+  use packjt77
+  implicit none
+  integer, parameter :: KK=91
+  integer, parameter :: ND=87
+  integer, parameter :: NS=16
+  integer, parameter :: NN=NS+ND
+  integer, parameter :: NSPS=576
+  integer, parameter :: NMAX=21*3456
+  integer, parameter :: NDOWN=18
+  integer, parameter :: NSS=NSPS/NDOWN
+  integer, parameter :: NDMAX=NMAX/NDOWN
+
+  interface
+     subroutine ft4_downsample(dd, newdata, f0, c)
+       real, intent(in) :: dd(72576), f0
+       logical, intent(in) :: newdata
+       complex, intent(out) :: c(0:4031)
+     end subroutine ft4_downsample
+     subroutine sync4d(cd2, istart, ctwk, ncoh, sync)
+       complex, intent(in) :: cd2(0:4031), ctwk(64)
+       integer, intent(in) :: istart, ncoh
+       real, intent(out) :: sync
+     end subroutine sync4d
+     subroutine get_ft4_bitmetrics(cd, bitmetrics, badsync)
+       complex, intent(in) :: cd(0:3295)
+       real, intent(out) :: bitmetrics(206,3)
+       logical, intent(out) :: badsync
+     end subroutine get_ft4_bitmetrics
+     subroutine decode174_91(llr, Keff, maxosd, norder, apmask, message91, cw, ntype, nharderror, dmin)
+       integer, intent(in) :: Keff, maxosd, norder
+       real, intent(in) :: llr(174)
+       integer*1, intent(in) :: apmask(174)
+       integer*1, intent(out) :: message91(91), cw(174)
+       integer, intent(out) :: ntype, nharderror
+       real, intent(out) :: dmin
+     end subroutine decode174_91
+     subroutine twkfreq1(c, npts, fs, a, ctwk)
+       integer, intent(in) :: npts
+       real, intent(in) :: fs, a(5)
+       complex, intent(in) :: c(npts)
+       complex, intent(out) :: ctwk(npts)
+     end subroutine twkfreq1
+     subroutine get_ft4_tones_from_77bits(msgbits, i4tone)
+       integer*1, intent(in) :: msgbits(77)
+       integer*4, intent(out) :: i4tone(103)
+     end subroutine get_ft4_tones_from_77bits
+  end interface
+
+  character(len=256) :: wav_path, arg
+  integer*2 :: iwave(NMAX)
+  real :: dd(NMAX)
+  real :: f0, f1, fs, a(5), sync, smax, smax1, sum2, dt, dmin, apmag
+  real :: bitmetrics(2*NN,3), llr(174), llra(174), llrb(174), llrc(174), llrd(174)
+  integer :: ios, nsamp, idf, iseg, isync, idfmin, idfmax, idfstp
+  integer :: ibmin, ibmax, ibstp, ibest, idfbest, istart, it, np, ipass
+  integer :: hbits(2*NN), ns1, ns2, ns3, ns4, nsync_qual, Keff, maxosd, norder, ntype, nharderror, ndepth
+  integer :: mcq(29)
+  integer*1 :: apmask(174), message91(91), cw(174), message77(77), rvec(77)
+  integer*4 :: i4tone(103)
+  logical :: badsync, unpk77_success, doosd
+  character(len=37) :: decoded
+  character(len=77) :: c77
+  complex :: ctwk(2*NSS), ctwk2(2*NSS,-16:16)
+  complex :: cd2(0:NDMAX-1), cb(0:NDMAX-1), cd(0:NN*NSS-1)
+  type(hdr) :: h
+  data mcq/0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0/
+  data rvec/0,1,0,0,1,0,1,0,0,1,0,1,1,1,1,0,1,0,0,0,1,0,0,1,1,0,1,1,0, &
+     1,0,0,1,0,1,1,0,0,0,0,1,0,0,0,1,0,1,0,0,1,1,1,1,0,0,1,0,1, &
+     0,1,0,1,0,1,1,0,1,1,1,1,1,0,0,0,1,0,1/
+
+  call get_command_argument(1, wav_path)
+  call get_command_argument(2, arg)
+  read(arg, *) f0
+  call get_command_argument(3, arg)
+  read(arg, *) ndepth
+
+  mcq = 2*mod(mcq + rvec(1:29), 2) - 1
+  doosd = .true.
+  if (ndepth .eq. 2) doosd = .false.
+
+  open(10, file=trim(wav_path), status='old', access='stream', iostat=ios)
+  if (ios .ne. 0) stop 1
+  read(10) h
+  iwave = 0
+  nsamp = min(h%ndata / 2, NMAX)
+  read(10) iwave(1:nsamp)
+  close(10)
+  dd = 0.0
+  dd(1:nsamp) = iwave(1:nsamp)
+
+  fs = 12000.0 / NDOWN
+  do idf=-16,16
+     a = 0.0
+     a(1) = real(idf)
+     ctwk = 1.0
+     call twkfreq1(ctwk, 2*NSS, fs/2.0, a, ctwk2(:,idf))
+  end do
+
+  call ft4_downsample(dd, .true., f0, cd2)
+  sum2 = sum(cd2*conjg(cd2)) / (real(NMAX) / real(NDOWN))
+  if (sum2 .gt. 0.0) cd2 = cd2 / sqrt(sum2)
+
+  smax1 = 0.0
+  do iseg=1,3
+     do isync=1,2
+        if (isync .eq. 1) then
+           idfmin = -12
+           idfmax = 12
+           idfstp = 3
+           ibmin = -344
+           ibmax = 1012
+           if (iseg .eq. 1) then
+              ibmin = 108
+              ibmax = 560
+           elseif (iseg .eq. 2) then
+              ibmin = 560
+              ibmax = 1012
+           elseif (iseg .eq. 3) then
+              ibmin = -344
+              ibmax = 108
+           endif
+           ibstp = 4
+        else
+           idfmin = idfbest - 4
+           idfmax = idfbest + 4
+           idfstp = 1
+           ibmin = ibest - 5
+           ibmax = ibest + 5
+           ibstp = 1
+        endif
+        ibest = -1
+        idfbest = 0
+        smax = -99.0
+        do idf=idfmin,idfmax,idfstp
+           do istart=ibmin,ibmax,ibstp
+              call sync4d(cd2, istart, ctwk2(:,idf), 1, sync)
+              if (sync .gt. smax) then
+                 smax = sync
+                 ibest = istart
+                 idfbest = idf
+              endif
+           enddo
+        enddo
+     enddo
+
+     if (iseg .eq. 1) smax1 = smax
+     print '(a,i0,a,f10.4,a,i0,a,i0)', 'segment=', iseg, ' smax=', smax, ' ibest=', ibest, ' idfbest=', idfbest
+     if (smax .lt. 1.2) cycle
+     if (iseg .gt. 1 .and. smax .lt. smax1) cycle
+
+     f1 = f0 + real(idfbest)
+     call ft4_downsample(dd, .false., f1, cb)
+     sum2 = sum(abs(cb)**2) / (real(NSS) * NN)
+     if (sum2 .gt. 0.0) cb = cb / sqrt(sum2)
+     cd = 0.0
+     if (ibest .ge. 0) then
+        it = min(NDMAX-1, ibest + NN*NSS - 1)
+        np = it - ibest + 1
+        cd(0:np-1) = cb(ibest:it)
+     else
+        cd(-ibest:ibest+NN*NSS-1) = cb(0:NN*NSS+2*ibest-1)
+     endif
+
+     call get_ft4_bitmetrics(cd, bitmetrics, badsync)
+     if (badsync) then
+        print '(a)', 'variant_badsync=1'
+        cycle
+     endif
+     hbits = 0
+     where(bitmetrics(:,1) .ge. 0.0) hbits = 1
+     ns1 = count(hbits(  1:  8) .eq. (/0,0,0,1,1,0,1,1/))
+     ns2 = count(hbits( 67: 74) .eq. (/0,1,0,0,1,1,1,0/))
+     ns3 = count(hbits(133:140) .eq. (/1,1,1,0,0,1,0,0/))
+     ns4 = count(hbits(199:206) .eq. (/1,0,1,1,0,0,0,1/))
+     nsync_qual = ns1 + ns2 + ns3 + ns4
+     print '(a,i0,a,f10.4,a,f10.4,a,i0,a,i0)', 'variant_segment=', iseg, ' f1=', f1, ' smax=', smax, ' nsync_qual=', nsync_qual, ' ibest=', ibest
+
+     llra(  1: 58)=bitmetrics(  9: 66, 1)
+     llra( 59:116)=bitmetrics( 75:132, 1)
+     llra(117:174)=bitmetrics(141:198, 1)
+     llrb(  1: 58)=bitmetrics(  9: 66, 2)
+     llrb( 59:116)=bitmetrics( 75:132, 2)
+     llrb(117:174)=bitmetrics(141:198, 2)
+     llrc(  1: 58)=bitmetrics(  9: 66, 3)
+     llrc( 59:116)=bitmetrics( 75:132, 3)
+     llrc(117:174)=bitmetrics(141:198, 3)
+     llra = 2.83 * llra
+     llrb = 2.83 * llrb
+     llrc = 2.83 * llrc
+     apmag = maxval(abs(llra)) * 1.1
+     Keff = 91
+     norder = 2
+
+     do ipass = 1, 4
+        if (ipass .eq. 1) llr = llra
+        if (ipass .eq. 2) llr = llrb
+        if (ipass .eq. 3) llr = llrc
+        apmask = 0
+        if (ipass .eq. 4) then
+           llrd = llrc
+           apmask(1:29) = 1
+           llrd(1:29) = apmag * mcq(1:29)
+           llr = llrd
+        endif
+        message91 = 0
+        cw = 0
+        dmin = 0.0
+        maxosd = 2
+        if (abs(1500.0-f1) .le. 80.0) maxosd = 3
+        if (.not. doosd) maxosd = -1
+        call decode174_91(llr, Keff, maxosd, norder, apmask, message91, cw, ntype, nharderror, dmin)
+        if (sum(message91) .eq. 0) cycle
+        if (nharderror .lt. 0) cycle
+        message77 = mod(message91(1:77) + rvec, 2)
+        write(c77,'(77i1)') message77
+        call unpack77(c77, 1, decoded, unpk77_success)
+        if (.not. unpk77_success) cycle
+        dt = real(ibest) / 666.67
+        call get_ft4_tones_from_77bits(message77, i4tone)
+        print '(a,i0,a,a)', 'variant_pass=', ipass, ' decoded=', trim(decoded)
+        print '(a,es16.8,a,es16.8,a,i0,a,i0,a,a)', 'subtract dt_internal=', dt, ' freq_exact=', f1, &
+           ' ntype=', ntype, ' nharderror=', nharderror, ' bits=', c77
+     end do
+  end do
+end program ft4_stock_fixed
+"""
+
+
 FT4_SUBTRACT_WRAPPER = r"""
 program ft4_stock_subtract
   use wavhdr
@@ -499,6 +855,71 @@ program ft4_stock_subtract
   write(20) h, owave(1:nsamp)
   close(20)
 end program ft4_stock_subtract
+"""
+
+
+FT4_SUBTRACT_BITS_WRAPPER = r"""
+program ft4_stock_subtract_bits
+  use wavhdr
+  implicit none
+  interface
+     subroutine subtractft4(dd, itone, f0, dt)
+       real, intent(inout) :: dd(72576)
+       integer, intent(in) :: itone(103)
+       real, intent(in) :: f0, dt
+     end subroutine subtractft4
+     subroutine get_ft4_tones_from_77bits(msgbits, i4tone)
+       integer*1, intent(in) :: msgbits(77)
+       integer*4, intent(out) :: i4tone(103)
+     end subroutine get_ft4_tones_from_77bits
+  end interface
+
+  character(len=256) :: inwav, outwav, bits_arg, arg
+  integer*2 :: iwave(72576), owave(72576)
+  integer*1 :: msgbits(77)
+  integer*4 :: i4tone(103)
+  real :: dd(72576), f0, dt
+  integer :: ios, nsamp, i
+  type(hdr) :: h
+
+  call get_command_argument(1, inwav)
+  call get_command_argument(2, outwav)
+  call get_command_argument(3, bits_arg)
+  call get_command_argument(4, arg)
+  read(arg, *) f0
+  call get_command_argument(5, arg)
+  read(arg, *) dt
+
+  if (len_trim(bits_arg) .ne. 77) stop 2
+  do i = 1, 77
+     if (bits_arg(i:i) .eq. '0') then
+        msgbits(i) = 0
+     else if (bits_arg(i:i) .eq. '1') then
+        msgbits(i) = 1
+     else
+        stop 3
+     endif
+  end do
+
+  open(10, file=trim(inwav), status='old', access='stream', iostat=ios)
+  if (ios .ne. 0) stop 1
+  read(10) h
+  iwave = 0
+  nsamp = min(h%ndata / 2, 72576)
+  read(10) iwave(1:nsamp)
+  close(10)
+
+  dd = 0.0
+  dd(1:nsamp) = iwave(1:nsamp)
+  call get_ft4_tones_from_77bits(msgbits, i4tone)
+  call subtractft4(dd, i4tone, f0, dt)
+
+  owave = nint(max(-32767.0, min(32767.0, dd)))
+  h = default_header(12000, nsamp)
+  open(20, file=trim(outwav), status='replace', access='stream')
+  write(20) h, owave(1:nsamp)
+  close(20)
+end program ft4_stock_subtract_bits
 """
 
 
@@ -581,14 +1002,15 @@ program ft4_stock_trace
   integer :: ibmin, ibmax, ibstp, ibest, idfbest, istart, it, np
   integer :: hbits(2*NN), ns1, ns2, ns3, ns4, nsync_qual
   integer :: mcq(29), nappasses(0:5), naptypes(0:5,4), ndepth, nsp, isp, iaptype
-  integer :: i3, n3, l1
+  integer :: ndecodes, nd1, nd2, idupe
+  integer :: probe_index
   integer*1 :: apbits(174), apmask(174), message91(91), cw(174), message77(77), rvec(77)
   integer*4 :: i4tone(103)
   logical :: badsync, doosd, dosubtract
   logical :: unpk77_success
-  character(len=37) :: decoded, msgsent
+  character(len=37) :: decoded
+  character(len=37) :: decodes(100)
   character(len=77) :: c77
-  character(len=12) :: mycall, hiscall, hiscall0
   complex :: ctwk(2*NSS), ctwk2(2*NSS,-16:16)
   complex :: cd2(0:NDMAX-1), cb(0:NDMAX-1), cd(0:NN*NSS-1)
   type(hdr) :: h
@@ -609,29 +1031,6 @@ program ft4_stock_trace
   apbits = 0
   apbits(1) = 99
   apbits(30) = 99
-  mycall = 'K1ABC'
-  hiscall = 'W9XYZ'
-  hiscall0 = hiscall
-  dxcall13 = hiscall
-  mycall13 = mycall
-  l1 = index(mycall, char(0))
-  if (l1 .ne. 0) mycall(l1:) = ' '
-  l1 = index(hiscall, char(0))
-  if (l1 .ne. 0) hiscall(l1:) = ' '
-  if (len(trim(mycall)) .ge. 3) then
-     if (len(trim(hiscall0)) .lt. 3) hiscall0 = mycall
-     decoded = trim(mycall) // ' ' // trim(hiscall0) // ' RR73'
-     i3 = -1
-     n3 = -1
-     call pack77(decoded, i3, n3, c77)
-     call unpack77(c77, 1, msgsent, unpk77_success)
-     if (i3 .eq. 1 .and. decoded .eq. msgsent .and. unpk77_success) then
-        read(c77, '(77i1)') message77
-        message77 = mod(message77 + rvec, 2)
-        call encode174_91(message77, cw)
-        apbits = 2*cw - 1
-     endif
-  endif
 
   open(10, file=trim(wav_path), status='old', access='stream', iostat=ios)
   if (ios .ne. 0) stop 1
@@ -664,8 +1063,19 @@ program ft4_stock_trace
      dosubtract = .false.
      doosd = .false.
   endif
+  ndecodes = 0
+  nd1 = 0
+  nd2 = 0
+  decodes = ' '
 
   do isp = 1, nsp
+     if (isp .eq. 2) then
+        if (ndecodes .eq. 0) exit
+        nd1 = ndecodes
+     elseif (isp .eq. 3) then
+        nd2 = ndecodes - nd1
+        if (nd2 .eq. 0) exit
+     endif
      savg = 0.0
      sbase = 0.0
      candidate = 0.0
@@ -803,19 +1213,56 @@ program ft4_stock_trace
               call unpack77(c77, 1, decoded, unpk77_success)
               if (.not. unpk77_success) cycle
               dt = real(ibest) / 666.67
-              print '(a,i0,a,i0,a,i0,a,i0,a,i0,a,i0,a,f8.4,a,f8.4,a,a)', &
-                 'decode pass=', isp, ' cand=', i, ' segment=', iseg, ' ipass=', ipass, &
-                 ' ntype=', ntype, ' nharderror=', nharderror, &
-                 ' dt=', dt - 0.5, ' freq=', f1, ' message=', trim(decoded)
               if (dosubtract) then
                  call get_ft4_tones_from_77bits(message77, i4tone)
                  call subtractft4(dd, i4tone, f1, dt)
               endif
+              idupe = 0
+              do np = 1, ndecodes
+                 if (decodes(np) .eq. decoded) idupe = 1
+              end do
+              if (idupe .eq. 1) exit
+              ndecodes = ndecodes + 1
+              decodes(ndecodes) = decoded
+              print '(a,i0,a,i0,a,i0,a,i0,a,i0,a,i0,a,f8.4,a,f8.4,a,a)', &
+                 'decode pass=', isp, ' cand=', i, ' segment=', iseg, ' ipass=', ipass, &
+                 ' ntype=', ntype, ' nharderror=', nharderror, &
+                 ' dt=', dt - 0.5, ' freq=', f1, ' message=', trim(decoded)
+              print '(a,i0,a,i0,a,es16.8,a,es16.8,a,a)', &
+                 'subtract pass=', isp, ' cand=', i, ' dt_internal=', dt, &
+                 ' freq_exact=', f1, ' bits=', c77
               exit
            end do
            if (nharderror .ge. 0) exit
         end do
      end do
+     write(*,'(a,i0,a,es16.8,a,es16.8,a)',advance='no') 'residual pass=', isp, &
+        ' sum=', sum(dd), ' sqsum=', sum(dd*dd), ' probes='
+     do probe_index = 1, 10
+        select case (probe_index)
+        case (1)
+           write(*,'(es16.8)',advance='no') dd(1)
+        case (2)
+           write(*,'(a,es16.8)',advance='no') ',', dd(2)
+        case (3)
+           write(*,'(a,es16.8)',advance='no') ',', dd(3)
+        case (4)
+           write(*,'(a,es16.8)',advance='no') ',', dd(4)
+        case (5)
+           write(*,'(a,es16.8)',advance='no') ',', dd(577)
+        case (6)
+           write(*,'(a,es16.8)',advance='no') ',', dd(1153)
+        case (7)
+           write(*,'(a,es16.8)',advance='no') ',', dd(4097)
+        case (8)
+           write(*,'(a,es16.8)',advance='no') ',', dd(24001)
+        case (9)
+           write(*,'(a,es16.8)',advance='no') ',', dd(48001)
+        case (10)
+           write(*,'(a,es16.8)',advance='no') ',', dd(72576)
+        end select
+     end do
+     write(*,*)
   end do
 end program ft4_stock_trace
 """
@@ -1379,7 +1826,7 @@ def build_ft2_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     return gen_bin, decode_bin, frame_bin, trace_bin
 
 
-def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Path, Path, Path]:
+def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     ft4_root = source_root / "lib" / "ft4"
     ft8_root = source_root / "lib" / "ft8"
     lib_root = source_root / "lib"
@@ -1388,7 +1835,10 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     gen_src = build_root / "ft4_ref_gen.f90"
     frame_src = build_root / "ft4_ref_frame.f90"
     debug_src = build_root / "ft4_stock_debug.f90"
+    search_src = build_root / "ft4_stock_search.f90"
+    fixed_src = build_root / "ft4_stock_fixed.f90"
     subtract_src = build_root / "ft4_stock_subtract.f90"
+    subtract_bits_src = build_root / "ft4_stock_subtract_bits.f90"
     trace_src = build_root / "ft4_stock_trace.f90"
     metrics_src = build_root / "ft4_stock_metrics.f90"
     normalize_src = build_root / "normalizebmet.f90"
@@ -1396,7 +1846,10 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     write_text(gen_src, FT4_GEN_WRAPPER)
     write_text(frame_src, FT4_FRAME_WRAPPER)
     write_text(debug_src, FT4_DEBUG_WRAPPER)
+    write_text(search_src, FT4_SEARCH_WRAPPER)
+    write_text(fixed_src, FT4_FIXED_WRAPPER)
     write_text(subtract_src, FT4_SUBTRACT_WRAPPER)
+    write_text(subtract_bits_src, FT4_SUBTRACT_BITS_WRAPPER)
     write_text(trace_src, FT4_TRACE_WRAPPER)
     write_text(metrics_src, FT4_METRICS_WRAPPER)
     write_text(normalize_src, NORMALIZE_BMET)
@@ -1498,7 +1951,10 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     gen_bin = build_root / "ft4-ref-gen"
     frame_bin = build_root / "ft4-ref-frame"
     debug_bin = build_root / "ft4-stock-debug"
+    search_bin = build_root / "ft4-stock-search"
+    fixed_bin = build_root / "ft4-stock-fixed"
     subtract_bin = build_root / "ft4-stock-subtract"
+    subtract_bits_bin = build_root / "ft4-stock-subtract-bits"
     trace_bin = build_root / "ft4-stock-trace"
     metrics_bin = build_root / "ft4-stock-metrics"
     link_flags = [
@@ -1513,12 +1969,31 @@ def build_ft4_refs(source_root: Path, build_root: Path) -> tuple[Path, Path, Pat
     run(common_cmd + include_flags + ["-o", str(gen_bin), str(gen_src)] + objects + link_flags)
     run(common_cmd + include_flags + ["-o", str(frame_bin), str(frame_src)] + objects + link_flags)
     run(common_cmd + include_flags + ["-o", str(debug_bin), str(debug_src)] + objects + link_flags)
+    run(common_cmd + include_flags + ["-o", str(search_bin), str(search_src)] + objects + link_flags)
+    run(common_cmd + include_flags + ["-o", str(fixed_bin), str(fixed_src)] + objects + link_flags)
     run(
         common_cmd + include_flags + ["-o", str(subtract_bin), str(subtract_src)] + objects + link_flags
     )
+    run(
+        common_cmd
+        + include_flags
+        + ["-o", str(subtract_bits_bin), str(subtract_bits_src)]
+        + objects
+        + link_flags
+    )
     run(common_cmd + include_flags + ["-o", str(trace_bin), str(trace_src)] + objects + link_flags)
     run(common_cmd + include_flags + ["-o", str(metrics_bin), str(metrics_src)] + objects + link_flags)
-    return gen_bin, frame_bin, debug_bin, subtract_bin, trace_bin, metrics_bin
+    return (
+        gen_bin,
+        frame_bin,
+        debug_bin,
+        search_bin,
+        fixed_bin,
+        subtract_bin,
+        subtract_bits_bin,
+        trace_bin,
+        metrics_bin,
+    )
 
 
 def main() -> int:
@@ -1545,12 +2020,25 @@ def main() -> int:
         output_dir = Path(tempfile.mkdtemp(prefix="mode-refs-"))
 
     ft2_gen, ft2_decode, ft2_frame, ft2_trace = build_ft2_refs(source_root, output_dir / "ft2")
-    ft4_gen, ft4_frame, ft4_debug, ft4_subtract, ft4_trace, ft4_metrics = build_ft4_refs(source_root, output_dir / "ft4")
+    (
+        ft4_gen,
+        ft4_frame,
+        ft4_debug,
+        ft4_search,
+        ft4_fixed,
+        ft4_subtract,
+        ft4_subtract_bits,
+        ft4_trace,
+        ft4_metrics,
+    ) = build_ft4_refs(source_root, output_dir / "ft4")
     print(f"output_dir={output_dir}")
     print(f"ft4_ref_gen={ft4_gen}")
     print(f"ft4_ref_frame={ft4_frame}")
     print(f"ft4_stock_debug={ft4_debug}")
+    print(f"ft4_stock_search={ft4_search}")
+    print(f"ft4_stock_fixed={ft4_fixed}")
     print(f"ft4_stock_subtract={ft4_subtract}")
+    print(f"ft4_stock_subtract_bits={ft4_subtract_bits}")
     print(f"ft4_stock_trace={ft4_trace}")
     print(f"ft4_stock_metrics={ft4_metrics}")
     print(f"ft2_ref_gen={ft2_gen}")

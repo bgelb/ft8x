@@ -515,6 +515,7 @@ fn debug_run_decode_search_inner(
                 Vec::new()
             };
             let mut accepted_successes = Vec::new();
+            let mut accepted_subtractions = Vec::new();
             for success in successes_for_candidate {
                 if options.mode == Mode::Ft4
                     && ft4_plain_report_after_rr73_conflict(
@@ -541,6 +542,16 @@ fn debug_run_decode_search_inner(
                 }
                 if capture_trace {
                     accepted_successes.push(rendered_success_key(&success, &resolver));
+                    accepted_subtractions.push(SearchAcceptedTrace {
+                        text: success.payload.to_message(&resolver).to_text(),
+                        dt_seconds: success.candidate.dt_seconds,
+                        freq_hz: success.candidate.freq_hz,
+                        codeword_bits: success
+                            .codeword_bits
+                            .iter()
+                            .map(|bit| if *bit == 0 { '0' } else { '1' })
+                            .collect(),
+                    });
                 }
                 pass_successes.push(success);
             }
@@ -552,6 +563,7 @@ fn debug_run_decode_search_inner(
                     coarse_score: candidate.score,
                     raw_successes,
                     accepted_successes,
+                    accepted_subtractions,
                 });
             }
         }
@@ -559,7 +571,12 @@ fn debug_run_decode_search_inner(
             pass_traces.push(SearchPassTrace {
                 pass_index: pass,
                 candidates: candidate_traces,
+                residual_signature: Some(compute_residual_signature(&residual_audio)),
             });
+        }
+        let pass_added_unique = !pass_successes.is_empty();
+        if options.mode == Mode::Ft4 && !pass_added_unique {
+            break;
         }
         if !pass_changed {
             break;
@@ -584,6 +601,25 @@ fn debug_run_decode_search_inner(
             counters,
         },
         passes: pass_traces,
+    }
+}
+
+fn compute_residual_signature(audio: &AudioBuffer) -> SearchResidualSignature {
+    const PROBE_INDICES: [usize; 10] = [0, 1, 2, 3, 576, 1_152, 4_096, 24_000, 48_000, 72_575];
+    let sample_sum = audio.samples.iter().map(|&sample| sample as f64).sum();
+    let sample_sq_sum = audio
+        .samples
+        .iter()
+        .map(|&sample| (sample as f64) * (sample as f64))
+        .sum();
+    let probe_values = PROBE_INDICES
+        .iter()
+        .filter_map(|&index| audio.samples.get(index).copied())
+        .collect();
+    SearchResidualSignature {
+        sample_sum,
+        sample_sq_sum,
+        probe_values,
     }
 }
 

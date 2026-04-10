@@ -806,21 +806,9 @@ fn gfsk_frequency_pulse(bt: f32, nsps: usize) -> Vec<f32> {
     (0..(3 * nsps))
         .map(|index| {
             let t = (index as f32 + 1.0 - 1.5 * nsps as f32) / nsps as f32;
-            0.5 * (erf_approx(c * bt * (t + 0.5)) - erf_approx(c * bt * (t - 0.5)))
+            0.5 * (libm::erff(c * bt * (t + 0.5)) - libm::erff(c * bt * (t - 0.5)))
         })
         .collect()
-}
-
-fn erf_approx(x: f32) -> f32 {
-    let sign = x.signum();
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let y = 1.0
-        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
-            + 0.254_829_6)
-            * t
-            * (-x * x).exp();
-    sign * y
 }
 
 pub fn channel_symbols_from_codeword_bits(

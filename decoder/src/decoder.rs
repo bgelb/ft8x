@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -292,6 +293,37 @@ pub struct Ft4MetricsDebug {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct Ft4SearchProbeBin {
+    pub bin: usize,
+    pub freq_hz: f32,
+    pub savg: f32,
+    pub sbase: f32,
+    pub savsm: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Ft4SearchProbeDebug {
+    pub target_freq_hz: f32,
+    pub df_hz: f32,
+    pub f_offset_hz: f32,
+    pub target_bin: usize,
+    pub candidate_bin: usize,
+    pub candidate_freq_hz: f32,
+    pub candidate_score: f32,
+    pub del: f32,
+    pub probe_bins: Vec<Ft4SearchProbeBin>,
+    pub top_candidates: Vec<DecodeCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchAcceptedTrace {
+    pub text: String,
+    pub dt_seconds: f32,
+    pub freq_hz: f32,
+    pub codeword_bits: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchCandidateTrace {
     pub coarse_start_seconds: f32,
     pub coarse_dt_seconds: f32,
@@ -299,12 +331,23 @@ pub struct SearchCandidateTrace {
     pub coarse_score: f32,
     pub raw_successes: Vec<String>,
     pub accepted_successes: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accepted_subtractions: Vec<SearchAcceptedTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResidualSignature {
+    pub sample_sum: f64,
+    pub sample_sq_sum: f64,
+    pub probe_values: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchPassTrace {
     pub pass_index: usize,
     pub candidates: Vec<SearchCandidateTrace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_signature: Option<SearchResidualSignature>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -404,6 +447,17 @@ fn long_input_samples(spec: &ModeSpec) -> usize {
     spec.tuning.long_input_samples
 }
 
+fn stock_window_audio<'a>(audio: &'a AudioBuffer, mode: Mode) -> Cow<'a, AudioBuffer> {
+    let max_samples = mode.spec().tuning.long_input_samples;
+    if audio.samples.len() <= max_samples {
+        Cow::Borrowed(audio)
+    } else {
+        let mut clipped = audio.clone();
+        clipped.samples.truncate(max_samples);
+        Cow::Owned(clipped)
+    }
+}
+
 fn sync8_early_threshold(spec: &ModeSpec) -> f32 {
     spec.tuning.sync_early_threshold
 }
@@ -450,8 +504,9 @@ pub fn debug_candidate_truth_wav_file(
     truth_codeword_bits: &[u8],
 ) -> Result<Option<CandidateDebugReport>, DecoderError> {
     let audio = load_wav(path)?;
+    let prepared = stock_window_audio(&audio, mode);
     Ok(debug_candidate_pcm_inner(
-        &audio,
+        &prepared,
         mode,
         dt_seconds,
         freq_hz,
@@ -482,7 +537,8 @@ pub fn debug_candidate_pcm(
     dt_seconds: f32,
     freq_hz: f32,
 ) -> Option<CandidateDebugReport> {
-    debug_candidate_pcm_inner(audio, mode, dt_seconds, freq_hz, None)
+    let prepared = stock_window_audio(audio, mode);
+    debug_candidate_pcm_inner(&prepared, mode, dt_seconds, freq_hz, None)
 }
 
 fn debug_candidate_pcm_inner(
@@ -734,6 +790,8 @@ pub fn debug_ft4_variants_wav_file(
 }
 
 pub fn debug_ft4_variants_pcm(audio: &AudioBuffer, freq_hz: f32) -> Vec<Ft4VariantDebug> {
+    let prepared = stock_window_audio(audio, Mode::Ft4);
+    let audio = prepared.as_ref();
     let spec = Mode::Ft4.spec();
     if audio.sample_rate_hz != spec.geometry.sample_rate_hz
         || audio.samples.len() < spec.geometry.symbol_samples
@@ -803,6 +861,8 @@ pub fn debug_ft4_metrics_pcm(
     dt_seconds: f32,
     freq_hz: f32,
 ) -> Option<Ft4MetricsDebug> {
+    let prepared = stock_window_audio(audio, Mode::Ft4);
+    let audio = prepared.as_ref();
     let spec = Mode::Ft4.spec();
     if audio.sample_rate_hz != spec.geometry.sample_rate_hz
         || audio.samples.len() < spec.geometry.symbol_samples
@@ -843,6 +903,15 @@ pub fn debug_ft4_metrics_pcm(
     })
 }
 
+pub fn debug_ft4_search_probe_wav_file(
+    path: impl AsRef<Path>,
+    target_freq_hz: f32,
+) -> Result<Option<Ft4SearchProbeDebug>, DecoderError> {
+    let audio = load_wav(path)?;
+    let prepared = stock_window_audio(&audio, Mode::Ft4);
+    Ok(search::debug_ft4_search_probe_pcm(&prepared, target_freq_hz))
+}
+
 pub fn debug_search_wav_file(
     path: impl AsRef<Path>,
     options: &DecodeOptions,
@@ -860,12 +929,13 @@ pub fn debug_search_pcm(
             "debug search tracing is not implemented for FT2".to_string(),
         ));
     }
-    let trace = session::debug_run_decode_search(audio, options)?;
+    let prepared = stock_window_audio(audio, options.mode);
+    let trace = session::debug_run_decode_search(&prepared, options)?;
     let final_report =
-        session::build_decode_report_with_resolver(audio, options, trace.search.clone(), None);
+        session::build_decode_report_with_resolver(&prepared, options, trace.search.clone(), None);
     Ok(SearchDebugReport {
-        sample_rate_hz: audio.sample_rate_hz,
-        duration_seconds: audio.samples.len() as f32 / audio.sample_rate_hz as f32,
+        sample_rate_hz: prepared.sample_rate_hz,
+        duration_seconds: prepared.samples.len() as f32 / prepared.sample_rate_hz as f32,
         passes: trace.passes,
         final_report,
     })
@@ -888,7 +958,8 @@ pub fn debug_ft2_trace_pcm(
             "ft2 trace requires --mode ft2".to_string(),
         ));
     }
-    debug_ft2_trace(audio, options)
+    let prepared = stock_window_audio(audio, options.mode);
+    debug_ft2_trace(&prepared, options)
 }
 
 pub fn subtract_truth_pcm(
@@ -898,8 +969,9 @@ pub fn subtract_truth_pcm(
     freq_hz: f32,
     truth_codeword_bits: &[u8],
 ) -> Option<AudioBuffer> {
+    let prepared = stock_window_audio(audio, mode);
     let payload = unpack_message_for_mode(mode, truth_codeword_bits)?;
-    let mut residual = audio.clone();
+    let mut residual = prepared.into_owned();
     let success = SuccessfulDecode {
         mode,
         payload: payload.clone(),
@@ -983,11 +1055,12 @@ pub fn decode_pcm(
     audio: &AudioBuffer,
     options: &DecodeOptions,
 ) -> Result<DecodeReport, DecoderError> {
+    let prepared = stock_window_audio(audio, options.mode);
     if options.mode == Mode::Ft2 {
-        return decode_ft2(audio, options);
+        return decode_ft2(&prepared, options);
     }
     let mut session = DecoderSession::new();
-    let mut updates = session.decode_available(audio, options)?;
+    let mut updates = session.decode_available(&prepared, options)?;
     if let Some(update) = updates.pop() {
         Ok(update.report)
     } else {
@@ -1002,12 +1075,13 @@ pub fn decode_pcm_with_state(
     options: &DecodeOptions,
     state: Option<&DecoderState>,
 ) -> Result<(DecodeReport, DecoderState), DecoderError> {
+    let prepared = stock_window_audio(audio, options.mode);
     if options.mode == Mode::Ft2 {
-        let report = decode_ft2(audio, options)?;
+        let report = decode_ft2(&prepared, options)?;
         return Ok((report, state.cloned().unwrap_or_default()));
     }
     let mut session = DecoderSession::new();
-    let mut updates = session.decode_available_with_state(audio, options, state)?;
+    let mut updates = session.decode_available_with_state(&prepared, options, state)?;
     if let Some((update, state)) = updates.pop() {
         Ok((update.report, state))
     } else {

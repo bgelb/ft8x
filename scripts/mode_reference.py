@@ -15,7 +15,10 @@ DEFAULT_FT2_REF_FRAME = DEFAULT_FT2_REF_ROOT / "ft2-ref-frame"
 DEFAULT_FT2_REF_TRACE = DEFAULT_FT2_REF_ROOT / "ft2-ref-trace"
 DEFAULT_FT4_REF_ROOT = Path("/private/tmp/mode-refs-test/ft4")
 DEFAULT_FT4_STOCK_DEBUG = DEFAULT_FT4_REF_ROOT / "ft4-stock-debug"
+DEFAULT_FT4_STOCK_SEARCH = DEFAULT_FT4_REF_ROOT / "ft4-stock-search"
+DEFAULT_FT4_STOCK_FIXED = DEFAULT_FT4_REF_ROOT / "ft4-stock-fixed"
 DEFAULT_FT4_STOCK_SUBTRACT = DEFAULT_FT4_REF_ROOT / "ft4-stock-subtract"
+DEFAULT_FT4_STOCK_SUBTRACT_BITS = DEFAULT_FT4_REF_ROOT / "ft4-stock-subtract-bits"
 DEFAULT_FT4_STOCK_TRACE = DEFAULT_FT4_REF_ROOT / "ft4-stock-trace"
 DEFAULT_FT4_STOCK_METRICS = DEFAULT_FT4_REF_ROOT / "ft4-stock-metrics"
 
@@ -66,11 +69,32 @@ def locate_ft4_stock_debug(explicit: str | None = None) -> Path:
     return _resolve_existing(DEFAULT_FT4_STOCK_DEBUG, "FT4 stock debug helper")
 
 
+def locate_ft4_stock_search(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("FT4_STOCK_SEARCH")
+    if value:
+        return _resolve_existing(Path(value), "FT4 stock search helper")
+    return _resolve_existing(DEFAULT_FT4_STOCK_SEARCH, "FT4 stock search helper")
+
+
+def locate_ft4_stock_fixed(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("FT4_STOCK_FIXED")
+    if value:
+        return _resolve_existing(Path(value), "FT4 stock fixed helper")
+    return _resolve_existing(DEFAULT_FT4_STOCK_FIXED, "FT4 stock fixed helper")
+
+
 def locate_ft4_stock_subtract(explicit: str | None = None) -> Path:
     value = explicit or os.environ.get("FT4_STOCK_SUBTRACT")
     if value:
         return _resolve_existing(Path(value), "FT4 stock subtraction helper")
     return _resolve_existing(DEFAULT_FT4_STOCK_SUBTRACT, "FT4 stock subtraction helper")
+
+
+def locate_ft4_stock_subtract_bits(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("FT4_STOCK_SUBTRACT_BITS")
+    if value:
+        return _resolve_existing(Path(value), "FT4 stock subtraction-bits helper")
+    return _resolve_existing(DEFAULT_FT4_STOCK_SUBTRACT_BITS, "FT4 stock subtraction-bits helper")
 
 
 def locate_ft4_stock_trace(explicit: str | None = None) -> Path:
