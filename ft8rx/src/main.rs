@@ -21,7 +21,7 @@ use qso::{
 };
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream, play_tone};
 use rigctl::{
-    Band, K3s, K3sConfig, Mode, TxMeterMode, detect_k3s_audio_device,
+    Band, K3s, K3sConfig, Mode as RigMode, TxMeterMode, detect_k3s_audio_device,
     detect_k3s_audio_output_device,
 };
 use rustfft::FftPlanner;
@@ -41,7 +41,6 @@ use tracing_subscriber::Registry;
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 
-const SLOT_SECONDS: u64 = 15;
 const DECODER_SAMPLE_RATE_HZ: u32 = 12_000;
 const WATERFALL_MAX_HZ: f32 = 4_000.0;
 const WATERFALL_BUCKETS: usize = 400;
@@ -102,6 +101,7 @@ enum AppError {
 #[derive(Debug, Clone)]
 struct DisplayState {
     rig: Option<RigSnapshot>,
+    app_mode: DecoderMode,
     audio: AudioDevice,
     capture_rms_dbfs: f32,
     capture_latest_sample_time: Option<SystemTime>,
@@ -124,7 +124,7 @@ struct DisplayState {
 #[derive(Debug, Clone)]
 struct RigSnapshot {
     frequency_hz: u64,
-    mode: Mode,
+    mode: RigMode,
     band: Band,
     configured_power_w: Option<f32>,
     bar_graph: Option<u8>,
@@ -212,7 +212,11 @@ impl QueueControlPlane {
 
 #[derive(Debug, Clone)]
 enum RigCommand {
-    Configure { band: Band, power_w: f32 },
+    Configure {
+        band: Band,
+        power_w: f32,
+        app_mode: DecoderMode,
+    },
     Tune10s,
 }
 
@@ -295,6 +299,7 @@ struct WebSnapshot {
     rig_frequency_hz: Option<u64>,
     rig_mode: String,
     rig_band: String,
+    app_mode: String,
     rig_power_w: Option<f32>,
     rig_bargraph: Option<u8>,
     rig_is_tx: Option<bool>,
@@ -434,6 +439,7 @@ struct WebDirectCallLog {
 struct RigConfigRequest {
     band: String,
     power_w: f32,
+    app_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,6 +547,7 @@ struct WebQsoHistoryEntry {
     age_seconds: u64,
     callsign: String,
     band: String,
+    mode: String,
     sent_info: String,
     received_info: String,
     got_roger: bool,
@@ -551,6 +558,7 @@ struct WebQsoHistoryEntry {
 
 #[derive(Debug, Clone)]
 struct StationTracker {
+    mode: DecoderMode,
     stations: BTreeMap<String, StationState>,
     logs: VecDeque<LoggedDecode>,
     hash12_resolutions: BTreeMap<u16, String>,
@@ -618,6 +626,7 @@ struct WorkQueueState {
     auto_enabled: bool,
     our_call: String,
     current_band: Option<String>,
+    current_mode: DecoderMode,
     auto_add_all_decoded_calls: bool,
     auto_add_decoded_min_count_5m: u32,
     auto_add_direct_calls: bool,
@@ -749,6 +758,7 @@ struct QsoJsonlCache {
 struct QsoJsonlSessionSummary {
     partner_call: String,
     rig_band: Option<String>,
+    app_mode: Option<String>,
     started_at: Option<SystemTime>,
     ended_at: Option<SystemTime>,
     last_seen_at: Option<SystemTime>,
@@ -769,6 +779,7 @@ struct QsoHistoryKey {
 impl Default for StationTracker {
     fn default() -> Self {
         Self {
+            mode: DecoderMode::Ft8,
             stations: BTreeMap::new(),
             logs: VecDeque::new(),
             hash12_resolutions: BTreeMap::new(),
@@ -780,6 +791,10 @@ impl Default for StationTracker {
 impl WorkQueueState {
     fn set_current_band(&mut self, band: Option<String>) {
         self.current_band = band;
+    }
+
+    fn set_current_mode(&mut self, mode: DecoderMode) {
+        self.current_mode = mode;
     }
 
     fn worked_band_key(callsign: &str, band: &str) -> WorkedBandKey {
@@ -798,6 +813,7 @@ impl WorkQueueState {
             auto_enabled: false,
             our_call: config.station.our_call.clone(),
             current_band: None,
+            current_mode: DecoderMode::Ft8,
             auto_add_all_decoded_calls: config.queue.auto_add_all_decoded_calls_default,
             auto_add_decoded_min_count_5m: config
                 .queue
@@ -1289,6 +1305,10 @@ impl WorkQueueState {
             self.scheduler_status = "auto disabled".to_string();
             return None;
         }
+        if self.current_mode == DecoderMode::Ft2 {
+            self.scheduler_status = "ft2 rx-only".to_string();
+            return None;
+        }
         if qso_busy {
             self.scheduler_status = "waiting: qso active".to_string();
             return None;
@@ -1311,11 +1331,22 @@ impl WorkQueueState {
         let cq_paused_for_low_activity = self.cq_paused_for_low_activity(unique_calls_last_5m);
         if self.cq_enabled && !cq_paused_for_low_activity && self.should_choose_cq(now) {
             let tx_slot_family = if self.next_cq_parity_flipped {
-                Some(qso::slot_family(next_slot_boundary(now)).opposite())
+                Some(
+                    qso::slot_family_for_mode(
+                        self.current_mode,
+                        next_slot_boundary_for_mode(self.current_mode, now),
+                    )
+                    .opposite(),
+                )
             } else {
                 None
             }
-            .unwrap_or_else(|| qso::slot_family(next_slot_boundary(now)));
+            .unwrap_or_else(|| {
+                qso::slot_family_for_mode(
+                    self.current_mode,
+                    next_slot_boundary_for_mode(self.current_mode, now),
+                )
+            });
             self.next_cq_parity_flipped = false;
             self.scheduler_status = if normal_pick.is_some() {
                 format!("dispatching cq at {}%", self.cq_percent)
@@ -1418,7 +1449,11 @@ impl WorkQueueState {
             odd_tx_freq_hz: self.odd_tx_freq_hz,
             no_message_retry_delay_seconds: self.no_message_retry_delay.as_secs(),
             no_forward_retry_delay_seconds: self.no_forward_retry_delay.as_secs(),
-            scheduler_status: self.scheduler_status.clone(),
+            scheduler_status: if self.current_mode == DecoderMode::Ft2 {
+                "ft2 rx-only".to_string()
+            } else {
+                self.scheduler_status.clone()
+            },
             entries,
         }
     }
@@ -1514,7 +1549,7 @@ impl WorkQueueState {
         let last_heard_message = station.last_message_kind;
         let last_heard_slot_family = Some(station.last_heard_slot_family);
         let latest_same_family_slot =
-            latest_slot_index_for_family(now, station.last_heard_slot_family);
+            latest_slot_index_for_family(self.current_mode, now, station.last_heard_slot_family);
         if latest_same_family_slot.saturating_sub(station.last_heard_slot_index) > 2 {
             return QueueEntryStatus {
                 last_heard_at,
@@ -1550,7 +1585,7 @@ impl WorkQueueState {
     }
 
     fn has_recent_priority_direct_for_slot(&self, slot_start: SystemTime, now: SystemTime) -> bool {
-        let slot_index = slot_index(slot_start);
+        let slot_index = slot_index_for_mode(self.current_mode, slot_start);
         self.entries.iter().any(|entry| {
             entry.direct_pending
                 && now >= entry.ok_to_schedule_after
@@ -1568,7 +1603,10 @@ impl WorkQueueState {
         let tx_slot_family = entry
             .last_direct_slot_family
             .map(|family| family.opposite())
-            .unwrap_or(qso::slot_family(next_slot_boundary(now)));
+            .unwrap_or(qso::slot_family_for_mode(
+                self.current_mode,
+                next_slot_boundary_for_mode(self.current_mode, now),
+            ));
         QueueDispatch {
             kind: QueueDispatchKind::Station {
                 callsign: entry.callsign.clone(),
@@ -1624,7 +1662,10 @@ impl WorkQueueState {
         let tx_slot_family = tracker
             .start_info(&entry.callsign)
             .map(|info| info.last_heard_slot_family.opposite())
-            .unwrap_or(qso::slot_family(next_slot_boundary(now)));
+            .unwrap_or(qso::slot_family_for_mode(
+                self.current_mode,
+                next_slot_boundary_for_mode(self.current_mode, now),
+            ));
         Some(QueueDispatch {
             kind: QueueDispatchKind::Station {
                 callsign: entry.callsign.clone(),
@@ -1657,7 +1698,8 @@ impl WorkQueueState {
         }
         let slot_family = entry.last_direct_slot_family?;
         let slot_index = entry.last_direct_slot_index?;
-        let latest_same_family_slot = latest_slot_index_for_family(now, slot_family);
+        let latest_same_family_slot =
+            latest_slot_index_for_family(self.current_mode, now, slot_family);
         if latest_same_family_slot.saturating_sub(slot_index) > 2 {
             return None;
         }
@@ -1674,7 +1716,10 @@ impl WorkQueueState {
         if !self.cq_enabled || self.cq_percent == 0 {
             return false;
         }
-        let roll = ((slot_index(now).wrapping_mul(1103515245).wrapping_add(12345)) % 100) as u8;
+        let roll = ((slot_index_for_mode(self.current_mode, now)
+            .wrapping_mul(1103515245)
+            .wrapping_add(12345))
+            % 100) as u8;
         roll < self.cq_percent
     }
 
@@ -1749,6 +1794,7 @@ struct QsoJsonlScan {
 #[derive(Debug)]
 struct DecodeJob {
     slot_start: SystemTime,
+    mode: DecoderMode,
     stage: DecodeStage,
     capture_end: SystemTime,
     samples: Vec<i16>,
@@ -1760,6 +1806,7 @@ struct DecodeJob {
 enum DecodeEvent {
     Finished {
         slot_start: SystemTime,
+        mode: DecoderMode,
         stage: DecodeStage,
         wall_ms: u128,
         result: Result<StageDecodeReport, AppError>,
@@ -1797,19 +1844,19 @@ impl SlotStageState {
 
     fn next_due_stage(
         self,
+        mode: DecoderMode,
         slot_start: SystemTime,
         latest_sample_time: Option<SystemTime>,
     ) -> Option<DecodeStage> {
         let latest_sample_time = latest_sample_time?;
-        for stage in [
-            DecodeStage::Early41,
-            DecodeStage::Early47,
-            DecodeStage::Full,
-        ] {
+        for stage in DecodeStage::ordered() {
+            if !decode_stage_enabled_for_mode(mode, stage) {
+                continue;
+            }
             if self.is_handled(stage) {
                 continue;
             }
-            let ready_at = stage_capture_end(slot_start, stage).ok()?;
+            let ready_at = stage_capture_end(mode, slot_start, stage).ok()?;
             if latest_sample_time >= ready_at {
                 return Some(stage);
             }
@@ -2519,6 +2566,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
                   <select id="rig-band" class="control-input"></select>
                 </div>
                 <div class="input-wrap">
+                  <div class="label">Mode</div>
+                  <select id="rig-app-mode" class="control-input"></select>
+                </div>
+                <div class="input-wrap">
                   <div class="label">Power</div>
                   <select id="rig-power" class="control-input"></select>
                 </div>
@@ -2693,14 +2744,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="maps">
       <section class="panel">
         <div class="panel-head">
-          <div class="label">Even Slots (:00 / :30)</div>
+          <div class="label">Even Slots</div>
           <button id="queue-even-map" class="button secondary" type="button">Add To Queue</button>
         </div>
         <div id="even-map" class="map-grid"></div>
       </section>
       <section class="panel">
         <div class="panel-head">
-          <div class="label">Odd Slots (:15 / :45)</div>
+          <div class="label">Odd Slots</div>
           <button id="queue-odd-map" class="button secondary" type="button">Add To Queue</button>
         </div>
         <div id="odd-map" class="map-grid"></div>
@@ -2733,6 +2784,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     const canvas = document.getElementById('waterfall');
     const ctx = canvas.getContext('2d');
     const BAND_OPTIONS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m', '6m'];
+    const APP_MODE_OPTIONS = ['FT8', 'FT4', 'FT2'];
     const POWER_OPTIONS = ['5', '10', '20', '50', '100'];
     let selectedCall = null;
     let lastSnapshot = null;
@@ -2757,6 +2809,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
         const option = document.createElement('option');
         option.value = power;
         option.textContent = `${power} W`;
+        select.appendChild(option);
+      }
+    }
+    function initRigModeOptions() {
+      const select = document.getElementById('rig-app-mode');
+      if (select.options.length) return;
+      for (const mode of APP_MODE_OPTIONS) {
+        const option = document.createElement('option');
+        option.value = mode;
+        option.textContent = mode;
         select.appendChild(option);
       }
     }
@@ -2904,10 +2966,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function applyRigSettings() {
       const band = document.getElementById('rig-band').value;
+      const appMode = document.getElementById('rig-app-mode').value;
       const power = Number(document.getElementById('rig-power').value);
-      pendingRigConfig = { band, power_w: power };
+      pendingRigConfig = { band, app_mode: appMode, power_w: power };
       await postJson('/api/rig/config', {
         band,
+        app_mode: appMode,
         power_w: power,
       });
       scheduleRefresh(10);
@@ -3004,8 +3068,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     function renderRigControls(data) {
       initRigBandOptions();
+      initRigModeOptions();
       initRigPowerOptions();
       const bandInput = document.getElementById('rig-band');
+      const modeInput = document.getElementById('rig-app-mode');
       const powerInput = document.getElementById('rig-power');
       const tune = document.getElementById('rig-tune');
       const hint = document.getElementById('rig-hint');
@@ -3016,22 +3082,28 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (
         pendingRigConfig &&
         data.rig_band === pendingRigConfig.band &&
+        data.app_mode === pendingRigConfig.app_mode &&
         data.rig_power_w != null &&
         Math.abs(data.rig_power_w - pendingRigConfig.power_w) < 0.05
       ) {
         pendingRigConfig = null;
       }
       const effectiveBand = pendingRigConfig?.band ?? data.rig_band;
+      const effectiveMode = pendingRigConfig?.app_mode ?? data.app_mode;
       const effectivePower =
         pendingRigConfig?.power_w ??
         (data.rig_power_w == null ? null : Math.round(data.rig_power_w).toString());
       if (rigAvailable && effectiveBand) {
         bandInput.value = effectiveBand;
       }
+      if (rigAvailable && effectiveMode) {
+        modeInput.value = effectiveMode;
+      }
       if (rigAvailable && effectivePower != null) {
         powerInput.value = String(effectivePower);
       }
       bandInput.disabled = !rigAvailable || txBusy || qsoActive;
+      modeInput.disabled = !rigAvailable || txBusy || qsoActive;
       powerInput.disabled = !rigAvailable || txBusy;
       tune.disabled = !rigAvailable || tuneActive || qsoActive || txBusy;
       if (!rigAvailable) {
@@ -3041,11 +3113,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       } else if (txBusy) {
         hint.textContent = 'Rig control disabled while transmit is active.';
       } else if (qsoActive) {
-        hint.textContent = 'Power can be changed mid-QSO while not transmitting. Band changes wait until the QSO is idle.';
+        hint.textContent = 'Power can be changed mid-QSO while not transmitting. Band and mode changes wait until the QSO is idle.';
       } else if (pendingRigConfig) {
-        hint.textContent = `Applying ${pendingRigConfig.band} at ${pendingRigConfig.power_w.toFixed(0)} W...`;
+        hint.textContent = `Applying ${pendingRigConfig.band} ${pendingRigConfig.app_mode} at ${pendingRigConfig.power_w.toFixed(0)} W...`;
       } else {
-        hint.textContent = `Rig is ${bandInput.value || data.rig_band} at ${powerInput.value || '-'} W. Tune sends a 1000 Hz tone for 10 seconds.`;
+        hint.textContent = `Rig is ${bandInput.value || data.rig_band} ${modeInput.value || data.app_mode} at ${powerInput.value || '-'} W. Tune sends a 1000 Hz tone for 10 seconds.`;
       }
     }
     function renderWaterfall(rows) {
@@ -3250,6 +3322,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const queue = data.queue || {};
       const station = selectedStation(data);
       const qso = data.qso || {};
+      const rxOnly = data.app_mode === 'FT2';
       const readyQueueEntry = (queue.entries || []).find((entry) => entry.ready);
       const candidateStation = station || (readyQueueEntry ? stationMap(data).get(readyQueueEntry.callsign) : null);
       const txParity = qso.active ? qso.tx_slot_family : inferredTxParity(candidateStation);
@@ -3277,6 +3350,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       snr.textContent = qso.latest_partner_snr_db == null ? '-' : `${qso.latest_partner_snr_db} dB`;
       if (qso.active) {
         hint.textContent = `TX ${qso.selected_tx_freq_hz?.toFixed(0) ?? '-'} Hz, ${qso.tx_slot_family ?? '?'} slots. Escape stops immediately.`;
+      } else if (rxOnly) {
+        hint.textContent = 'FT2 is RX-only in ft8rx. Queueing and decode display remain active, but CQ and QSO TX are disabled.';
       } else if (data.rig_tune_active) {
         hint.textContent = 'Tune tone active. Queue dispatch is paused until TX returns to RX.';
       } else if (candidateStation) {
@@ -3305,9 +3380,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
         transcript.scrollTop = transcript.scrollHeight;
       }
       stop.disabled = !qso.active && !qso.tx_active;
-      autoToggle.disabled = !!data.rig_tune_active;
-      evenAutoPick.disabled = !autoPickAllowed(data, 'even');
-      oddAutoPick.disabled = !autoPickAllowed(data, 'odd');
+      autoToggle.disabled = !!data.rig_tune_active || rxOnly;
+      evenFreqInput.disabled = !!qso.tx_active || !!data.rig_tune_active || rxOnly;
+      oddFreqInput.disabled = !!qso.tx_active || !!data.rig_tune_active || rxOnly;
+      evenAutoPick.disabled = rxOnly || !autoPickAllowed(data, 'even');
+      oddAutoPick.disabled = rxOnly || !autoPickAllowed(data, 'odd');
       evenAutoPick.textContent = autoPickAllowed(data, 'even') ? 'Auto-Pick Even' : 'Auto-Pick Even';
       oddAutoPick.textContent = autoPickAllowed(data, 'odd') ? 'Auto-Pick Odd' : 'Auto-Pick Odd';
     }
@@ -3456,6 +3533,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div>Ago</div>
           <div>Call</div>
           <div>Bd</div>
+          <div>Md</div>
           <div>Rpl</div>
           <div>R</div>
           <div>73</div>
@@ -3475,6 +3553,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="history-cell muted">${escapeHtml(entry.age)}</div>
           <div class="history-cell">${renderCallValue(escapeHtml(entry.callsign), entry.callsign)}</div>
           <div class="history-cell muted">${escapeHtml(entry.band ?? '-')}</div>
+          <div class="history-cell muted">${escapeHtml(entry.mode ?? '-')}</div>
           <div class="history-cell muted">${entry.got_reply ? 'Y' : '-'}</div>
           <div class="history-cell muted">${entry.got_roger ? 'Y' : '-'}</div>
           <div class="history-cell muted">${entry.reached_73 ? 'Y' : '-'}</div>
@@ -3502,18 +3581,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
         const data = await response.json();
         lastSnapshot = data;
         document.getElementById('time').textContent = data.time_utc || '-';
-        const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(3)} MHz`;
+      const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(4)} MHz`;
       const rigDir = data.rig_is_tx == null ? '?' : (data.rig_is_tx ? 'TX' : 'RX');
       const rigPower = data.rig_power_w == null ? '-' : `${data.rig_power_w.toFixed(1)}W`;
       const rigBg = data.rig_bargraph == null ? '-' : data.rig_bargraph;
-      document.getElementById('rig').textContent = `${freq} ${data.rig_mode} ${data.rig_band} ${rigDir} P=${rigPower} BG=${rigBg}`;
+      document.getElementById('rig').textContent = `${freq} ${data.rig_mode}/${data.app_mode} ${data.rig_band} ${rigDir} P=${rigPower} BG=${rigBg}`;
       document.getElementById('audio').textContent =
         `t=${data.audio_stats.latest_sample ?? '-'} ch=${data.audio_stats.selected_channel} L=${data.audio_stats.left_dbfs.toFixed(1)} R=${data.audio_stats.right_dbfs.toFixed(1)} all=${data.audio_stats.overall_dbfs.toFixed(1)} rec=${data.audio_stats.recoveries}`;
       document.getElementById('status').textContent = data.decode_status || '-';
       document.getElementById('slot').textContent =
         `${data.current_slot}${data.last_done_slot ? ` last=${data.last_done_slot}` : ''}`;
       document.getElementById('times').textContent =
-        `e=${fmtSec(data.decode_times.early_seconds)} m=${fmtSec(data.decode_times.mid_seconds)} l=${fmtSec(data.decode_times.late_seconds)} tx=${fmtSec(data.decode_times.tx_margin_seconds)}`;
+        data.app_mode === 'FT8'
+          ? `e=${fmtSec(data.decode_times.early_seconds)} m=${fmtSec(data.decode_times.mid_seconds)} l=${fmtSec(data.decode_times.late_seconds)} tx=${fmtSec(data.decode_times.tx_margin_seconds)}`
+          : `m=${fmtSec(data.decode_times.mid_seconds)} tx=${fmtSec(data.decode_times.tx_margin_seconds)}`;
       document.getElementById('dtstats').textContent =
         `cur=${fmtSec(data.dt_stats.current_mean_seconds)}/${fmtSec(data.dt_stats.current_median_seconds)} sd=${fmtSec(data.dt_stats.current_stddev_seconds)} n=${data.dt_stats.current_count} 10m=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}/${fmtSec(data.dt_stats.ten_minute_median_seconds)} n=${data.dt_stats.ten_minute_count}`;
       document.getElementById('count').textContent = `${data.decodes.length} visible`;
@@ -3555,6 +3636,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     refresh().catch(console.error);
     initRigBandOptions();
+    initRigModeOptions();
     initRigPowerOptions();
     document.getElementById('detail-logs').addEventListener('scroll', (event) => {
       const node = event.currentTarget;
@@ -3584,6 +3666,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       tuneRigForTenSeconds().catch((error) => console.error(error));
     });
     document.getElementById('rig-band').addEventListener('change', () => {
+      applyRigSettings().catch((error) => {
+        pendingRigConfig = null;
+        console.error(error);
+      });
+    });
+    document.getElementById('rig-app-mode').addEventListener('change', () => {
       applyRigSettings().catch((error) => {
         pendingRigConfig = null;
         console.error(error);
@@ -4260,6 +4348,18 @@ async fn api_rig_config_handler(
             );
         }
     };
+    let app_mode = match request.app_mode.parse::<DecoderMode>() {
+        Ok(mode) => mode,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiStatus {
+                    ok: false,
+                    message: error,
+                }),
+            );
+        }
+    };
     if !(0.1..=110.0).contains(&request.power_w) {
         return (
             StatusCode::BAD_REQUEST,
@@ -4278,9 +4378,19 @@ async fn api_rig_config_handler(
             }),
         );
     }
+    if snapshot.qso.active && snapshot.app_mode != app_mode.as_str().to_uppercase() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiStatus {
+                ok: false,
+                message: "cannot change mode during active qso".to_string(),
+            }),
+        );
+    }
     state.rig_control.enqueue(RigCommand::Configure {
         band,
         power_w: request.power_w,
+        app_mode,
     });
     (
         StatusCode::ACCEPTED,
@@ -4455,6 +4565,10 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             .get("rig_band")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let app_mode = fields
+            .get("app_mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
         let key = if event == "start" {
             let key = QsoHistoryKey {
                 session_id,
@@ -4485,6 +4599,9 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         }
         if !rig_band.is_empty() && session.rig_band.is_none() {
             session.rig_band = Some(rig_band.to_string());
+        }
+        if !app_mode.is_empty() && session.app_mode.is_none() {
+            session.app_mode = Some(app_mode.to_uppercase());
         }
         session.last_seen_at = Some(timestamp);
         if event == "start" && session.started_at.is_none() {
@@ -4568,6 +4685,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
                     age_seconds: age.as_secs(),
                     callsign: session.partner_call,
                     band: session.rig_band.unwrap_or_else(|| "-".to_string()),
+                    mode: session.app_mode.unwrap_or_else(|| "-".to_string()),
                     sent_info: if session.sent_infos.is_empty() {
                         "-".to_string()
                     } else {
@@ -4724,18 +4842,21 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let (event_tx, event_rx) = mpsc::channel::<DecodeEvent>();
     thread::spawn(move || {
         let mut session_slot: Option<SystemTime> = None;
+        let mut session_mode: DecoderMode = DecoderMode::Ft8;
         let mut session = DecoderSession::new();
         let mut state = DecoderState::new();
         while let Ok(job) = job_rx.recv() {
-            if session_slot != Some(job.slot_start) {
+            if session_slot != Some(job.slot_start) || session_mode != job.mode {
                 session.reset();
                 session_slot = Some(job.slot_start);
+                session_mode = job.mode;
             }
             let result = decode_stage_from_samples(
                 &mut session,
                 &mut state,
                 &job.samples,
                 job.sample_rate_hz,
+                job.mode,
                 job.stage,
                 job.slot_start,
                 job.raw_path.as_deref(),
@@ -4746,6 +4867,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 .as_millis();
             let _ = event_tx.send(DecodeEvent::Finished {
                 slot_start: job.slot_start,
+                mode: job.mode,
                 stage: job.stage,
                 wall_ms,
                 result,
@@ -4765,6 +4887,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
     let mut display = DisplayState {
         rig: read_rig_snapshot_shared(&rig),
+        app_mode: DecoderMode::Ft8,
         audio,
         capture_rms_dbfs: -120.0,
         capture_latest_sample_time: None,
@@ -4784,7 +4907,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         full_decodes: Vec::new(),
     };
 
-    let mut next_slot = next_slot_boundary(SystemTime::now());
+    let mut next_slot = next_slot_boundary_for_mode(display.app_mode, SystemTime::now());
     let mut next_slot_stages = SlotStageState::default();
     let mut slot_direct_skip_start: Option<SystemTime> = None;
     let mut slot_direct_skip_calls = BTreeSet::<String>::new();
@@ -4799,8 +4922,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     qso_controller.update_rig_context(
         display.rig.as_ref().map(|rig| rig.frequency_hz),
         display.rig.as_ref().map(|rig| rig.band.to_string()),
+        display.app_mode,
     );
     work_queue.set_current_band(display.rig.as_ref().map(|rig| rig.band.to_string()));
+    work_queue.set_current_mode(display.app_mode);
 
     print!("\x1b[?25l");
     while !stop.load(Ordering::Relaxed) {
@@ -4827,8 +4952,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             qso_controller.update_rig_context(
                 display.rig.as_ref().map(|rig| rig.frequency_hz),
                 current_band.clone(),
+                display.app_mode,
             );
             work_queue.set_current_band(current_band);
+            work_queue.set_current_mode(display.app_mode);
             last_rig_poll = now;
         }
         qso_jsonl_cache.refresh(now);
@@ -4911,22 +5038,48 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         }
         for command in rig_control.drain() {
             match command {
-                RigCommand::Configure { band, power_w } => {
-                    if let Err(error) = apply_rig_config(&rig, band, power_w) {
+                RigCommand::Configure {
+                    band,
+                    power_w,
+                    app_mode,
+                } => {
+                    if let Err(error) = apply_rig_config(&rig, band, power_w, app_mode) {
                         display.decode_status = format!("Rig config failed: {error}");
                     } else {
                         let previous_band = display.rig.as_ref().map(|rig| rig.band.to_string());
+                        let previous_mode = display.app_mode;
                         display.rig = read_rig_snapshot_shared(&rig);
                         let current_band = display.rig.as_ref().map(|rig| rig.band.to_string());
-                        if previous_band != current_band {
+                        display.app_mode = app_mode;
+                        if previous_band != current_band || previous_mode != app_mode {
                             clear_bandmaps(&mut bandmaps);
-                            work_queue.clear("band_change");
+                            work_queue.clear(if previous_mode != app_mode {
+                                "mode_change"
+                            } else {
+                                "band_change"
+                            });
+                            station_tracker.reset_for_mode(app_mode);
+                            dt_frame_history.clear();
+                            display.early41_wall_ms = None;
+                            display.early47_wall_ms = None;
+                            display.early47_tx_margin_ms = None;
+                            display.full_wall_ms = None;
+                            display.last_decode_wall_ms = None;
+                            display.last_slot_start = None;
+                            display.early41_decodes.clear();
+                            display.early47_decodes.clear();
+                            display.full_decodes.clear();
+                            next_slot = next_slot_boundary_for_mode(app_mode, now);
+                            next_slot_stages = SlotStageState::default();
+                            active_decode = None;
                         }
                         qso_controller.update_rig_context(
                             display.rig.as_ref().map(|rig| rig.frequency_hz),
                             current_band.clone(),
+                            display.app_mode,
                         );
                         work_queue.set_current_band(current_band);
+                        work_queue.set_current_mode(display.app_mode);
                         last_rig_poll = now;
                     }
                 }
@@ -4955,10 +5108,14 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             match event {
                 DecodeEvent::Finished {
                     slot_start,
+                    mode,
                     stage,
                     wall_ms,
                     result,
                 } => {
+                    if mode != display.app_mode {
+                        continue;
+                    }
                     active_decode = None;
                     if slot_direct_skip_start != Some(slot_start) {
                         slot_direct_skip_start = Some(slot_start);
@@ -5012,9 +5169,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             }
                             DecodeStage::Early47 => {
                                 display.early47_wall_ms = Some(wall_ms);
-                                display.early47_tx_margin_ms = Some(
-                                    tx_margin_after_stage_decode_ms(slot_start, stage, wall_ms)?,
-                                );
+                                display.early47_tx_margin_ms =
+                                    Some(tx_margin_after_stage_decode_ms(
+                                        display.app_mode,
+                                        slot_start,
+                                        stage,
+                                        wall_ms,
+                                    )?);
                                 display.early47_decodes = update.report.decodes.clone();
                                 station_tracker.ingest_stage(
                                     slot_start,
@@ -5058,13 +5219,27 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 display.last_slot_start = Some(slot_start);
                                 display.full_wall_ms = Some(wall_ms);
                                 display.last_decode_wall_ms = Some(wall_ms);
+                                if display.app_mode != DecoderMode::Ft8 {
+                                    display.early47_tx_margin_ms =
+                                        Some(tx_margin_after_stage_decode_ms(
+                                            display.app_mode,
+                                            slot_start,
+                                            stage,
+                                            wall_ms,
+                                        )?);
+                                }
                                 display.full_decodes = update.report.decodes.clone();
                                 if dt_frame_history.len() == DT_HISTORY_FRAMES {
                                     dt_frame_history.pop_front();
                                 }
                                 dt_frame_history.push_back(display.full_decodes.clone());
                                 station_tracker.ingest_frame(slot_start, &display.full_decodes);
-                                update_bandmaps(&mut bandmaps, slot_start, &display.full_decodes);
+                                update_bandmaps(
+                                    &mut bandmaps,
+                                    display.app_mode,
+                                    slot_start,
+                                    &display.full_decodes,
+                                );
                                 maybe_auto_add_decoded_calls(
                                     &mut work_queue,
                                     &station_tracker,
@@ -5109,8 +5284,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         Err(error) => {
                             display.decode_status = format!(
                                 "Last {} {} failed: {}",
-                                stage.as_str(),
-                                format_slot_time(slot_start),
+                                stage_display_label(display.app_mode, stage),
+                                format_slot_time_for_mode(display.app_mode, slot_start),
                                 error
                             );
                             if stage == DecodeStage::Full {
@@ -5127,12 +5302,15 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             }
         }
 
-        while let Some(stage) =
-            next_slot_stages.next_due_stage(next_slot, display.capture_latest_sample_time)
-        {
+        while let Some(stage) = next_slot_stages.next_due_stage(
+            display.app_mode,
+            next_slot,
+            display.capture_latest_sample_time,
+        ) {
             let slot_start = next_slot;
-            let capture_end = stage_capture_end(slot_start, stage)?;
-            let samples = match extract_stage_capture(&capture, slot_start, stage) {
+            let capture_end = stage_capture_end(display.app_mode, slot_start, stage)?;
+            let samples = match extract_stage_capture(&capture, slot_start, display.app_mode, stage)
+            {
                 Ok(raw) => raw,
                 Err(AppError::Audio(rigctl::audio::Error::WindowNotReady)) => {
                     break;
@@ -5140,8 +5318,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 Err(error) => {
                     display.decode_status = format!(
                         "Capture error for {} {}: {}",
-                        stage.as_str(),
-                        format_slot_time(slot_start),
+                        stage_display_label(display.app_mode, stage),
+                        format_slot_time_for_mode(display.app_mode, slot_start),
                         error
                     );
                     next_slot_stages.mark_handled(stage);
@@ -5150,7 +5328,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         display.early41_decodes.clear();
                         display.early47_decodes.clear();
                         display.full_decodes.clear();
-                        next_slot += Duration::from_secs(SLOT_SECONDS);
+                        next_slot += slot_duration_for_mode(display.app_mode);
                         next_slot_stages = SlotStageState::default();
                     }
                     continue;
@@ -5174,6 +5352,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 samples,
                 sample_rate_hz: capture.config().sample_rate_hz,
                 raw_path,
+                mode: display.app_mode,
             });
             next_slot_stages.mark_handled(stage);
             match send_result {
@@ -5195,9 +5374,12 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         display.dropped_slots += 1;
                         display.decode_status = format!(
                             "capture=active decode=busy dropping={} drops={} next={}",
-                            format_slot_time(slot_start),
+                            format_slot_time_for_mode(display.app_mode, slot_start),
                             display.dropped_slots,
-                            format_slot_time(next_slot + Duration::from_secs(SLOT_SECONDS))
+                            format_slot_time_for_mode(
+                                display.app_mode,
+                                next_slot + slot_duration_for_mode(display.app_mode)
+                            )
                         );
                         display.last_slot_start = Some(slot_start);
                         display.early41_decodes.clear();
@@ -5214,7 +5396,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             }
 
             if stage == DecodeStage::Full {
-                next_slot += Duration::from_secs(SLOT_SECONDS);
+                next_slot += slot_duration_for_mode(display.app_mode);
                 next_slot_stages = SlotStageState::default();
             }
         }
@@ -5289,6 +5471,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             next_slot,
             display.dropped_slots,
             capture.config().sample_rate_hz,
+            display.app_mode,
         );
         refresh_web_snapshot(
             &web_snapshot,
@@ -5332,7 +5515,7 @@ fn refresh_web_snapshot(
     tune_active: bool,
 ) {
     let now = SystemTime::now();
-    let current_slot = current_slot_boundary(now);
+    let current_slot = current_slot_boundary_for_mode(display.app_mode, now);
     let composite = composite_rows(display);
     let preferred_decodes = preferred_stage_decodes(display);
     let current_dt_stats = summarize_dt(preferred_decodes);
@@ -5357,7 +5540,7 @@ fn refresh_web_snapshot(
             }
         })
         .collect::<Vec<_>>();
-    let current_slot_index = slot_index(current_slot);
+    let current_slot_index = slot_index_for_mode(display.app_mode, current_slot);
     let mut guard = snapshot.lock().expect("web snapshot poisoned");
     guard.time_utc = {
         let now_utc: DateTime<Utc> = now.into();
@@ -5375,6 +5558,7 @@ fn refresh_web_snapshot(
         .as_ref()
         .map(|state| state.band.to_string())
         .unwrap_or_else(|| "unavailable".to_string());
+    guard.app_mode = display.app_mode.as_str().to_uppercase();
     guard.rig_power_w = display
         .rig
         .as_ref()
@@ -5384,7 +5568,9 @@ fn refresh_web_snapshot(
     guard.rig_tune_active = tune_active;
     guard.decode_status = display.decode_status.clone();
     guard.audio_stats = WebAudioStats {
-        latest_sample: display.capture_latest_sample_time.map(format_slot_time),
+        latest_sample: display
+            .capture_latest_sample_time
+            .map(|time| format_slot_time_for_mode(display.app_mode, time)),
         selected_channel: display.capture_channel,
         overall_dbfs: display.capture_rms_dbfs,
         left_dbfs: display
@@ -5399,11 +5585,20 @@ fn refresh_web_snapshot(
             .unwrap_or(-120.0),
         recoveries: display.capture_recoveries,
     };
-    guard.decode_times = WebDecodeTimes {
-        early_seconds: display.early41_wall_ms.map(ms_to_seconds),
-        mid_seconds: display.early47_wall_ms.map(ms_to_seconds),
-        late_seconds: display.full_wall_ms.map(ms_to_seconds),
-        tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+    guard.decode_times = if display.app_mode == DecoderMode::Ft8 {
+        WebDecodeTimes {
+            early_seconds: display.early41_wall_ms.map(ms_to_seconds),
+            mid_seconds: display.early47_wall_ms.map(ms_to_seconds),
+            late_seconds: display.full_wall_ms.map(ms_to_seconds),
+            tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+        }
+    } else {
+        WebDecodeTimes {
+            early_seconds: None,
+            mid_seconds: display.full_wall_ms.map(ms_to_seconds),
+            late_seconds: None,
+            tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+        }
     };
     guard.dt_stats = WebDtStats {
         current_mean_seconds: current_dt_stats.mean,
@@ -5414,8 +5609,10 @@ fn refresh_web_snapshot(
         ten_minute_median_seconds: ten_minute_dt_stats.median,
         ten_minute_count: ten_minute_dt_stats.count,
     };
-    guard.current_slot = format_slot_time(current_slot);
-    guard.last_done_slot = display.last_slot_start.map(format_slot_time);
+    guard.current_slot = format_slot_time_for_mode(display.app_mode, current_slot);
+    guard.last_done_slot = display
+        .last_slot_start
+        .map(|time| format_slot_time_for_mode(display.app_mode, time));
     guard.decodes = decodes;
     guard.waterfall = waterfall_rows.iter().cloned().collect();
     guard.bandmaps = WebBandMaps {
@@ -5446,14 +5643,15 @@ fn refresh_web_snapshot(
 }
 
 fn run_oneshot(cli: Cli) -> Result<(), AppError> {
+    let app_mode = DecoderMode::Ft8;
     let audio = detect_k3s_audio_device(cli.device.as_deref())?;
     let capture = SampleStream::start(audio.clone(), AudioStreamConfig::default())?;
-    let target_slot = next_slot_boundary(SystemTime::now());
+    let target_slot = next_slot_boundary_for_mode(app_mode, SystemTime::now());
 
     println!("audio=\"{}\" spec={}", audio.name, audio.spec);
     println!("target_slot={}", format_slot_time(target_slot));
 
-    let ready_at = slot_capture_end(target_slot, capture.config().sample_rate_hz)?;
+    let ready_at = slot_capture_end(target_slot, capture.config().sample_rate_hz, app_mode)?;
     while SystemTime::now() < ready_at {
         let stats = capture.stats();
         let latest = stats
@@ -5477,6 +5675,7 @@ fn run_oneshot(cli: Cli) -> Result<(), AppError> {
     let summary = decode_slot_from_capture(
         &capture,
         target_slot,
+        app_mode,
         cli.save_raw_wav.as_deref().or(cli.save_wav.as_deref()),
     )?;
     println!("decodes={}", summary.final_decodes.len());
@@ -5506,7 +5705,51 @@ fn read_rig_snapshot_shared(rig: &SharedRig) -> Option<RigSnapshot> {
     read_rig_snapshot(&mut guard)
 }
 
-fn apply_rig_config(rig: &SharedRig, band: Band, power_w: f32) -> Result<(), AppError> {
+fn calling_frequency_hz(band: Band, app_mode: DecoderMode) -> u64 {
+    match (app_mode, band) {
+        (DecoderMode::Ft8, Band::M160) => 1_840_000,
+        (DecoderMode::Ft8, Band::M80) => 3_573_000,
+        (DecoderMode::Ft8, Band::M60) => 5_357_000,
+        (DecoderMode::Ft8, Band::M40) => 7_074_000,
+        (DecoderMode::Ft8, Band::M30) => 10_136_000,
+        (DecoderMode::Ft8, Band::M20) => 14_074_000,
+        (DecoderMode::Ft8, Band::M17) => 18_100_000,
+        (DecoderMode::Ft8, Band::M15) => 21_074_000,
+        (DecoderMode::Ft8, Band::M12) => 24_915_000,
+        (DecoderMode::Ft8, Band::M10) => 28_074_000,
+        (DecoderMode::Ft8, Band::M6) => 50_313_000,
+        (DecoderMode::Ft4, Band::M80) => 3_575_000,
+        (DecoderMode::Ft4, Band::M40) => 7_047_500,
+        (DecoderMode::Ft4, Band::M30) => 10_140_000,
+        (DecoderMode::Ft4, Band::M20) => 14_080_000,
+        (DecoderMode::Ft4, Band::M17) => 18_104_000,
+        (DecoderMode::Ft4, Band::M15) => 21_140_000,
+        (DecoderMode::Ft4, Band::M12) => 24_919_000,
+        (DecoderMode::Ft4, Band::M10) => 28_180_000,
+        (DecoderMode::Ft4, Band::M6) => 50_318_000,
+        (DecoderMode::Ft2, Band::M160) => 1_843_000,
+        (DecoderMode::Ft2, Band::M80) => 3_578_000,
+        (DecoderMode::Ft2, Band::M40) => 7_052_000,
+        (DecoderMode::Ft2, Band::M30) => 10_144_000,
+        (DecoderMode::Ft2, Band::M20) => 14_084_000,
+        (DecoderMode::Ft2, Band::M17) => 18_108_000,
+        (DecoderMode::Ft2, Band::M15) => 21_144_000,
+        (DecoderMode::Ft2, Band::M12) => 24_923_000,
+        (DecoderMode::Ft2, Band::M10) => 28_184_000,
+        (DecoderMode::Ft4, Band::M160)
+        | (DecoderMode::Ft4, Band::M60)
+        | (DecoderMode::Ft2, Band::M60)
+        | (DecoderMode::Ft2, Band::M6) => calling_frequency_hz(band, DecoderMode::Ft8),
+        (_, Band::Xvtr(_)) => 0,
+    }
+}
+
+fn apply_rig_config(
+    rig: &SharedRig,
+    band: Band,
+    power_w: f32,
+    app_mode: DecoderMode,
+) -> Result<(), AppError> {
     let mut guard = rig.lock().expect("rig mutex poisoned");
     let rig = guard.as_mut().ok_or_else(|| {
         AppError::Io(std::io::Error::new(
@@ -5515,7 +5758,11 @@ fn apply_rig_config(rig: &SharedRig, band: Band, power_w: f32) -> Result<(), App
         ))
     })?;
     rig.set_band(band)?;
-    rig.set_mode(Mode::Data)?;
+    let frequency_hz = calling_frequency_hz(band, app_mode);
+    if frequency_hz > 0 {
+        rig.set_frequency_hz(frequency_hz)?;
+    }
+    rig.set_mode(RigMode::Data)?;
     rig.set_configured_power_w(power_w)?;
     Ok(())
 }
@@ -5606,30 +5853,33 @@ impl Drop for AtomicFlagGuard {
 fn extract_slot_capture(
     capture: &SampleStream,
     slot_start: SystemTime,
+    mode: DecoderMode,
 ) -> Result<Vec<i16>, AppError> {
     Ok(capture.extract_window(
         slot_start,
-        full_slot_sample_count(capture.config().sample_rate_hz),
+        full_decode_sample_count(capture.config().sample_rate_hz, mode),
     )?)
 }
 
 fn extract_stage_capture(
     capture: &SampleStream,
     slot_start: SystemTime,
+    mode: DecoderMode,
     stage: DecodeStage,
 ) -> Result<Vec<i16>, AppError> {
     Ok(capture.extract_window(
         slot_start,
-        stage_sample_count(capture.config().sample_rate_hz, stage),
+        stage_sample_count(capture.config().sample_rate_hz, mode, stage),
     )?)
 }
 
 fn decode_slot_from_capture(
     capture: &SampleStream,
     slot_start: SystemTime,
+    mode: DecoderMode,
     save_raw_wav: Option<&Path>,
 ) -> Result<DecodeSummary, AppError> {
-    let samples = extract_slot_capture(capture, slot_start)?;
+    let samples = extract_slot_capture(capture, slot_start, mode)?;
     let raw_path = save_raw_wav
         .map(Path::to_path_buf)
         .unwrap_or_else(|| temp_path("ft8rx-raw.wav"));
@@ -5639,6 +5889,7 @@ fn decode_slot_from_capture(
         &raw_path,
         save_raw_wav.is_some(),
         slot_start,
+        mode,
     )
 }
 
@@ -5648,11 +5899,12 @@ fn decode_slot_from_samples_with_raw_path(
     raw_path: &Path,
     keep_raw: bool,
     slot_start: SystemTime,
+    mode: DecoderMode,
 ) -> Result<DecodeSummary, AppError> {
     if keep_raw {
         write_mono_wav(raw_path, sample_rate_hz, samples)?;
     }
-    let decodes = decode_slot_from_samples(samples, sample_rate_hz, slot_start)?;
+    let decodes = decode_slot_from_samples(samples, sample_rate_hz, slot_start, mode)?;
     if !keep_raw && raw_path.exists() {
         let _ = std::fs::remove_file(raw_path);
     }
@@ -5664,6 +5916,7 @@ fn decode_stage_from_samples(
     state: &mut DecoderState,
     samples: &[i16],
     sample_rate_hz: u32,
+    mode: DecoderMode,
     stage: DecodeStage,
     slot_start: SystemTime,
     raw_path: Option<&Path>,
@@ -5672,10 +5925,11 @@ fn decode_stage_from_samples(
         write_mono_wav(raw_path, sample_rate_hz, samples)?;
     }
     let options = DecodeOptions {
+        mode,
         profile: DecodeProfile::Deepest,
         min_freq_hz: 200.0,
         max_freq_hz: 3_500.0,
-        ..DecodeOptions::default()
+        ..DecodeOptions::for_mode(mode)
     };
     let audio = AudioBuffer {
         sample_rate_hz: DECODER_SAMPLE_RATE_HZ,
@@ -5692,7 +5946,7 @@ fn decode_stage_from_samples(
         .decode_stage_with_state(&audio, &options, stage, Some(state))
         .map_err(|error| AppError::Decoder(error.to_string()))?;
     *state = next_state;
-    relabel_stage_update(&mut update, slot_start);
+    relabel_stage_update(&mut update, slot_start, mode);
     Ok(update)
 }
 
@@ -5700,12 +5954,14 @@ fn decode_slot_from_samples(
     samples: &[i16],
     sample_rate_hz: u32,
     slot_start: SystemTime,
+    mode: DecoderMode,
 ) -> Result<DecodeSummary, AppError> {
     let options = DecodeOptions {
+        mode,
         profile: DecodeProfile::Deepest,
         min_freq_hz: 200.0,
         max_freq_hz: 3_500.0,
-        ..DecodeOptions::default()
+        ..DecodeOptions::for_mode(mode)
     };
     let audio = AudioBuffer {
         sample_rate_hz: DECODER_SAMPLE_RATE_HZ,
@@ -5724,7 +5980,7 @@ fn decode_slot_from_samples(
         .map_err(|error| AppError::Decoder(error.to_string()))?;
     let mut final_decodes = Vec::new();
     for mut update in updates {
-        relabel_stage_update(&mut update, slot_start);
+        relabel_stage_update(&mut update, slot_start, mode);
         match update.stage {
             DecodeStage::Early41 => {}
             DecodeStage::Early47 => {
@@ -5753,13 +6009,13 @@ fn write_mono_wav(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Result<(
     Ok(())
 }
 
-fn slot_progress_bar(now: SystemTime) -> String {
-    let slot_start = current_slot_boundary(now);
+fn slot_progress_bar(now: SystemTime, mode: DecoderMode) -> String {
+    let slot_start = current_slot_boundary_for_mode(mode, now);
     let elapsed = now
         .duration_since(slot_start)
         .unwrap_or_default()
         .as_secs_f32();
-    let progress = (elapsed / SLOT_SECONDS as f32).clamp(0.0, 1.0);
+    let progress = (elapsed / slot_duration_for_mode(mode).as_secs_f32()).clamp(0.0, 1.0);
     let width: usize = 16;
     let filled = (progress * width as f32).round() as usize;
     format!(
@@ -5773,11 +6029,11 @@ fn slot_progress_bar(now: SystemTime) -> String {
 fn render(display: &DisplayState) {
     let now_local: DateTime<Local> = SystemTime::now().into();
     let now = SystemTime::now();
-    let current_slot = current_slot_boundary(now);
+    let current_slot = current_slot_boundary_for_mode(display.app_mode, now);
     let rig_frequency = display
         .rig
         .as_ref()
-        .map(|state| format!("{:.3} MHz", state.frequency_hz as f64 / 1_000_000.0))
+        .map(|state| format!("{:.4} MHz", state.frequency_hz as f64 / 1_000_000.0))
         .unwrap_or_else(|| "unavailable".to_string());
     let rig_mode = display
         .rig
@@ -5822,7 +6078,7 @@ fn render(display: &DisplayState) {
         .unwrap_or(-120.0);
     let latest_sample = display
         .capture_latest_sample_time
-        .map(format_slot_time)
+        .map(|time| format_slot_time_for_mode(display.app_mode, time))
         .unwrap_or_else(|| "------".to_string());
 
     let mut output = String::new();
@@ -5833,8 +6089,14 @@ fn render(display: &DisplayState) {
     );
     let _ = writeln!(
         output,
-        "Rig      {}  {}  {}  {}  P={}  BG={}",
-        rig_frequency, rig_mode, rig_band, rig_direction, rig_power, rig_bargraph
+        "Rig      {}  {}  {}  {}  {}  P={}  BG={}",
+        rig_frequency,
+        rig_mode,
+        display.app_mode.as_str().to_uppercase(),
+        rig_band,
+        rig_direction,
+        rig_power,
+        rig_bargraph
     );
     let _ = writeln!(
         output,
@@ -5855,28 +6117,37 @@ fn render(display: &DisplayState) {
             .map(|ms| format!(" last={:.2}s", ms as f32 / 1000.0))
             .unwrap_or_default()
     );
-    let _ = writeln!(
-        output,
-        "DecodeT  early={} mid={} late={} tx_margin={}",
-        format_wall_time(display.early41_wall_ms),
-        format_wall_time(display.early47_wall_ms),
-        format_wall_time(display.full_wall_ms),
-        format_signed_wall_time(display.early47_tx_margin_ms)
-    );
+    if display.app_mode == DecoderMode::Ft8 {
+        let _ = writeln!(
+            output,
+            "DecodeT  early={} mid={} late={} tx_margin={}",
+            format_wall_time(display.early41_wall_ms),
+            format_wall_time(display.early47_wall_ms),
+            format_wall_time(display.full_wall_ms),
+            format_signed_wall_time(display.early47_tx_margin_ms)
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "DecodeT  mid={} tx_margin={}",
+            format_wall_time(display.full_wall_ms),
+            format_signed_wall_time(display.early47_tx_margin_ms)
+        );
+    }
     if let Some(slot_start) = display.last_slot_start {
         let _ = writeln!(
             output,
             "Slot     {} {} last_done={}",
-            format_slot_time(current_slot),
-            slot_progress_bar(now),
-            format_slot_time(slot_start)
+            format_slot_time_for_mode(display.app_mode, current_slot),
+            slot_progress_bar(now, display.app_mode),
+            format_slot_time_for_mode(display.app_mode, slot_start)
         );
     } else {
         let _ = writeln!(
             output,
             "Slot     {} {}",
-            format_slot_time(current_slot),
-            slot_progress_bar(now)
+            format_slot_time_for_mode(display.app_mode, current_slot),
+            slot_progress_bar(now, display.app_mode)
         );
     }
     let _ = writeln!(
@@ -5987,38 +6258,83 @@ fn ms_to_signed_seconds(ms: i128) -> f32 {
     ms as f32 / 1000.0
 }
 
-fn next_slot_boundary(now: SystemTime) -> SystemTime {
-    current_slot_boundary(now) + Duration::from_secs(SLOT_SECONDS)
+fn stage_display_label(mode: DecoderMode, stage: DecodeStage) -> &'static str {
+    match stage {
+        DecodeStage::Early41 => "early",
+        DecodeStage::Early47 => "mid",
+        DecodeStage::Full => {
+            if mode == DecoderMode::Ft8 {
+                "full"
+            } else {
+                "full"
+            }
+        }
+    }
 }
 
-fn current_slot_boundary(now: SystemTime) -> SystemTime {
+fn slot_millis_for_mode(mode: DecoderMode) -> u64 {
+    match mode {
+        DecoderMode::Ft8 => 15_000,
+        DecoderMode::Ft4 => 7_500,
+        DecoderMode::Ft2 => 2_500,
+    }
+}
+
+fn decode_stage_enabled_for_mode(mode: DecoderMode, stage: DecodeStage) -> bool {
+    match stage {
+        DecodeStage::Full => true,
+        DecodeStage::Early41 | DecodeStage::Early47 => mode == DecoderMode::Ft8,
+    }
+}
+
+pub(crate) fn slot_duration_for_mode(mode: DecoderMode) -> Duration {
+    Duration::from_millis(slot_millis_for_mode(mode))
+}
+
+pub(crate) fn next_slot_boundary_for_mode(mode: DecoderMode, now: SystemTime) -> SystemTime {
+    current_slot_boundary_for_mode(mode, now) + slot_duration_for_mode(mode)
+}
+
+fn next_slot_boundary(now: SystemTime) -> SystemTime {
+    next_slot_boundary_for_mode(DecoderMode::Ft8, now)
+}
+
+pub(crate) fn current_slot_boundary_for_mode(mode: DecoderMode, now: SystemTime) -> SystemTime {
     let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let current = (since_epoch.as_secs() / SLOT_SECONDS) * SLOT_SECONDS;
-    UNIX_EPOCH + Duration::from_secs(current)
+    let slot_millis = slot_millis_for_mode(mode) as u128;
+    let elapsed_millis = since_epoch.as_millis();
+    let current_millis = (elapsed_millis / slot_millis) * slot_millis;
+    UNIX_EPOCH + Duration::from_millis(current_millis as u64)
+}
+
+pub(crate) fn slot_index_for_mode(mode: DecoderMode, time: SystemTime) -> u64 {
+    let slot_millis = slot_millis_for_mode(mode) as u128;
+    (time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / slot_millis) as u64
 }
 
 fn slot_index(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / SLOT_SECONDS
+    slot_index_for_mode(DecoderMode::Ft8, time)
 }
 
-fn latest_slot_index_for_family(now: SystemTime, family: qso::SlotFamily) -> u64 {
-    let current = slot_index(current_slot_boundary(now));
-    match (family, is_even_slot_family(current_slot_boundary(now))) {
+fn latest_slot_index_for_family(
+    mode: DecoderMode,
+    now: SystemTime,
+    family: qso::SlotFamily,
+) -> u64 {
+    let current_slot = current_slot_boundary_for_mode(mode, now);
+    let current = slot_index_for_mode(mode, current_slot);
+    match (family, is_even_slot_family_for_mode(mode, current_slot)) {
         (qso::SlotFamily::Even, true) | (qso::SlotFamily::Odd, false) => current,
         _ => current.saturating_sub(1),
     }
 }
 
-fn is_even_slot_family(time: SystemTime) -> bool {
-    let second = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        % 60;
-    matches!(second, 0 | 30)
+pub(crate) fn is_even_slot_family_for_mode(mode: DecoderMode, time: SystemTime) -> bool {
+    slot_index_for_mode(mode, time).is_multiple_of(2)
 }
 
 fn parse_slot_family_name(value: &str) -> Option<qso::SlotFamily> {
@@ -6034,51 +6350,76 @@ fn format_slot_time(time: SystemTime) -> String {
     utc.format("%H%M%S").to_string()
 }
 
+fn format_slot_time_for_mode(mode: DecoderMode, time: SystemTime) -> String {
+    if mode == DecoderMode::Ft8 {
+        return format_slot_time(time);
+    }
+    let utc: DateTime<Utc> = time.into();
+    format!(
+        "{}.{}",
+        utc.format("%H%M%S"),
+        utc.timestamp_subsec_millis() / 100
+    )
+}
+
 fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}-{}", std::process::id(), name))
 }
 
-fn full_slot_sample_count(sample_rate_hz: u32) -> usize {
-    SLOT_SECONDS as usize * sample_rate_hz as usize
+fn full_decode_sample_count(sample_rate_hz: u32, mode: DecoderMode) -> usize {
+    let decoder_samples = DecodeStage::Full.required_samples(mode.spec()) as u64;
+    let numerator = decoder_samples * sample_rate_hz as u64 + (DECODER_SAMPLE_RATE_HZ as u64 / 2);
+    (numerator / DECODER_SAMPLE_RATE_HZ as u64) as usize
 }
 
 fn samples_to_duration(sample_rate_hz: u32, sample_count: usize) -> Duration {
     Duration::from_secs_f64(sample_count as f64 / sample_rate_hz as f64)
 }
 
-fn stage_sample_count(sample_rate_hz: u32, stage: DecodeStage) -> usize {
-    (((stage.required_samples(DecoderMode::Ft8.spec()) as u64 * sample_rate_hz as u64)
+fn stage_sample_count(sample_rate_hz: u32, mode: DecoderMode, stage: DecodeStage) -> usize {
+    (((stage.required_samples(mode.spec()) as u64 * sample_rate_hz as u64)
         + (DECODER_SAMPLE_RATE_HZ as u64 / 2))
         / DECODER_SAMPLE_RATE_HZ as u64) as usize
 }
 
-fn capture_window_duration(sample_rate_hz: u32) -> Duration {
-    Duration::from_secs_f64(full_slot_sample_count(sample_rate_hz) as f64 / sample_rate_hz as f64)
+fn capture_window_duration(sample_rate_hz: u32, mode: DecoderMode) -> Duration {
+    Duration::from_secs_f64(
+        full_decode_sample_count(sample_rate_hz, mode) as f64 / sample_rate_hz as f64,
+    )
 }
 
-fn slot_capture_end(slot_start: SystemTime, sample_rate_hz: u32) -> Result<SystemTime, AppError> {
+fn slot_capture_end(
+    slot_start: SystemTime,
+    sample_rate_hz: u32,
+    mode: DecoderMode,
+) -> Result<SystemTime, AppError> {
     slot_start
-        .checked_add(capture_window_duration(sample_rate_hz))
+        .checked_add(capture_window_duration(sample_rate_hz, mode))
         .ok_or(AppError::Clock)
 }
 
-fn stage_capture_end(slot_start: SystemTime, stage: DecodeStage) -> Result<SystemTime, AppError> {
+fn stage_capture_end(
+    mode: DecoderMode,
+    slot_start: SystemTime,
+    stage: DecodeStage,
+) -> Result<SystemTime, AppError> {
     slot_start
         .checked_add(Duration::from_secs_f64(
-            stage.required_samples(DecoderMode::Ft8.spec()) as f64 / DECODER_SAMPLE_RATE_HZ as f64,
+            stage.required_samples(mode.spec()) as f64 / DECODER_SAMPLE_RATE_HZ as f64,
         ))
         .ok_or(AppError::Clock)
 }
 
 fn tx_margin_after_stage_decode_ms(
+    mode: DecoderMode,
     slot_start: SystemTime,
     stage: DecodeStage,
     wall_ms: u128,
 ) -> Result<i128, AppError> {
     let tx_start = slot_start
-        .checked_add(Duration::from_secs(SLOT_SECONDS))
+        .checked_add(slot_duration_for_mode(mode))
         .ok_or(AppError::Clock)?;
-    let capture_end = stage_capture_end(slot_start, stage)?;
+    let capture_end = stage_capture_end(mode, slot_start, stage)?;
     let capture_to_tx_ms = tx_start
         .duration_since(capture_end)
         .map_err(|_| AppError::Clock)?
@@ -6091,9 +6432,14 @@ fn format_status(
     next_slot: SystemTime,
     dropped_slots: u64,
     sample_rate_hz: u32,
+    app_mode: DecoderMode,
 ) -> String {
     let now = SystemTime::now();
-    let capture_active = match slot_capture_end(current_slot_boundary(now), sample_rate_hz) {
+    let capture_active = match slot_capture_end(
+        current_slot_boundary_for_mode(app_mode, now),
+        sample_rate_hz,
+        app_mode,
+    ) {
         Ok(capture_end) => now < capture_end,
         Err(_) => false,
     };
@@ -6102,22 +6448,22 @@ fn format_status(
         Some(active) => format!(
             "capture={} decode={} slot={} drops={} next={}",
             capture_state,
-            active.stage.as_str(),
-            format_slot_time(active.slot_start),
+            stage_display_label(app_mode, active.stage),
+            format_slot_time_for_mode(app_mode, active.slot_start),
             dropped_slots,
-            format_slot_time(next_slot)
+            format_slot_time_for_mode(app_mode, next_slot)
         ),
         None => format!(
             "capture={} decode=idle drops={} next={}",
             capture_state,
             dropped_slots,
-            format_slot_time(next_slot)
+            format_slot_time_for_mode(app_mode, next_slot)
         ),
     }
 }
 
-fn relabel_stage_update(update: &mut StageDecodeReport, slot_start: SystemTime) {
-    let slot_label = format_slot_time(slot_start);
+fn relabel_stage_update(update: &mut StageDecodeReport, slot_start: SystemTime, mode: DecoderMode) {
+    let slot_label = format_slot_time_for_mode(mode, slot_start);
     for decode in &mut update.report.decodes {
         decode.utc = slot_label.clone();
     }
@@ -6165,7 +6511,7 @@ fn composite_rows(display: &DisplayState) -> Vec<CompositeDecodeRow> {
             .entry(decode.text.clone())
             .or_insert_with(|| CompositeDecodeRow {
                 display: decode.clone(),
-                seen: "late",
+                seen: "full",
             });
         entry.display = decode.clone();
     }
@@ -6607,6 +6953,14 @@ fn reply_word_text(word: ft8_decoder::ReplyWord) -> &'static str {
 }
 
 impl StationTracker {
+    fn reset_for_mode(&mut self, mode: DecoderMode) {
+        self.mode = mode;
+        self.stations.clear();
+        self.logs.clear();
+        self.hash12_resolutions.clear();
+        self.hash22_resolutions.clear();
+    }
+
     fn ingest_stage(
         &mut self,
         received_at: SystemTime,
@@ -6661,7 +7015,7 @@ impl StationTracker {
         let Some(sender_call) = semantic_sender_call(&decode.message) else {
             return;
         };
-        let current_slot_index = slot_index(received_at);
+        let current_slot_index = slot_index_for_mode(self.mode, received_at);
         if let Some(existing) = self.stations.get(&sender_call) {
             if current_slot_index < existing.last_heard_slot_index
                 || (current_slot_index == existing.last_heard_slot_index
@@ -6711,7 +7065,7 @@ impl StationTracker {
                 last_heard_decode_stage: stage,
                 last_heard_freq_hz: decode.freq_hz,
                 last_heard_snr_db: decode.snr_db,
-                last_heard_slot_family: qso::slot_family(received_at),
+                last_heard_slot_family: qso::slot_family_for_mode(self.mode, received_at),
                 last_message_kind: station_message_kind(&decode.message),
                 last_text: decode.text.clone(),
                 last_structured_json: serde_json::to_string(&decode.message).unwrap_or_default(),
@@ -6724,7 +7078,7 @@ impl StationTracker {
         entry.last_heard_decode_stage = stage;
         entry.last_heard_freq_hz = decode.freq_hz;
         entry.last_heard_snr_db = decode.snr_db;
-        entry.last_heard_slot_family = qso::slot_family(received_at);
+        entry.last_heard_slot_family = qso::slot_family_for_mode(self.mode, received_at);
         entry.last_message_kind = station_message_kind(&decode.message);
         entry.last_text = decode.text.clone();
         entry.last_structured_json = serde_json::to_string(&decode.message).unwrap_or_default();
@@ -7033,9 +7387,8 @@ impl StationTracker {
             .iter()
             .filter(|entry| {
                 entry.received_at >= since
-                    &&
-                entry.peer.as_ref().map(|peer| self.peer_display(peer))
-                    == Some(our_call.to_string())
+                    && entry.peer.as_ref().map(|peer| self.peer_display(peer))
+                        == Some(our_call.to_string())
             })
             .map(|entry| WebDirectCallLog {
                 sort_epoch_ms: system_time_to_epoch_ms(entry.received_at),
@@ -7201,6 +7554,7 @@ fn direct_call_observation_from_decode(
     decode: &DecodedMessage,
     our_call: &str,
     observed_at: SystemTime,
+    mode: DecoderMode,
 ) -> Option<DirectCallObservation> {
     let sender_call = semantic_sender_call(&decode.message)?;
     let (start_state, compound_eligible) = match &decode.message {
@@ -7289,8 +7643,8 @@ fn direct_call_observation_from_decode(
     Some(DirectCallObservation {
         callsign: sender_call,
         observed_at,
-        slot_index: slot_index(observed_at),
-        slot_family: qso::slot_family(observed_at),
+        slot_index: slot_index_for_mode(mode, observed_at),
+        slot_family: qso::slot_family_for_mode(mode, observed_at),
         snr_db: decode.snr_db,
         start_state,
         compound_eligible,
@@ -7310,9 +7664,12 @@ fn maybe_track_priority_directs(
     if work_queue.auto_add_direct_calls {
         let active_partner = qso_controller.active_partner_call();
         for decode in decodes {
-            let Some(observation) =
-                direct_call_observation_from_decode(decode, our_call, slot_start)
-            else {
+            let Some(observation) = direct_call_observation_from_decode(
+                decode,
+                our_call,
+                slot_start,
+                work_queue.current_mode,
+            ) else {
                 continue;
             };
             if slot_skip_calls
@@ -7634,11 +7991,16 @@ fn seeded_waterfall_rows() -> VecDeque<Vec<u8>> {
     rows
 }
 
-fn update_bandmaps(store: &mut BandMapStore, slot_start: SystemTime, decodes: &[DecodedMessage]) {
-    let slot_idx = slot_index(slot_start);
+fn update_bandmaps(
+    store: &mut BandMapStore,
+    mode: DecoderMode,
+    slot_start: SystemTime,
+    decodes: &[DecodedMessage],
+) {
+    let slot_idx = slot_index_for_mode(mode, slot_start);
     prune_bandmap(&mut store.even, slot_idx);
     prune_bandmap(&mut store.odd, slot_idx);
-    let map = if is_even_slot_family(slot_start) {
+    let map = if is_even_slot_family_for_mode(mode, slot_start) {
         store.even_last_updated_at = Some(slot_start);
         &mut store.even
     } else {
@@ -7929,6 +8291,187 @@ mod tests {
     }
 
     #[test]
+    fn calling_frequency_uses_mode_specific_qrgs() {
+        assert_eq!(
+            calling_frequency_hz(Band::M20, DecoderMode::Ft8),
+            14_074_000
+        );
+        assert_eq!(
+            calling_frequency_hz(Band::M20, DecoderMode::Ft4),
+            14_080_000
+        );
+        assert_eq!(
+            calling_frequency_hz(Band::M20, DecoderMode::Ft2),
+            14_084_000
+        );
+        assert_eq!(
+            calling_frequency_hz(Band::M60, DecoderMode::Ft2),
+            calling_frequency_hz(Band::M60, DecoderMode::Ft8)
+        );
+        assert_eq!(
+            calling_frequency_hz(Band::M6, DecoderMode::Ft2),
+            calling_frequency_hz(Band::M6, DecoderMode::Ft8)
+        );
+    }
+
+    #[test]
+    fn full_decode_sample_window_matches_decoder_mode_spec() {
+        assert_eq!(
+            full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft8),
+            180_000
+        );
+        assert_eq!(
+            full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4),
+            72_576
+        );
+        assert_eq!(
+            full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft2),
+            30_000
+        );
+        assert_eq!(
+            capture_window_duration(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4),
+            Duration::from_secs_f64(72_576.0 / 12_000.0)
+        );
+    }
+
+    #[test]
+    fn non_ft8_modes_only_schedule_full_decode_stage() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(30);
+        let before_full_ready = slot_start + Duration::from_secs(1);
+        let ft4_full_ready = stage_capture_end(DecoderMode::Ft4, slot_start, DecodeStage::Full)
+            .expect("ft4 full ready");
+        let ft2_full_ready = stage_capture_end(DecoderMode::Ft2, slot_start, DecodeStage::Full)
+            .expect("ft2 full ready");
+
+        assert_eq!(
+            SlotStageState::default().next_due_stage(
+                DecoderMode::Ft4,
+                slot_start,
+                Some(before_full_ready)
+            ),
+            None
+        );
+        assert_eq!(
+            SlotStageState::default().next_due_stage(
+                DecoderMode::Ft4,
+                slot_start,
+                Some(ft4_full_ready)
+            ),
+            Some(DecodeStage::Full)
+        );
+        assert_eq!(
+            SlotStageState::default().next_due_stage(
+                DecoderMode::Ft2,
+                slot_start,
+                Some(before_full_ready)
+            ),
+            None
+        );
+        assert_eq!(
+            SlotStageState::default().next_due_stage(
+                DecoderMode::Ft2,
+                slot_start,
+                Some(ft2_full_ready)
+            ),
+            Some(DecodeStage::Full)
+        );
+    }
+
+    #[test]
+    fn station_tracker_reset_for_mode_clears_previous_state() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let mut tracker = StationTracker::default();
+        tracker.ingest_decode(now, &cq_decode("K1ABC"));
+        assert!(tracker.start_info("K1ABC").is_some());
+
+        tracker.reset_for_mode(DecoderMode::Ft4);
+
+        assert_eq!(tracker.mode, DecoderMode::Ft4);
+        assert!(tracker.start_info("K1ABC").is_none());
+        assert!(tracker.web_logs().is_empty());
+    }
+
+    #[test]
+    fn queue_scheduler_blocks_dispatch_in_ft2_rx_only_mode() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let config = sample_app_config();
+        let mut tracker = StationTracker::default();
+        tracker.ingest_decode(now, &cq_decode("K1ABC"));
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.auto_enabled = true;
+        queue.set_current_band(Some("20m".to_string()));
+        queue.set_current_mode(DecoderMode::Ft2);
+        queue.add_station("K1ABC", now, now).expect("queued");
+
+        assert!(
+            queue
+                .scheduler_pick(now + Duration::from_secs(1), &tracker, false, false)
+                .is_none()
+        );
+        assert_eq!(queue.scheduler_status, "ft2 rx-only");
+    }
+
+    #[test]
+    fn ft4_slot_boundaries_preserve_half_second_alignment() {
+        let before_half = UNIX_EPOCH + Duration::from_millis(7_499);
+        let at_half = UNIX_EPOCH + Duration::from_millis(7_500);
+        let later = UNIX_EPOCH + Duration::from_millis(22_900);
+
+        assert_eq!(
+            current_slot_boundary_for_mode(DecoderMode::Ft4, before_half),
+            UNIX_EPOCH
+        );
+        assert_eq!(
+            current_slot_boundary_for_mode(DecoderMode::Ft4, at_half),
+            UNIX_EPOCH + Duration::from_millis(7_500)
+        );
+        assert_eq!(
+            next_slot_boundary_for_mode(DecoderMode::Ft4, at_half),
+            UNIX_EPOCH + Duration::from_millis(15_000)
+        );
+        assert_eq!(
+            current_slot_boundary_for_mode(DecoderMode::Ft4, later),
+            UNIX_EPOCH + Duration::from_millis(22_500)
+        );
+    }
+
+    #[test]
+    fn mode_aware_slot_time_formatting_is_stable() {
+        assert_eq!(
+            format_slot_time_for_mode(DecoderMode::Ft4, UNIX_EPOCH + Duration::from_millis(7_500)),
+            "000007.5"
+        );
+        assert_eq!(
+            format_slot_time_for_mode(DecoderMode::Ft4, UNIX_EPOCH + Duration::from_secs(15)),
+            "000015.0"
+        );
+        assert_eq!(
+            format_slot_time_for_mode(DecoderMode::Ft8, UNIX_EPOCH + Duration::from_secs(15)),
+            "000015"
+        );
+        assert_eq!(
+            format_slot_time(UNIX_EPOCH + Duration::from_secs(15)),
+            "000015"
+        );
+    }
+
+    #[test]
+    fn full_decode_is_labeled_full_for_all_modes() {
+        assert_eq!(
+            stage_display_label(DecoderMode::Ft8, DecodeStage::Full),
+            "full"
+        );
+        assert_eq!(
+            stage_display_label(DecoderMode::Ft4, DecodeStage::Full),
+            "full"
+        );
+        assert_eq!(
+            stage_display_label(DecoderMode::Ft2, DecodeStage::Full),
+            "full"
+        );
+    }
+
+    #[test]
     fn related_calls_ignore_previous_qso_peer() {
         let mut tracker = StationTracker::default();
         let now = UNIX_EPOCH + Duration::from_secs(1);
@@ -8024,7 +8567,8 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let decode = dxpedition_direct_decode("PY7ZZ", "SP4MCH", "N1VF", -18);
         let observation =
-            direct_call_observation_from_decode(&decode, "N1VF", now).expect("direct observation");
+            direct_call_observation_from_decode(&decode, "N1VF", now, DecoderMode::Ft8)
+                .expect("direct observation");
         assert_eq!(observation.callsign, "PY7ZZ");
         assert_eq!(observation.start_state, QsoState::SendSigAck);
         assert!(!observation.compound_eligible);
@@ -8053,7 +8597,8 @@ mod tests {
             },
         };
         let observation =
-            direct_call_observation_from_decode(&decode, "N1VF", now).expect("direct observation");
+            direct_call_observation_from_decode(&decode, "N1VF", now, DecoderMode::Ft8)
+                .expect("direct observation");
         assert_eq!(observation.callsign, "JA1IST");
         assert_eq!(observation.start_state, QsoState::SendRR73);
         assert!(!observation.compound_eligible);
@@ -8872,5 +9417,15 @@ mod tests {
         assert_eq!(scan.history.len(), 1);
         assert!(scan.history[0].got_reply);
         assert!(scan.history[0].got_roger);
+    }
+
+    #[test]
+    fn qso_jsonl_scan_surfaces_logged_app_mode() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":13,"partner_call":"K1ABC","state_before":"idle","state_after":"send_grid","last_rx_event":"start","app_mode":"ft4","rx_text":"","tx_text":""}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":13,"partner_call":"K1ABC","state_before":"send_grid","state_after":"idle","last_rx_event":"stopped","app_mode":"ft4","rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert_eq!(scan.history.len(), 1);
+        assert_eq!(scan.history[0].mode, "FT4");
     }
 }
