@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::Registry;
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -4595,12 +4595,6 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         .map(|(_, entry)| entry)
         .collect::<Vec<_>>();
     direct_calls.sort_by_key(|entry| entry.sort_epoch_ms);
-    trace!(
-        count = history.len(),
-        direct_calls = direct_calls.len(),
-        recent_worked = recent_worked.len(),
-        "recent_worked_cache_loaded"
-    );
     QsoJsonlScan {
         history,
         direct_calls,
