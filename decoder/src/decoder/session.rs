@@ -435,7 +435,7 @@ fn debug_run_decode_search_inner(
     residual_override: Option<AudioBuffer>,
     initial_successes: Vec<SuccessfulDecode>,
     base_resolver: Option<&HashResolver>,
-    _sync_threshold: f32,
+    sync_threshold: f32,
     allow_ap: bool,
     capture_trace: bool,
 ) -> DebugSearchTrace {
@@ -461,7 +461,6 @@ fn debug_run_decode_search_inner(
     }
 
     for pass in 0..total_passes {
-        let pass_sync_threshold = options.sync_threshold_for_pass(pass);
         let cached_long_spectrum = if options.mode == Mode::Ft4 {
             None
         } else {
@@ -469,7 +468,7 @@ fn debug_run_decode_search_inner(
         };
         let mut pass_options = options.clone();
         pass_options.max_candidates = options.max_candidates_for_pass(pass);
-        let candidates = collect_candidates(&residual_audio, &pass_options, pass_sync_threshold);
+        let candidates = collect_candidates(&residual_audio, &pass_options, sync_threshold);
         if pass == 0 {
             top_candidates = candidates.clone();
         }

@@ -102,10 +102,7 @@ impl DecodeOptions {
             max_freq_hz: 4_000.0,
             max_candidates: 600,
             max_successes: 200,
-            search_passes: match mode {
-                Mode::Ft4 => 2,
-                Mode::Ft8 | Mode::Ft2 => 3,
-            },
+            search_passes: 3,
             target_freq_hz: mode.spec().search.nfqso_hz,
             tx_freq_hz: mode.spec().search.nfqso_hz,
             ap_width_hz: 75.0,
@@ -121,14 +118,6 @@ impl DecodeOptions {
             1.3
         } else {
             self.mode.spec().search.sync_threshold
-        }
-    }
-
-    fn sync_threshold_for_pass(&self, outer_pass: usize) -> f32 {
-        if self.mode == Mode::Ft4 && outer_pass > 0 {
-            self.sync_threshold().max(2.0)
-        } else {
-            self.sync_threshold()
         }
     }
 
@@ -1282,11 +1271,6 @@ mod tests {
         };
         assert_eq!(options.max_osd_passes(0, 1_500.0), -1);
         assert_eq!(options.max_osd_passes(1, 1_500.0), -1);
-    }
-
-    #[test]
-    fn ft4_defaults_to_two_search_passes() {
-        assert_eq!(DecodeOptions::for_mode(Mode::Ft4).search_passes, 2);
     }
 
     #[test]
