@@ -1,6 +1,6 @@
 use clap::Parser;
 use ft8_decoder::{
-    GridReport, WaveformOptions, encode_standard_message, synthesize_rectangular_waveform,
+    GridReport, Mode, WaveformOptions, encode_standard_message, synthesize_rectangular_waveform,
 };
 use rigctl::audio::play_mono_samples;
 use rigctl::{K3S_BAUD_RATE, K3s, K3sConfig, TxMeterMode, detect_k3s_audio_output_device};
@@ -179,6 +179,7 @@ fn synthesize_ft8_cq(
     let waveform = synthesize_rectangular_waveform(
         &frame,
         &WaveformOptions {
+            mode: Mode::Ft8,
             base_freq_hz,
             start_seconds: 0.5,
             total_seconds: 15.0,
