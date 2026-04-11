@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 use tracing_subscriber::Registry;
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -61,6 +61,7 @@ const DIRECT_CALL_PANE_RETENTION: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_QUEUE_NO_MSG_RETRY_DELAY: Duration = Duration::from_secs(35);
 const DEFAULT_QUEUE_NO_FWD_RETRY_DELAY: Duration = Duration::from_secs(300);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const QSO_JSONL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const CONFIG_DEFAULT: &str = "config/ft8rx.json";
 
 #[derive(Debug, Parser)]
@@ -738,6 +739,7 @@ struct QsoJsonlCache {
     direct_calls_since: SystemTime,
     last_modified: Option<SystemTime>,
     last_len: u64,
+    last_refresh_at: Option<SystemTime>,
     history: Vec<WebQsoHistoryEntry>,
     direct_calls: Vec<WebDirectCallLog>,
     recent_worked: BTreeMap<WorkedBandKey, SystemTime>,
@@ -1698,6 +1700,7 @@ impl QsoJsonlCache {
             direct_calls_since,
             last_modified: None,
             last_len: 0,
+            last_refresh_at: None,
             history: Vec::new(),
             direct_calls: Vec::new(),
             recent_worked: BTreeMap::new(),
@@ -1705,6 +1708,12 @@ impl QsoJsonlCache {
     }
 
     fn refresh(&mut self, now: SystemTime) {
+        if let Some(last_refresh_at) = self.last_refresh_at
+            && now.duration_since(last_refresh_at).unwrap_or_default() < QSO_JSONL_REFRESH_INTERVAL
+        {
+            return;
+        }
+        self.last_refresh_at = Some(now);
         let Ok(metadata) = std::fs::metadata(&self.path) else {
             self.history.clear();
             self.direct_calls.clear();
@@ -4586,7 +4595,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         .map(|(_, entry)| entry)
         .collect::<Vec<_>>();
     direct_calls.sort_by_key(|entry| entry.sort_epoch_ms);
-    info!(
+    trace!(
         count = history.len(),
         direct_calls = direct_calls.len(),
         recent_worked = recent_worked.len(),
@@ -4809,6 +4818,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         display.capture_recoveries = stats.recoveries;
 
         let now = SystemTime::now();
+        qso_controller.tick(now);
+        for outcome in qso_controller.drain_outcomes() {
+            work_queue.handle_qso_outcome(&outcome, &station_tracker);
+        }
         if now.duration_since(last_rig_poll).unwrap_or_default() >= Duration::from_secs(2) {
             let previous_band = display.rig.as_ref().map(|rig| rig.band.to_string());
             display.rig = read_rig_snapshot_shared(&rig);
@@ -5212,10 +5225,6 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             }
         }
 
-        qso_controller.tick(SystemTime::now());
-        for outcome in qso_controller.drain_outcomes() {
-            work_queue.handle_qso_outcome(&outcome, &station_tracker);
-        }
         let qso_runtime_snapshot = qso_controller.snapshot(SystemTime::now());
         if let Some(dispatch) = work_queue.scheduler_pick(
             SystemTime::now(),
@@ -5260,6 +5269,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     );
                 }
             }
+        }
+        qso_controller.tick(SystemTime::now());
+        for outcome in qso_controller.drain_outcomes() {
+            work_queue.handle_qso_outcome(&outcome, &station_tracker);
         }
 
         if should_refresh_waterfall(

@@ -2261,13 +2261,11 @@ fn run_tx_thread(
     event_tx: mpsc::Sender<TxEvent>,
 ) {
     let _busy_guard = TxBusyGuard::new(tx_busy);
-    if wait_until(
-        request
-            .target_slot
-            .checked_sub(Duration::from_millis(PRE_KEY_MS))
-            .unwrap_or(request.target_slot),
-        &cancel,
-    ) {
+    let key_target = request
+        .target_slot
+        .checked_sub(Duration::from_millis(PRE_KEY_MS))
+        .unwrap_or(request.target_slot);
+    if wait_until(key_target, &cancel) {
         let _ = event_tx.send(TxEvent::Aborted {
             session_id: request.session_id,
             state: request.state,
