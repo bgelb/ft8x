@@ -479,13 +479,16 @@ fn debug_run_decode_search_inner(
         let mut pass_successes = Vec::<SuccessfulDecode>::new();
         let mut pass_changed = false;
         let mut candidate_traces = Vec::new();
+        let mut ft4_long_spectrum = if options.mode == Mode::Ft4 {
+            Some(build_long_spectrum(&residual_audio, spec))
+        } else {
+            None
+        };
         for candidate in &candidates {
-            let long_spectrum_owned = if options.mode == Mode::Ft4 {
-                Some(build_long_spectrum(&residual_audio, spec))
-            } else {
-                None
-            };
-            let long_spectrum = long_spectrum_owned
+            if options.mode == Mode::Ft4 && ft4_long_spectrum.is_none() {
+                ft4_long_spectrum = Some(build_long_spectrum(&residual_audio, spec));
+            }
+            let long_spectrum = ft4_long_spectrum
                 .as_ref()
                 .or_else(|| cached_long_spectrum.as_ref())
                 .expect("decode pass spectrum should be available");
@@ -537,12 +540,14 @@ fn debug_run_decode_search_inner(
                     pass_changed = true;
                     if !options.disable_subtraction {
                         subtract_candidate(&mut residual_audio, &success, subtraction_plan);
+                        ft4_long_spectrum = None;
                     }
                     continue;
                 }
                 pass_changed = true;
                 if !options.disable_subtraction {
                     subtract_candidate(&mut residual_audio, &success, subtraction_plan);
+                    ft4_long_spectrum = None;
                 }
                 if capture_trace {
                     accepted_successes.push(rendered_success_key(&success, &resolver));
