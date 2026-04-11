@@ -124,6 +124,14 @@ impl DecodeOptions {
         }
     }
 
+    fn sync_threshold_for_pass(&self, outer_pass: usize) -> f32 {
+        if self.mode == Mode::Ft4 && outer_pass > 0 {
+            self.sync_threshold().max(2.0)
+        } else {
+            self.sync_threshold()
+        }
+    }
+
     fn max_osd_passes(&self, outer_pass: usize, freq_hz: f32) -> isize {
         match (self.mode, self.profile) {
             (_, DecodeProfile::Quick) => -1,
