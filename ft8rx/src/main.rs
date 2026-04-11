@@ -2476,14 +2476,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .history-row {
       display: grid;
-      grid-template-columns: 132px 58px 72px 28px 24px 24px 24px 74px 74px minmax(140px, 1fr);
-      gap: 4px;
+      grid-template-columns: 126px 52px 64px 24px 28px 24px 18px 18px 64px 64px minmax(96px, 1fr);
+      gap: 3px;
       align-items: baseline;
-      padding: 2px 4px;
+      padding: 2px 3px;
       border: 1px solid rgba(143, 176, 192, 0.08);
       border-radius: 6px;
       background: rgba(19, 40, 56, 0.45);
-      min-width: 640px;
+      min-width: 600px;
     }
     .history-head {
       position: sticky;
@@ -2502,9 +2502,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
       color: var(--ink);
+      min-width: 0;
     }
     .history-cell.muted {
       color: var(--muted);
+    }
+    .history-cell-exit {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
     }
     .table-scroll {
       min-height: 0;
@@ -3559,7 +3566,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="history-cell muted">${entry.reached_73 ? 'Y' : '-'}</div>
           <div class="history-cell">${escapeHtml(entry.sent_info)}</div>
           <div class="history-cell">${escapeHtml(entry.received_info)}</div>
-          <div class="history-cell muted">${escapeHtml(entry.exit_reason)}</div>`;
+          <div class="history-cell history-cell-exit muted">${escapeHtml(entry.exit_reason)}</div>`;
         list.appendChild(row);
       }
     }
