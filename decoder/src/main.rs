@@ -42,8 +42,8 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         max_successes: usize,
 
-        #[arg(long, default_value_t = 3)]
-        search_passes: usize,
+        #[arg(long)]
+        search_passes: Option<usize>,
 
         #[arg(long, default_value = "medium")]
         profile: String,
@@ -89,8 +89,8 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         max_successes: usize,
 
-        #[arg(long, default_value_t = 3)]
-        search_passes: usize,
+        #[arg(long)]
+        search_passes: Option<usize>,
 
         #[arg(long, default_value = "medium")]
         profile: String,
@@ -363,20 +363,20 @@ fn decode_options_with_overrides(
     max_freq_hz: f32,
     max_candidates: usize,
     max_successes: usize,
-    search_passes: usize,
+    search_passes: Option<usize>,
     disable_subtraction: bool,
 ) -> DecodeOptions {
-    DecodeOptions {
-        mode,
-        profile,
-        min_freq_hz,
-        max_freq_hz,
-        max_candidates,
-        max_successes,
-        search_passes,
-        disable_subtraction,
-        ..decode_options_for_mode(mode)
+    let mut options = decode_options_for_mode(mode);
+    options.profile = profile;
+    options.min_freq_hz = min_freq_hz;
+    options.max_freq_hz = max_freq_hz;
+    options.max_candidates = max_candidates;
+    options.max_successes = max_successes;
+    if let Some(search_passes) = search_passes {
+        options.search_passes = search_passes;
     }
+    options.disable_subtraction = disable_subtraction;
+    options
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
