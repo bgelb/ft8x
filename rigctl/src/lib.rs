@@ -1,8 +1,9 @@
 pub mod audio {
     pub use audiolib::{
-        AudioDevice, AudioStreamConfig, CaptureStats, Error, Result, SampleStream,
+        AudioDevice, AudioStreamConfig, CaptureStats, Error, PreparedMonoPlayback, Result,
+        SampleStream,
         list_input_devices, list_output_devices, play_interleaved_samples_i16_until,
-        play_mono_samples, play_mono_samples_until, play_tone,
+        play_mono_samples, play_mono_samples_until, play_tone, prepare_mono_playback,
     };
 }
 

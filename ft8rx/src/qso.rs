@@ -6,7 +6,7 @@ use ft8_decoder::{
     TxMessage, WaveformOptions, synthesize_tx_message,
 };
 use rigctl::K3s;
-use rigctl::audio::{AudioDevice, play_mono_samples_until};
+use rigctl::audio::{AudioDevice, prepare_mono_playback};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2287,6 +2287,25 @@ fn run_tx_thread(
         return;
     }
 
+    let prepared_playback = match prepare_mono_playback(
+        &output_device,
+        sample_rate_hz,
+        request.playback_channels,
+        &samples,
+    ) {
+        Ok(playback) => playback,
+        Err(error) => {
+            force_rx(&rig);
+            let _ = event_tx.send(TxEvent::Error {
+                session_id: request.session_id,
+                state: request.state,
+                message_text: request.message_text,
+                message: format!("prepare playback failed: {error}"),
+            });
+            return;
+        }
+    };
+
     if wait_until(request.target_slot, &cancel) {
         force_rx(&rig);
         let _ = event_tx.send(TxEvent::Aborted {
@@ -2304,13 +2323,7 @@ fn run_tx_thread(
         message_text: request.message_text.clone(),
     });
 
-    match play_mono_samples_until(
-        &output_device,
-        sample_rate_hz,
-        request.playback_channels,
-        &samples,
-        Some(cancel.as_ref()),
-    ) {
+    match prepared_playback.play_until(Some(cancel.as_ref())) {
         Ok(()) if cancel.load(Ordering::Relaxed) => {
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Aborted {

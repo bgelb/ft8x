@@ -38,6 +38,13 @@ pub struct AudioDevice {
     pub description: Option<String>,
 }
 
+pub struct PreparedMonoPlayback {
+    #[cfg(target_os = "linux")]
+    pcm: alsa::pcm::PCM,
+    channels: usize,
+    interleaved: Vec<i16>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioStreamConfig {
     pub sample_rate_hz: u32,
@@ -392,9 +399,8 @@ pub fn play_mono_samples_until(
     samples: &[f32],
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    let channel_count = channels.max(1);
-    let interleaved = interleave_mono_samples_i16(samples, channel_count);
-    play_interleaved_samples_i16_until(device, sample_rate_hz, channel_count, &interleaved, cancel)
+    let prepared = prepare_mono_playback(device, sample_rate_hz, channels, samples)?;
+    prepared.play_until(cancel)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -416,29 +422,115 @@ pub fn play_interleaved_samples_i16_until(
     samples: &[i16],
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    use alsa::ValueOr;
-    use alsa::pcm::{Access, Format, HwParams, PCM, State};
-
     if samples.is_empty() {
         return Ok(());
     }
 
+    let pcm = prepare_playback_pcm(device, sample_rate_hz, channels.max(1))?;
+    write_interleaved_samples_i16_until(&pcm, channels.max(1), samples, cancel)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn play_interleaved_samples_i16_until(
+    _device: &AudioDevice,
+    _sample_rate_hz: u32,
+    _channels: usize,
+    _samples: &[i16],
+    _cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    Err(Error::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+pub fn prepare_mono_playback(
+    device: &AudioDevice,
+    sample_rate_hz: u32,
+    channels: usize,
+    samples: &[f32],
+) -> Result<PreparedMonoPlayback> {
+    let channel_count = channels.max(1);
+    Ok(PreparedMonoPlayback {
+        pcm: prepare_playback_pcm(device, sample_rate_hz, channel_count)?,
+        channels: channel_count,
+        interleaved: interleave_mono_samples_i16(samples, channel_count),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn prepare_mono_playback(
+    _device: &AudioDevice,
+    _sample_rate_hz: u32,
+    _channels: usize,
+    _samples: &[f32],
+) -> Result<PreparedMonoPlayback> {
+    Err(Error::UnsupportedPlatform)
+}
+
+impl PreparedMonoPlayback {
+    #[cfg(target_os = "linux")]
+    pub fn play_until(self, cancel: Option<&AtomicBool>) -> Result<()> {
+        write_interleaved_samples_i16_until(&self.pcm, self.channels, &self.interleaved, cancel)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn play_until(self, _cancel: Option<&AtomicBool>) -> Result<()> {
+        Err(Error::UnsupportedPlatform)
+    }
+}
+
+fn interleave_mono_samples_i16(samples: &[f32], channels: usize) -> Vec<i16> {
+    let channel_count = channels.max(1);
+    let mut interleaved = Vec::with_capacity(samples.len() * channel_count);
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let pcm = (clamped * i16::MAX as f32).round() as i16;
+        for _ in 0..channel_count {
+            interleaved.push(pcm);
+        }
+    }
+    interleaved
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_playback_pcm(
+    device: &AudioDevice,
+    sample_rate_hz: u32,
+    channels: usize,
+) -> Result<alsa::pcm::PCM> {
+    use alsa::ValueOr;
+    use alsa::pcm::{Access, Format, HwParams, PCM};
+
     let pcm = PCM::new(&device.spec, alsa::Direction::Playback, false)?;
-    let hwp = HwParams::any(&pcm)?;
-    hwp.set_channels(channels as u32)?;
-    hwp.set_rate(sample_rate_hz, ValueOr::Nearest)?;
-    hwp.set_format(Format::s16())?;
-    hwp.set_access(Access::RWInterleaved)?;
     let period_frames = DEFAULT_PLAYBACK_FRAMES_PER_WRITE as alsa::pcm::Frames;
     let buffer_frames = DEFAULT_PLAYBACK_BUFFER_FRAMES as alsa::pcm::Frames;
-    let _ = hwp.set_period_size_near(period_frames, ValueOr::Nearest)?;
-    let _ = hwp.set_buffer_size_near(buffer_frames)?;
-    pcm.hw_params(&hwp)?;
-    let swp = pcm.sw_params_current()?;
-    swp.set_start_threshold(1)?;
-    swp.set_avail_min(period_frames)?;
-    pcm.sw_params(&swp)?;
+    {
+        let hwp = HwParams::any(&pcm)?;
+        hwp.set_channels(channels as u32)?;
+        hwp.set_rate(sample_rate_hz, ValueOr::Nearest)?;
+        hwp.set_format(Format::s16())?;
+        hwp.set_access(Access::RWInterleaved)?;
+        let _ = hwp.set_period_size_near(period_frames, ValueOr::Nearest)?;
+        let _ = hwp.set_buffer_size_near(buffer_frames)?;
+        pcm.hw_params(&hwp)?;
+    }
+    {
+        let swp = pcm.sw_params_current()?;
+        swp.set_start_threshold(1)?;
+        swp.set_avail_min(period_frames)?;
+        pcm.sw_params(&swp)?;
+    }
     pcm.prepare()?;
+    Ok(pcm)
+}
+
+#[cfg(target_os = "linux")]
+fn write_interleaved_samples_i16_until(
+    pcm: &alsa::pcm::PCM,
+    channels: usize,
+    samples: &[i16],
+    cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    use alsa::pcm::State;
 
     let io = pcm.io_i16()?;
     let mut offset = 0usize;
@@ -484,30 +576,6 @@ pub fn play_interleaved_samples_i16_until(
         pcm.prepare()?;
     }
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn play_interleaved_samples_i16_until(
-    _device: &AudioDevice,
-    _sample_rate_hz: u32,
-    _channels: usize,
-    _samples: &[i16],
-    _cancel: Option<&AtomicBool>,
-) -> Result<()> {
-    Err(Error::UnsupportedPlatform)
-}
-
-fn interleave_mono_samples_i16(samples: &[f32], channels: usize) -> Vec<i16> {
-    let channel_count = channels.max(1);
-    let mut interleaved = Vec::with_capacity(samples.len() * channel_count);
-    for &sample in samples {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let pcm = (clamped * i16::MAX as f32).round() as i16;
-        for _ in 0..channel_count {
-            interleaved.push(pcm);
-        }
-    }
-    interleaved
 }
 
 #[cfg(target_os = "linux")]
