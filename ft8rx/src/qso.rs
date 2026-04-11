@@ -1,5 +1,4 @@
 use crate::config::AppConfig;
-use crate::next_slot_boundary;
 use chrono::{DateTime, Utc};
 use ft8_decoder::{
     DecodeStage, Mode, ReplyWord, StructuredInfoValue, StructuredMessage, TxDirectedPayload,
@@ -192,6 +191,7 @@ pub struct QsoController {
     pending_outcomes: VecDeque<QsoOutcome>,
     current_rig_frequency_hz: Option<u64>,
     current_rig_band: Option<String>,
+    current_app_mode: Mode,
 }
 
 impl QsoController {
@@ -209,15 +209,23 @@ impl QsoController {
             pending_outcomes: VecDeque::new(),
             current_rig_frequency_hz: None,
             current_rig_band: None,
+            current_app_mode: Mode::Ft8,
         }
     }
 
-    pub fn update_rig_context(&mut self, frequency_hz: Option<u64>, band: Option<String>) {
+    pub fn update_rig_context(
+        &mut self,
+        frequency_hz: Option<u64>,
+        band: Option<String>,
+        app_mode: Mode,
+    ) {
         self.current_rig_frequency_hz = frequency_hz;
         self.current_rig_band = band.clone();
+        self.current_app_mode = app_mode;
         if let Some(session) = &mut self.session {
             session.rig_frequency_hz = frequency_hz;
             session.rig_band = band;
+            session.app_mode = app_mode;
         }
     }
 
@@ -274,7 +282,7 @@ impl QsoController {
         let Some(session) = &mut self.session else {
             return;
         };
-        if slot_family(slot_start) == session.tx_slot_family {
+        if slot_family_for_mode(session.app_mode, slot_start) == session.tx_slot_family {
             return;
         }
         Self::roll_rx_stage_tracking(session, slot_start);
@@ -1128,9 +1136,12 @@ impl QsoController {
         } else if let Some(station_info) = &station_info {
             station_info.last_heard_slot_family.opposite()
         } else {
-            slot_family(next_slot_boundary(now))
+            slot_family_for_mode(
+                self.current_app_mode,
+                crate::next_slot_boundary_for_mode(self.current_app_mode, now),
+            )
         };
-        let next_tx_slot = first_matching_slot_after(now, tx_slot_family);
+        let next_tx_slot = first_matching_slot_after(now, tx_slot_family, self.current_app_mode);
         let mut session = ActiveSession {
             session_id: self.next_session_id,
             partner_call: if start_mode == QsoStartMode::Cq {
@@ -1162,6 +1173,7 @@ impl QsoController {
             partner_rx_count: 0,
             rig_frequency_hz: self.current_rig_frequency_hz,
             rig_band: self.current_rig_band.clone(),
+            app_mode: self.current_app_mode,
             last_rx_event: station_info
                 .as_ref()
                 .and_then(|info| info.last_text.as_ref())
@@ -1258,6 +1270,7 @@ impl QsoController {
                 start_mode = %session.start_mode.as_str(),
                 rig_frequency_hz = session.rig_frequency_hz.unwrap_or_default(),
                 rig_band = session.rig_band.clone().unwrap_or_default(),
+                app_mode = %session.app_mode.as_str(),
                 tx_slot_family = %session.tx_slot_family.as_str(),
                 tx_freq_hz = session.tx_freq_hz,
                 state_before = %QsoState::Idle.as_str(),
@@ -1381,6 +1394,7 @@ impl QsoController {
             start_mode = %session.start_mode.as_str(),
             rig_frequency_hz = session.rig_frequency_hz.unwrap_or_default(),
             rig_band = session.rig_band.clone().unwrap_or_default(),
+            app_mode = %session.app_mode.as_str(),
             tx_slot_family = %session.tx_slot_family.as_str(),
             tx_freq_hz = session.tx_freq_hz,
             state_before = %state_before.as_str(),
@@ -1541,6 +1555,7 @@ struct ActiveSession {
     latest_partner_snr_db: i32,
     rig_frequency_hz: Option<u64>,
     rig_band: Option<String>,
+    app_mode: Mode,
     started_at: SystemTime,
     deadline_at: SystemTime,
     next_tx_slot: Option<SystemTime>,
@@ -1594,6 +1609,7 @@ pub(crate) struct TxRequest {
     tx_freq_hz: f32,
     drive_level: f32,
     playback_channels: usize,
+    app_mode: Mode,
 }
 
 #[derive(Debug, Clone)]
@@ -1699,11 +1715,10 @@ impl TxBackend for RigTxBackend {
         let synthesized = synthesize_tx_message(
             &request.message,
             &WaveformOptions {
-                mode: Mode::Ft8,
+                mode: request.app_mode,
                 base_freq_hz: request.tx_freq_hz,
-                start_seconds: 0.5,
-                total_seconds: 15.0,
                 amplitude: request.drive_level,
+                ..WaveformOptions::for_mode(request.app_mode)
             },
         )
         .map_err(|error| {
@@ -1966,6 +1981,7 @@ fn build_tx_request(
         tx_freq_hz: session.tx_freq_hz,
         drive_level: config.tx.drive_level,
         playback_channels: config.tx.playback_channels,
+        app_mode: session.app_mode,
     }
 }
 
@@ -2388,33 +2404,39 @@ fn with_rig<T>(
     f(rig).map_err(|error| error.to_string())
 }
 
-fn first_matching_slot_after(now: SystemTime, family: SlotFamily) -> SystemTime {
-    let mut slot = crate::next_slot_boundary(now);
+fn first_matching_slot_after(now: SystemTime, family: SlotFamily, app_mode: Mode) -> SystemTime {
+    let mut slot = crate::next_slot_boundary_for_mode(app_mode, now);
     let key_time = slot
         .checked_sub(Duration::from_millis(PRE_KEY_MS))
         .unwrap_or(slot);
     if now >= key_time {
-        slot += Duration::from_secs(crate::SLOT_SECONDS);
+        slot += crate::slot_duration_for_mode(app_mode);
     }
-    while slot_family(slot) != family {
-        slot += Duration::from_secs(crate::SLOT_SECONDS);
+    while slot_family_for_mode(app_mode, slot) != family {
+        slot += crate::slot_duration_for_mode(app_mode);
     }
     slot
 }
 
-fn next_matching_slot_after(slot_start: SystemTime, family: SlotFamily) -> Option<SystemTime> {
-    let mut slot = slot_start + Duration::from_secs(crate::SLOT_SECONDS);
-    while slot_family(slot) != family {
-        slot += Duration::from_secs(crate::SLOT_SECONDS);
+fn next_matching_slot_after(
+    slot_start: SystemTime,
+    family: SlotFamily,
+    app_mode: Mode,
+) -> Option<SystemTime> {
+    let mut slot = slot_start + crate::slot_duration_for_mode(app_mode);
+    while slot_family_for_mode(app_mode, slot) != family {
+        slot += crate::slot_duration_for_mode(app_mode);
     }
     Some(slot)
 }
 
 fn schedule_next_tx_slot(session: &ActiveSession, rx_slot_start: SystemTime) -> Option<SystemTime> {
-    let mut candidate = next_matching_slot_after(rx_slot_start, session.tx_slot_family)?;
+    let mut candidate =
+        next_matching_slot_after(rx_slot_start, session.tx_slot_family, session.app_mode)?;
     if let Some(last_tx_slot) = session.last_tx_slot {
         while candidate <= last_tx_slot {
-            candidate = next_matching_slot_after(candidate, session.tx_slot_family)?;
+            candidate =
+                next_matching_slot_after(candidate, session.tx_slot_family, session.app_mode)?;
         }
     }
     Some(candidate)
@@ -2428,7 +2450,8 @@ fn is_next_tx_slot_committed(
     if !tx_backend_active {
         return false;
     }
-    let Some(candidate_slot) = next_matching_slot_after(rx_slot_start, session.tx_slot_family)
+    let Some(candidate_slot) =
+        next_matching_slot_after(rx_slot_start, session.tx_slot_family, session.app_mode)
     else {
         return false;
     };
@@ -2436,7 +2459,11 @@ fn is_next_tx_slot_committed(
 }
 
 pub fn slot_family(time: SystemTime) -> SlotFamily {
-    if crate::is_even_slot_family(time) {
+    slot_family_for_mode(Mode::Ft8, time)
+}
+
+pub fn slot_family_for_mode(app_mode: Mode, time: SystemTime) -> SlotFamily {
+    if crate::is_even_slot_family_for_mode(app_mode, time) {
         SlotFamily::Even
     } else {
         SlotFamily::Odd
@@ -3535,7 +3562,7 @@ mod tests {
         );
         if let Some(session) = controller.session.as_mut() {
             session.state = QsoState::Send73Once;
-            session.next_tx_slot = Some(first_matching_slot_after(now, SlotFamily::Odd));
+            session.next_tx_slot = Some(first_matching_slot_after(now, SlotFamily::Odd, Mode::Ft8));
         }
         controller.tick(now + Duration::from_secs(15));
         controller.tick(now + Duration::from_secs(15));
@@ -3555,6 +3582,7 @@ mod tests {
             latest_partner_snr_db: -9,
             rig_frequency_hz: None,
             rig_band: None,
+            app_mode: Mode::Ft8,
             started_at: now,
             deadline_at: now + Duration::from_secs(600),
             next_tx_slot: None,
