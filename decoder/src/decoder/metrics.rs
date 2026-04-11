@@ -1,4 +1,5 @@
 use super::*;
+use crate::ldpc::{BpUpdateRule, LdpcDecodePolicy};
 use crate::protocol::{
     FTX_AP_KNOWN_FIELDS, FTX_BITS_PER_SYMBOL, FTX_CODEWORD_BITS, copy_known_message_bits,
     gray_encode_3bit_value,
@@ -445,7 +446,8 @@ pub(super) fn decode_llr_set(
     max_osd: isize,
     counters: &mut DecodeCounters,
 ) -> Option<(Payload, Vec<u8>, usize)> {
-    let Some((bits, iterations)) = parity.decode_for_mode_with_maxosd(mode, llrs, max_osd) else {
+    let policy = ldpc_decode_policy(mode);
+    let Some((bits, iterations)) = parity.decode_with_policy(llrs, None, max_osd, policy) else {
         return None;
     };
     if bits.iter().all(|bit| *bit == 0) {
@@ -470,8 +472,9 @@ pub(super) fn decode_llr_set_with_known_bits(
     max_osd: isize,
     counters: &mut DecodeCounters,
 ) -> Option<(Payload, Vec<u8>, usize)> {
+    let policy = ldpc_decode_policy(mode);
     let Some((bits, iterations)) =
-        parity.decode_for_mode_with_known_bits_and_maxosd(mode, llrs, known_bits, max_osd)
+        parity.decode_with_policy(llrs, Some(known_bits), max_osd, policy)
     else {
         return None;
     };
@@ -487,6 +490,20 @@ pub(super) fn decode_llr_set_with_known_bits(
     }
     counters.parsed_payloads += 1;
     Some((payload, bits, iterations))
+}
+
+fn ldpc_decode_policy(mode: Mode) -> LdpcDecodePolicy {
+    match mode {
+        // FT8 keeps the pre-refactor thresholded candidate search that matches origin/main.
+        Mode::Ft8 => LdpcDecodePolicy::thresholded_search(2),
+        // FT4 parity uses the shared order-2 OSD path but keeps the historical
+        // piecewise-linear BP update that matched the stock reference.
+        Mode::Ft4 => LdpcDecodePolicy {
+            bp_update_rule: BpUpdateRule::PiecewiseLinearAtanh,
+            osd_style: crate::ldpc::OsdStyle::OrderedStatistics { norder: 2 },
+        },
+        Mode::Ft2 => unreachable!("FT2 uses its dedicated LDPC backend"),
+    }
 }
 
 pub(super) fn cq_ap_known_bits(mode: Mode) -> &'static [Option<u8>] {

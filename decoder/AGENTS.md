@@ -33,6 +33,7 @@
 ### Do
 
 - Route geometry, layout, and timing semantics through `ModeSpec`, `FrameGeometry`, and shared layout helpers instead of scattering literals through decoder code.
+- Prefer generic decoder subcomponents whose behavior is configured by externally supplied mode policy over baking parallel mode-specific paths into the component itself. Shared engines should expose policy hooks, thresholds, update rules, or strategy objects; mode wrappers should decide which policy to use. If a refactor reveals that FT8, FT4, or FT2 need different behavior, first try to express that difference as injected policy at the boundary rather than adding `match Mode` branches inside the shared engine.
 - Keep internal indexing zero-based. If an external paper or reference algorithm is 1-based, translate it once at the boundary and keep the rest of the code zero-based.
 - Confine raw slice/index math to small named helpers or hot numeric kernels. Orchestration code should work in terms of named fields, windows, and typed geometry.
 - Add derived constants or helpers when a protocol shape matters. Examples: symbol-group starts, bit-field ranges, valid baseband windows, taper reach, and sync spans.
@@ -44,6 +45,7 @@
 ### Don't
 
 - Don’t add direct `FT8_` references to shared decoder submodules. FT8-specific constants belong in the FT8 mode definition or FT8 wrapper layer.
+- Don’t solve mode divergence in shared decoder engines by accreting parallel FT8/FT4/FT2 code paths unless there is no credible policy boundary. Once a shared component has separate baked-in mode branches, it becomes harder to reason about, harder to test, and easier to regress during cleanup. Prefer one generic implementation plus explicit policy selection from the mode-specific caller.
 - Don’t add raw FT8 timing arithmetic like `dt + 0.5`, `start - 0.5`, or coarse-lag half-step math outside mode/helper code.
 - Don’t duplicate message, codeword, or channel-symbol layout logic across encode, decode, and message-render paths.
 - Don’t rewrite hot DSP, LDPC, subtraction, or FFT loops into iterator-heavy forms just for style. Keep hot loops explicit when that is the clearest and safest representation of the computation.

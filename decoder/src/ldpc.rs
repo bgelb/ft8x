@@ -1,13 +1,26 @@
 use std::sync::OnceLock;
 
 use crate::crc;
-use crate::modes::Mode;
 use crate::protocol::GRAY_TONES_TO_BITS;
 
 const MAX_ITERS: usize = 30;
 const OSD_NT: usize = 40;
-const LEGACY_OSD_NTHETA_MEDIUM: usize = 10;
-const LEGACY_OSD_NTHETA_DEEP: usize = 12;
+const THRESHOLDED_OSD_ZERO_MAXOSD_NTHETA: usize = 10;
+const THRESHOLDED_OSD_ITERATIVE_NTHETA: usize = 12;
+// Preserve the historic piecewise-linear atanh approximation used by the
+// generalized 174,91 decoder path before the FT8 regression fix.
+const BP_UPDATE_LINEAR_LIMIT: f32 = 0.664;
+const BP_UPDATE_LINEAR_SCALE: f32 = 0.83;
+const BP_UPDATE_SEGMENT_1_LIMIT: f32 = 0.9217;
+const BP_UPDATE_SEGMENT_1_OFFSET: f32 = 0.4064;
+const BP_UPDATE_SEGMENT_1_SCALE: f32 = 0.322;
+const BP_UPDATE_SEGMENT_2_LIMIT: f32 = 0.9951;
+const BP_UPDATE_SEGMENT_2_OFFSET: f32 = 0.8378;
+const BP_UPDATE_SEGMENT_2_SCALE: f32 = 0.0524;
+const BP_UPDATE_SEGMENT_3_LIMIT: f32 = 0.9998;
+const BP_UPDATE_SEGMENT_3_OFFSET: f32 = 0.9914;
+const BP_UPDATE_SEGMENT_3_SCALE: f32 = 0.0012;
+const BP_UPDATE_CLAMP: f32 = 7.0;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LdpcOsdProbeResult {
@@ -37,6 +50,50 @@ struct OsdConfig {
     #[allow(dead_code)]
     npre2: bool,
     ntheta: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BpUpdateRule {
+    AtanhClamped,
+    PiecewiseLinearAtanh,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum OsdStyle {
+    OrderedStatistics {
+        norder: usize,
+    },
+    ThresholdedSearch {
+        max_order: usize,
+        zero_maxosd_ntheta: usize,
+        iterative_ntheta: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LdpcDecodePolicy {
+    pub bp_update_rule: BpUpdateRule,
+    pub osd_style: OsdStyle,
+}
+
+impl LdpcDecodePolicy {
+    pub const fn ordered_statistics(norder: usize) -> Self {
+        Self {
+            bp_update_rule: BpUpdateRule::AtanhClamped,
+            osd_style: OsdStyle::OrderedStatistics { norder },
+        }
+    }
+
+    pub const fn thresholded_search(max_order: usize) -> Self {
+        Self {
+            bp_update_rule: BpUpdateRule::AtanhClamped,
+            osd_style: OsdStyle::ThresholdedSearch {
+                max_order,
+                zero_maxosd_ntheta: THRESHOLDED_OSD_ZERO_MAXOSD_NTHETA,
+                iterative_ntheta: THRESHOLDED_OSD_ITERATIVE_NTHETA,
+            },
+        }
+    }
 }
 
 impl OsdConfig {
@@ -202,19 +259,33 @@ impl ParityMatrix {
     }
 
     pub fn decode_with_maxosd(&self, llrs: &[f32], maxosd: isize) -> Option<(Vec<u8>, usize)> {
-        self.decode_bp_osd(llrs, None, maxosd, 2)
+        self.decode_with_policy(llrs, None, maxosd, LdpcDecodePolicy::ordered_statistics(2))
     }
 
-    pub fn decode_for_mode_with_maxosd(
+    pub fn decode_with_policy(
         &self,
-        mode: Mode,
         llrs: &[f32],
+        known_bits: Option<&[Option<u8>]>,
         maxosd: isize,
+        policy: LdpcDecodePolicy,
     ) -> Option<(Vec<u8>, usize)> {
-        match mode {
-            Mode::Ft8 => self.decode_bp_osd_legacy(llrs, None, maxosd),
-            Mode::Ft4 => self.decode_bp_osd(llrs, None, maxosd, 2),
-            Mode::Ft2 => None,
+        match policy.osd_style {
+            OsdStyle::OrderedStatistics { norder } => {
+                self.decode_bp_osd(llrs, known_bits, maxosd, norder, policy.bp_update_rule)
+            }
+            OsdStyle::ThresholdedSearch {
+                max_order,
+                zero_maxosd_ntheta,
+                iterative_ntheta,
+            } => self.decode_bp_with_thresholded_osd(
+                llrs,
+                known_bits,
+                maxosd,
+                max_order,
+                zero_maxosd_ntheta,
+                iterative_ntheta,
+                policy.bp_update_rule,
+            ),
         }
     }
 
@@ -224,21 +295,12 @@ impl ParityMatrix {
         known_bits: &[Option<u8>],
         maxosd: isize,
     ) -> Option<(Vec<u8>, usize)> {
-        self.decode_bp_osd(llrs, Some(known_bits), maxosd, 2)
-    }
-
-    pub fn decode_for_mode_with_known_bits_and_maxosd(
-        &self,
-        mode: Mode,
-        llrs: &[f32],
-        known_bits: &[Option<u8>],
-        maxosd: isize,
-    ) -> Option<(Vec<u8>, usize)> {
-        match mode {
-            Mode::Ft8 => self.decode_bp_osd_legacy(llrs, Some(known_bits), maxosd),
-            Mode::Ft4 => self.decode_bp_osd(llrs, Some(known_bits), maxosd, 2),
-            Mode::Ft2 => None,
-        }
+        self.decode_with_policy(
+            llrs,
+            Some(known_bits),
+            maxosd,
+            LdpcDecodePolicy::ordered_statistics(2),
+        )
     }
 
     fn decode_bp_osd(
@@ -247,6 +309,7 @@ impl ParityMatrix {
         known_bits: Option<&[Option<u8>]>,
         maxosd: isize,
         norder: usize,
+        bp_update_rule: BpUpdateRule,
     ) -> Option<(Vec<u8>, usize)> {
         if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
             return None;
@@ -348,8 +411,7 @@ impl ParityMatrix {
                         }
                         product *= tanhtoc[row_index][row_slot];
                     }
-                    // FT8/FT4 parity is tied to the original 174,91 BP update used on `main`.
-                    tov[column][slot] = 2.0 * atanh_clamped(-product);
+                    tov[column][slot] = 2.0 * apply_bp_update_rule(bp_update_rule, -product);
                 }
             }
         }
@@ -363,11 +425,15 @@ impl ParityMatrix {
         None
     }
 
-    fn decode_bp_osd_legacy(
+    fn decode_bp_with_thresholded_osd(
         &self,
         llrs: &[f32],
         known_bits: Option<&[Option<u8>]>,
         maxosd: isize,
+        max_order: usize,
+        zero_maxosd_ntheta: usize,
+        iterative_ntheta: usize,
+        bp_update_rule: BpUpdateRule,
     ) -> Option<(Vec<u8>, usize)> {
         if llrs.len() != 174 || known_bits.is_some_and(|bits| bits.len() != 174) {
             return None;
@@ -469,19 +535,18 @@ impl ParityMatrix {
                         }
                         product *= tanhtoc[row_index][row_slot];
                     }
-                    tov[column][slot] = 2.0 * atanh_clamped(-product);
+                    tov[column][slot] = 2.0 * apply_bp_update_rule(bp_update_rule, -product);
                 }
             }
         }
 
-        let max_order = 2;
         let ntheta = if maxosd == 0 {
-            LEGACY_OSD_NTHETA_MEDIUM
+            zero_maxosd_ntheta
         } else {
-            LEGACY_OSD_NTHETA_DEEP
+            iterative_ntheta
         };
         for (index, saved) in saved_llrs.iter().enumerate() {
-            if let Some(bits) = self.decode_osd_legacy(saved, known_bits, max_order, ntheta) {
+            if let Some(bits) = self.decode_osd_thresholded(saved, known_bits, max_order, ntheta) {
                 return Some((bits, MAX_ITERS + index + 1));
             }
         }
@@ -587,8 +652,8 @@ impl ParityMatrix {
                         }
                         product *= tanhtoc[row_index][row_slot];
                     }
-                    // Keep the debug path numerically aligned with the live FT8/FT4 decoder.
-                    tov[column][slot] = 2.0 * atanh_clamped(-product);
+                    tov[column][slot] =
+                        2.0 * apply_bp_update_rule(BpUpdateRule::AtanhClamped, -product);
                 }
             }
         }
@@ -797,7 +862,7 @@ impl ParityMatrix {
         )
     }
 
-    fn decode_osd_legacy(
+    fn decode_osd_thresholded(
         &self,
         llrs: &[f32],
         known_bits: Option<&[Option<u8>]>,
@@ -976,6 +1041,29 @@ impl ParityMatrix {
         }
         llrs
     }
+}
+
+fn apply_bp_update_rule(rule: BpUpdateRule, value: f32) -> f32 {
+    match rule {
+        BpUpdateRule::AtanhClamped => atanh_clamped(value),
+        BpUpdateRule::PiecewiseLinearAtanh => platanh_approx(value),
+    }
+}
+
+fn platanh_approx(x: f32) -> f32 {
+    let magnitude = x.abs();
+    let approx = if magnitude <= BP_UPDATE_LINEAR_LIMIT {
+        x / BP_UPDATE_LINEAR_SCALE
+    } else if magnitude <= BP_UPDATE_SEGMENT_1_LIMIT {
+        x.signum() * ((magnitude - BP_UPDATE_SEGMENT_1_OFFSET) / BP_UPDATE_SEGMENT_1_SCALE)
+    } else if magnitude <= BP_UPDATE_SEGMENT_2_LIMIT {
+        x.signum() * ((magnitude - BP_UPDATE_SEGMENT_2_OFFSET) / BP_UPDATE_SEGMENT_2_SCALE)
+    } else if magnitude <= BP_UPDATE_SEGMENT_3_LIMIT {
+        x.signum() * ((magnitude - BP_UPDATE_SEGMENT_3_OFFSET) / BP_UPDATE_SEGMENT_3_SCALE)
+    } else {
+        x.signum() * BP_UPDATE_CLAMP
+    };
+    if x == 0.0 { 0.0 } else { approx }
 }
 
 fn build_osd_probe_result(
