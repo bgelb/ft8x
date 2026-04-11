@@ -3572,7 +3572,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         const data = await response.json();
         lastSnapshot = data;
         document.getElementById('time').textContent = data.time_utc || '-';
-        const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(3)} MHz`;
+      const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(4)} MHz`;
       const rigDir = data.rig_is_tx == null ? '?' : (data.rig_is_tx ? 'TX' : 'RX');
       const rigPower = data.rig_power_w == null ? '-' : `${data.rig_power_w.toFixed(1)}W`;
       const rigBg = data.rig_bargraph == null ? '-' : data.rig_bargraph;
@@ -3583,7 +3583,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById('slot').textContent =
         `${data.current_slot}${data.last_done_slot ? ` last=${data.last_done_slot}` : ''}`;
       document.getElementById('times').textContent =
-        `e=${fmtSec(data.decode_times.early_seconds)} m=${fmtSec(data.decode_times.mid_seconds)} l=${fmtSec(data.decode_times.late_seconds)} tx=${fmtSec(data.decode_times.tx_margin_seconds)}`;
+        data.app_mode === 'FT8'
+          ? `e=${fmtSec(data.decode_times.early_seconds)} m=${fmtSec(data.decode_times.mid_seconds)} l=${fmtSec(data.decode_times.late_seconds)} tx=${fmtSec(data.decode_times.tx_margin_seconds)}`
+          : `m=${fmtSec(data.decode_times.mid_seconds)} tx=${fmtSec(data.decode_times.tx_margin_seconds)}`;
       document.getElementById('dtstats').textContent =
         `cur=${fmtSec(data.dt_stats.current_mean_seconds)}/${fmtSec(data.dt_stats.current_median_seconds)} sd=${fmtSec(data.dt_stats.current_stddev_seconds)} n=${data.dt_stats.current_count} 10m=${fmtSec(data.dt_stats.ten_minute_mean_seconds)}/${fmtSec(data.dt_stats.ten_minute_median_seconds)} n=${data.dt_stats.ten_minute_count}`;
       document.getElementById('count').textContent = `${data.decodes.length} visible`;
@@ -5210,6 +5212,15 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 display.last_slot_start = Some(slot_start);
                                 display.full_wall_ms = Some(wall_ms);
                                 display.last_decode_wall_ms = Some(wall_ms);
+                                if display.app_mode != DecoderMode::Ft8 {
+                                    display.early47_tx_margin_ms =
+                                        Some(tx_margin_after_stage_decode_ms(
+                                            display.app_mode,
+                                            slot_start,
+                                            stage,
+                                            wall_ms,
+                                        )?);
+                                }
                                 display.full_decodes = update.report.decodes.clone();
                                 if dt_frame_history.len() == DT_HISTORY_FRAMES {
                                     dt_frame_history.pop_front();
@@ -5266,8 +5277,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         Err(error) => {
                             display.decode_status = format!(
                                 "Last {} {} failed: {}",
-                                stage.as_str(),
-                                format_slot_time(slot_start),
+                                stage_display_label(display.app_mode, stage),
+                                format_slot_time_for_mode(display.app_mode, slot_start),
                                 error
                             );
                             if stage == DecodeStage::Full {
@@ -5300,8 +5311,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 Err(error) => {
                     display.decode_status = format!(
                         "Capture error for {} {}: {}",
-                        stage.as_str(),
-                        format_slot_time(slot_start),
+                        stage_display_label(display.app_mode, stage),
+                        format_slot_time_for_mode(display.app_mode, slot_start),
                         error
                     );
                     next_slot_stages.mark_handled(stage);
@@ -5356,9 +5367,12 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         display.dropped_slots += 1;
                         display.decode_status = format!(
                             "capture=active decode=busy dropping={} drops={} next={}",
-                            format_slot_time(slot_start),
+                            format_slot_time_for_mode(display.app_mode, slot_start),
                             display.dropped_slots,
-                            format_slot_time(next_slot + slot_duration_for_mode(display.app_mode))
+                            format_slot_time_for_mode(
+                                display.app_mode,
+                                next_slot + slot_duration_for_mode(display.app_mode)
+                            )
                         );
                         display.last_slot_start = Some(slot_start);
                         display.early41_decodes.clear();
@@ -5547,7 +5561,9 @@ fn refresh_web_snapshot(
     guard.rig_tune_active = tune_active;
     guard.decode_status = display.decode_status.clone();
     guard.audio_stats = WebAudioStats {
-        latest_sample: display.capture_latest_sample_time.map(format_slot_time),
+        latest_sample: display
+            .capture_latest_sample_time
+            .map(|time| format_slot_time_for_mode(display.app_mode, time)),
         selected_channel: display.capture_channel,
         overall_dbfs: display.capture_rms_dbfs,
         left_dbfs: display
@@ -5562,11 +5578,20 @@ fn refresh_web_snapshot(
             .unwrap_or(-120.0),
         recoveries: display.capture_recoveries,
     };
-    guard.decode_times = WebDecodeTimes {
-        early_seconds: display.early41_wall_ms.map(ms_to_seconds),
-        mid_seconds: display.early47_wall_ms.map(ms_to_seconds),
-        late_seconds: display.full_wall_ms.map(ms_to_seconds),
-        tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+    guard.decode_times = if display.app_mode == DecoderMode::Ft8 {
+        WebDecodeTimes {
+            early_seconds: display.early41_wall_ms.map(ms_to_seconds),
+            mid_seconds: display.early47_wall_ms.map(ms_to_seconds),
+            late_seconds: display.full_wall_ms.map(ms_to_seconds),
+            tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+        }
+    } else {
+        WebDecodeTimes {
+            early_seconds: None,
+            mid_seconds: display.full_wall_ms.map(ms_to_seconds),
+            late_seconds: None,
+            tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+        }
     };
     guard.dt_stats = WebDtStats {
         current_mean_seconds: current_dt_stats.mean,
@@ -5577,8 +5602,10 @@ fn refresh_web_snapshot(
         ten_minute_median_seconds: ten_minute_dt_stats.median,
         ten_minute_count: ten_minute_dt_stats.count,
     };
-    guard.current_slot = format_slot_time(current_slot);
-    guard.last_done_slot = display.last_slot_start.map(format_slot_time);
+    guard.current_slot = format_slot_time_for_mode(display.app_mode, current_slot);
+    guard.last_done_slot = display
+        .last_slot_start
+        .map(|time| format_slot_time_for_mode(display.app_mode, time));
     guard.decodes = decodes;
     guard.waterfall = waterfall_rows.iter().cloned().collect();
     guard.bandmaps = WebBandMaps {
@@ -5912,7 +5939,7 @@ fn decode_stage_from_samples(
         .decode_stage_with_state(&audio, &options, stage, Some(state))
         .map_err(|error| AppError::Decoder(error.to_string()))?;
     *state = next_state;
-    relabel_stage_update(&mut update, slot_start);
+    relabel_stage_update(&mut update, slot_start, mode);
     Ok(update)
 }
 
@@ -5946,7 +5973,7 @@ fn decode_slot_from_samples(
         .map_err(|error| AppError::Decoder(error.to_string()))?;
     let mut final_decodes = Vec::new();
     for mut update in updates {
-        relabel_stage_update(&mut update, slot_start);
+        relabel_stage_update(&mut update, slot_start, mode);
         match update.stage {
             DecodeStage::Early41 => {}
             DecodeStage::Early47 => {
@@ -5999,7 +6026,7 @@ fn render(display: &DisplayState) {
     let rig_frequency = display
         .rig
         .as_ref()
-        .map(|state| format!("{:.3} MHz", state.frequency_hz as f64 / 1_000_000.0))
+        .map(|state| format!("{:.4} MHz", state.frequency_hz as f64 / 1_000_000.0))
         .unwrap_or_else(|| "unavailable".to_string());
     let rig_mode = display
         .rig
@@ -6044,7 +6071,7 @@ fn render(display: &DisplayState) {
         .unwrap_or(-120.0);
     let latest_sample = display
         .capture_latest_sample_time
-        .map(format_slot_time)
+        .map(|time| format_slot_time_for_mode(display.app_mode, time))
         .unwrap_or_else(|| "------".to_string());
 
     let mut output = String::new();
@@ -6083,27 +6110,36 @@ fn render(display: &DisplayState) {
             .map(|ms| format!(" last={:.2}s", ms as f32 / 1000.0))
             .unwrap_or_default()
     );
-    let _ = writeln!(
-        output,
-        "DecodeT  early={} mid={} late={} tx_margin={}",
-        format_wall_time(display.early41_wall_ms),
-        format_wall_time(display.early47_wall_ms),
-        format_wall_time(display.full_wall_ms),
-        format_signed_wall_time(display.early47_tx_margin_ms)
-    );
+    if display.app_mode == DecoderMode::Ft8 {
+        let _ = writeln!(
+            output,
+            "DecodeT  early={} mid={} late={} tx_margin={}",
+            format_wall_time(display.early41_wall_ms),
+            format_wall_time(display.early47_wall_ms),
+            format_wall_time(display.full_wall_ms),
+            format_signed_wall_time(display.early47_tx_margin_ms)
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "DecodeT  mid={} tx_margin={}",
+            format_wall_time(display.full_wall_ms),
+            format_signed_wall_time(display.early47_tx_margin_ms)
+        );
+    }
     if let Some(slot_start) = display.last_slot_start {
         let _ = writeln!(
             output,
             "Slot     {} {} last_done={}",
-            format_slot_time(current_slot),
+            format_slot_time_for_mode(display.app_mode, current_slot),
             slot_progress_bar(now, display.app_mode),
-            format_slot_time(slot_start)
+            format_slot_time_for_mode(display.app_mode, slot_start)
         );
     } else {
         let _ = writeln!(
             output,
             "Slot     {} {}",
-            format_slot_time(current_slot),
+            format_slot_time_for_mode(display.app_mode, current_slot),
             slot_progress_bar(now, display.app_mode)
         );
     }
@@ -6215,6 +6251,20 @@ fn ms_to_signed_seconds(ms: i128) -> f32 {
     ms as f32 / 1000.0
 }
 
+fn stage_display_label(mode: DecoderMode, stage: DecodeStage) -> &'static str {
+    match stage {
+        DecodeStage::Early41 => "early",
+        DecodeStage::Early47 => "mid",
+        DecodeStage::Full => {
+            if mode == DecoderMode::Ft8 {
+                "full"
+            } else {
+                "full"
+            }
+        }
+    }
+}
+
 fn slot_millis_for_mode(mode: DecoderMode) -> u64 {
     match mode {
         DecoderMode::Ft8 => 15_000,
@@ -6291,6 +6341,18 @@ fn parse_slot_family_name(value: &str) -> Option<qso::SlotFamily> {
 fn format_slot_time(time: SystemTime) -> String {
     let utc: DateTime<Utc> = time.into();
     utc.format("%H%M%S").to_string()
+}
+
+fn format_slot_time_for_mode(mode: DecoderMode, time: SystemTime) -> String {
+    if mode == DecoderMode::Ft8 {
+        return format_slot_time(time);
+    }
+    let utc: DateTime<Utc> = time.into();
+    format!(
+        "{}.{}",
+        utc.format("%H%M%S"),
+        utc.timestamp_subsec_millis() / 100
+    )
 }
 
 fn temp_path(name: &str) -> PathBuf {
@@ -6377,22 +6439,22 @@ fn format_status(
         Some(active) => format!(
             "capture={} decode={} slot={} drops={} next={}",
             capture_state,
-            active.stage.as_str(),
-            format_slot_time(active.slot_start),
+            stage_display_label(app_mode, active.stage),
+            format_slot_time_for_mode(app_mode, active.slot_start),
             dropped_slots,
-            format_slot_time(next_slot)
+            format_slot_time_for_mode(app_mode, next_slot)
         ),
         None => format!(
             "capture={} decode=idle drops={} next={}",
             capture_state,
             dropped_slots,
-            format_slot_time(next_slot)
+            format_slot_time_for_mode(app_mode, next_slot)
         ),
     }
 }
 
-fn relabel_stage_update(update: &mut StageDecodeReport, slot_start: SystemTime) {
-    let slot_label = format_slot_time(slot_start);
+fn relabel_stage_update(update: &mut StageDecodeReport, slot_start: SystemTime, mode: DecoderMode) {
+    let slot_label = format_slot_time_for_mode(mode, slot_start);
     for decode in &mut update.report.decodes {
         decode.utc = slot_label.clone();
     }
@@ -6440,7 +6502,7 @@ fn composite_rows(display: &DisplayState) -> Vec<CompositeDecodeRow> {
             .entry(decode.text.clone())
             .or_insert_with(|| CompositeDecodeRow {
                 display: decode.clone(),
-                seen: "late",
+                seen: "full",
             });
         entry.display = decode.clone();
     }
@@ -8318,6 +8380,66 @@ mod tests {
                 .is_none()
         );
         assert_eq!(queue.scheduler_status, "ft2 rx-only");
+    }
+
+    #[test]
+    fn ft4_slot_boundaries_preserve_half_second_alignment() {
+        let before_half = UNIX_EPOCH + Duration::from_millis(7_499);
+        let at_half = UNIX_EPOCH + Duration::from_millis(7_500);
+        let later = UNIX_EPOCH + Duration::from_millis(22_900);
+
+        assert_eq!(
+            current_slot_boundary_for_mode(DecoderMode::Ft4, before_half),
+            UNIX_EPOCH
+        );
+        assert_eq!(
+            current_slot_boundary_for_mode(DecoderMode::Ft4, at_half),
+            UNIX_EPOCH + Duration::from_millis(7_500)
+        );
+        assert_eq!(
+            next_slot_boundary_for_mode(DecoderMode::Ft4, at_half),
+            UNIX_EPOCH + Duration::from_millis(15_000)
+        );
+        assert_eq!(
+            current_slot_boundary_for_mode(DecoderMode::Ft4, later),
+            UNIX_EPOCH + Duration::from_millis(22_500)
+        );
+    }
+
+    #[test]
+    fn mode_aware_slot_time_formatting_is_stable() {
+        assert_eq!(
+            format_slot_time_for_mode(DecoderMode::Ft4, UNIX_EPOCH + Duration::from_millis(7_500)),
+            "000007.5"
+        );
+        assert_eq!(
+            format_slot_time_for_mode(DecoderMode::Ft4, UNIX_EPOCH + Duration::from_secs(15)),
+            "000015.0"
+        );
+        assert_eq!(
+            format_slot_time_for_mode(DecoderMode::Ft8, UNIX_EPOCH + Duration::from_secs(15)),
+            "000015"
+        );
+        assert_eq!(
+            format_slot_time(UNIX_EPOCH + Duration::from_secs(15)),
+            "000015"
+        );
+    }
+
+    #[test]
+    fn full_decode_is_labeled_full_for_all_modes() {
+        assert_eq!(
+            stage_display_label(DecoderMode::Ft8, DecodeStage::Full),
+            "full"
+        );
+        assert_eq!(
+            stage_display_label(DecoderMode::Ft4, DecodeStage::Full),
+            "full"
+        );
+        assert_eq!(
+            stage_display_label(DecoderMode::Ft2, DecodeStage::Full),
+            "full"
+        );
     }
 
     #[test]
