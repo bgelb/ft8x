@@ -8,6 +8,12 @@ pub(super) struct DebugSearchTrace {
     pub(super) passes: Vec<SearchPassTrace>,
 }
 
+struct Ft8ReportedSnrContext {
+    long_spectrum: LongSpectrum,
+    baseband_plan: BasebandPlan,
+    baseline_db: Vec<f32>,
+}
+
 impl DecoderSession {
     pub fn new() -> Self {
         Self::default()
@@ -305,6 +311,9 @@ pub(super) fn build_decode_report_with_resolver(
     let resolver = base_state
         .map(|state| state.resolver.clone())
         .unwrap_or_default();
+    let ft8_snr_context = (options.mode == Mode::Ft8)
+        .then(|| build_ft8_reported_snr_context(audio, options))
+        .flatten();
 
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
@@ -316,9 +325,16 @@ pub(super) fn build_decode_report_with_resolver(
         if text.trim().is_empty() {
             continue;
         }
+        let reported_snr_db = match success.mode {
+            Mode::Ft8 => ft8_snr_context
+                .as_ref()
+                .and_then(|context| ft8_reported_snr_db(context, &success))
+                .unwrap_or(success.snr_db),
+            Mode::Ft4 | Mode::Ft2 => success.snr_db,
+        };
         let decode = DecodedMessage {
             utc: "000000".to_string(),
-            snr_db: success.snr_db,
+            snr_db: reported_snr_db,
             dt_seconds: success.candidate.dt_seconds,
             freq_hz: success.candidate.freq_hz,
             text: text.clone(),
@@ -355,6 +371,66 @@ pub(super) fn build_decode_report_with_resolver(
         },
         decodes,
     }
+}
+
+fn build_ft8_reported_snr_context(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+) -> Option<Ft8ReportedSnrContext> {
+    let spec = Mode::Ft8.spec();
+    Some(Ft8ReportedSnrContext {
+        long_spectrum: build_long_spectrum(audio, spec),
+        baseband_plan: BasebandPlan::new(spec),
+        baseline_db: ft8_spectrum_baseline_db(audio, options.min_freq_hz, options.max_freq_hz)?,
+    })
+}
+
+fn ft8_reported_snr_db(
+    context: &Ft8ReportedSnrContext,
+    success: &SuccessfulDecode,
+) -> Option<i32> {
+    let spec = Mode::Ft8.spec();
+    let baseband = downsample_candidate(
+        &context.long_spectrum,
+        &context.baseband_plan,
+        spec,
+        success.candidate.freq_hz,
+    )?;
+    let start_index = (success.candidate.start_seconds * spec.baseband_rate_hz()).round() as isize;
+    let full_tones = extract_symbol_tones(spec, &baseband, start_index);
+    let channel_symbols =
+        crate::encode::channel_symbols_from_codeword_bits_for_mode(Mode::Ft8, &success.codeword_bits)?;
+    if channel_symbols.len() != full_tones.len() {
+        return None;
+    }
+
+    let xsig = channel_symbols
+        .iter()
+        .enumerate()
+        .map(|(index, &tone)| full_tones[index][tone as usize].norm_sqr())
+        .sum::<f32>();
+    let bin = ((success.candidate.freq_hz / spec.sync_bin_hz()).round() as isize)
+        .clamp(0, context.baseline_db.len().saturating_sub(1) as isize) as usize;
+    let xbase = 10.0f32.powf(0.1 * (context.baseline_db[bin] - 40.0));
+    if !xbase.is_finite() || xbase <= 0.0 {
+        return None;
+    }
+
+    let mut xsnr = 0.001f32;
+    let arg = xsig / xbase / 3.0e6 - 1.0;
+    if arg > 0.1 {
+        xsnr = arg;
+    }
+    Some((10.0 * xsnr.log10() - 27.0).max(-24.0).round() as i32)
+}
+
+fn ft4_reported_snr_db(coarse_score: f32) -> i32 {
+    let xsnr = if coarse_score > 1.0 {
+        10.0 * (coarse_score - 1.0).log10() - 14.8
+    } else {
+        -21.0
+    };
+    xsnr.max(-21.0).round() as i32
 }
 
 pub(super) fn build_decoder_state(
@@ -939,7 +1015,10 @@ fn build_successful_decode(
             score: refined.sync_score.max(candidate_score),
         },
         ldpc_iterations: iterations,
-        snr_db: refined.snr_db,
+        snr_db: match mode {
+            Mode::Ft4 => ft4_reported_snr_db(candidate_score),
+            Mode::Ft8 | Mode::Ft2 => refined.snr_db,
+        },
     }
 }
 

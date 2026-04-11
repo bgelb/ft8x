@@ -61,7 +61,7 @@ jobs:
         run: cargo test --manifest-path ft8rx/Cargo.toml
 
   decoder-distilled:
-    name: Decoder distilled mixed regressions
+    name: Decoder distilled and SNR regressions
     runs-on: ubuntu-24.04
     env:
       PYTHONPATH: src
@@ -80,4 +80,11 @@ jobs:
           cargo test
           --manifest-path decoder/Cargo.toml
           --test distilled_regressions
+          -- --test-threads=1
+
+      - name: Weak-signal decoder SNR regressions
+        run: >
+          cargo test
+          --manifest-path decoder/Cargo.toml
+          --test snr_regressions
           -- --test-threads=1

@@ -410,18 +410,117 @@ fn collect_candidates_ft4_with_probe(
     (selected, probe)
 }
 
+fn build_nuttall_window(nfft: usize) -> Vec<f32> {
+    let pi = std::f32::consts::PI;
+    (0..nfft)
+        .map(|index| {
+            let phase = 2.0 * pi * index as f32 / nfft as f32;
+            0.3635819 - 0.4891775 * phase.cos() + 0.1365995 * (2.0 * phase).cos()
+                - 0.0106411 * (3.0 * phase).cos()
+        })
+        .collect()
+}
+
 fn ft4_nuttall_window(nfft: usize) -> &'static [f32] {
     static WINDOW: OnceLock<Vec<f32>> = OnceLock::new();
-    WINDOW.get_or_init(|| {
-        let pi = std::f32::consts::PI;
-        (0..nfft)
-            .map(|index| {
-                let phase = 2.0 * pi * index as f32 / nfft as f32;
-                0.3635819 - 0.4891775 * phase.cos() + 0.1365995 * (2.0 * phase).cos()
-                    - 0.0106411 * (3.0 * phase).cos()
-            })
-            .collect()
-    })
+    WINDOW.get_or_init(|| build_nuttall_window(nfft))
+}
+
+pub(super) fn ft8_spectrum_baseline_db(
+    audio: &AudioBuffer,
+    min_freq_hz: f32,
+    max_freq_hz: f32,
+) -> Option<Vec<f32>> {
+    let spec = Mode::Ft8.spec();
+    let nfft = spec.sync_fft_samples();
+    let nh1 = nfft / 2;
+    let step = nfft / 2;
+    let sample_len = audio.samples.len().min(spec.search.long_input_samples);
+    if sample_len < nfft {
+        return None;
+    }
+
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(nfft);
+    let mut input = fft.make_input_vec();
+    let mut spectrum = fft.make_output_vec();
+    let mut window = build_nuttall_window(nfft);
+    let scale = spec.geometry.symbol_samples as f32 * 2.0 / (window.iter().sum::<f32>() * 300.0);
+    for value in &mut window {
+        *value *= scale;
+    }
+
+    let mut savg = vec![0.0f32; nh1 + 1];
+    let mut start = 0usize;
+    while start + nfft <= sample_len {
+        for (slot, (&sample, &gain)) in input
+            .iter_mut()
+            .zip(audio.samples[start..start + nfft].iter().zip(window.iter()))
+        {
+            *slot = sample * gain;
+        }
+        fft.process(&mut input, &mut spectrum)
+            .expect("ft8 baseline fft");
+        for bin in 1..=nh1 {
+            savg[bin] += spectrum[bin].norm_sqr();
+        }
+        start += step;
+    }
+
+    let df = spec.sync_bin_hz();
+    let mut nfa = min_freq_hz;
+    let mut nfb = max_freq_hz;
+    let nwin = nfb - nfa;
+    if nfa < 100.0 {
+        nfa = 100.0;
+        if nwin < 100.0 {
+            nfb = nfa + nwin;
+        }
+    }
+    if nfb > 4910.0 {
+        nfb = 4910.0;
+        if nwin < 100.0 {
+            nfa = nfb - nwin;
+        }
+    }
+
+    let ia = ((nfa / df).round() as usize).clamp(1, nh1);
+    let ib = ((nfb / df).round() as usize).clamp(ia, nh1);
+    let mut spectrum_db = savg;
+    for value in &mut spectrum_db[ia..=ib] {
+        *value = 10.0 * value.max(1e-12).log10();
+    }
+
+    let nseg = 10usize;
+    let nlen = (ib - ia + 1) / nseg;
+    if nlen == 0 {
+        return None;
+    }
+    let i0 = ((ib - ia + 1) / 2) as f64;
+    let mut xs = Vec::<f64>::with_capacity(1000);
+    let mut ys = Vec::<f64>::with_capacity(1000);
+    for seg in 0..nseg {
+        let ja = ia + seg * nlen;
+        let jb = ja + nlen - 1;
+        let base = percentile_10(&spectrum_db[ja..=jb]);
+        for (offset, &value) in spectrum_db[ja..=jb].iter().enumerate() {
+            if value <= base && xs.len() < 1000 {
+                let bin = ja + offset;
+                xs.push(bin as f64 - i0);
+                ys.push(value as f64);
+            }
+        }
+    }
+
+    let coeffs = polyfit_degree4(&xs, &ys)?;
+    let mut baseline = vec![0.0f32; nh1 + 1];
+    for (bin, slot) in baseline.iter_mut().enumerate().take(ib + 1).skip(ia) {
+        let t = bin as f64 - i0;
+        *slot =
+            (coeffs[0] + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4])))
+                + 0.65) as f32;
+    }
+    Some(baseline)
 }
 
 fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {

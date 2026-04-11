@@ -1,0 +1,121 @@
+{
+  "cases": [
+    {
+      "id": "ft8-weak-near-zero",
+      "mode": "ft8",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.05,
+      "noise_sigma": 0.05,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": -1
+    },
+    {
+      "id": "ft8-weak-mid",
+      "mode": "ft8",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.025,
+      "noise_sigma": 0.05,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": -7
+    },
+    {
+      "id": "ft8-weak-deep",
+      "mode": "ft8",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.006,
+      "noise_sigma": 0.05,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": -19
+    },
+    {
+      "id": "ft4-weak-near-zero",
+      "mode": "ft4",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.05,
+      "noise_sigma": 0.04,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": 0
+    },
+    {
+      "id": "ft4-weak-mid",
+      "mode": "ft4",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.015,
+      "noise_sigma": 0.04,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": -10
+    },
+    {
+      "id": "ft4-weak-deep",
+      "mode": "ft4",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.008,
+      "noise_sigma": 0.05,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": -17
+    },
+    {
+      "id": "ft2-weak-near-zero",
+      "mode": "ft2",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.02,
+      "noise_sigma": 0.04,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": 1
+    },
+    {
+      "id": "ft2-weak-mid",
+      "mode": "ft2",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.012,
+      "noise_sigma": 0.04,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": -4
+    },
+    {
+      "id": "ft2-weak-deep",
+      "mode": "ft2",
+      "first": "CQ",
+      "second": "K1ABC",
+      "info": "FN42",
+      "expected_text": "CQ K1ABC FN42",
+      "base_freq_hz": 1000.0,
+      "signal_gain": 0.01,
+      "noise_sigma": 0.04,
+      "noise_seed": 1311768467463790320,
+      "expected_stock_snr_db": -6
+    }
+  ]
+}
