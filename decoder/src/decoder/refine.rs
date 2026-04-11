@@ -146,7 +146,7 @@ pub(super) fn refine_candidate_ft4_variants_with_cache(
     debug_assert_eq!(spec.mode, Mode::Ft4);
 
     const FT4_SEGMENT_SEED_LIMIT: usize = 1;
-    const FT4_SYNC4D_THRESHOLD: f32 = 1.2 * 1.2;
+    const FT4_SYNC4D_THRESHOLD: f32 = 1.2;
 
     let mut segment_one_score = f32::NEG_INFINITY;
     let mut winners = Vec::<(isize, f32, f32)>::new();
@@ -567,6 +567,7 @@ fn sync4d(spec: &ModeSpec, baseband: &[Complex32], start_index: isize, residual_
         return 0.0;
     }
 
+    let sync_scale = 1.0 / sync4d_waveforms().first().map_or(1, Vec::len) as f32;
     let precomputed_waveforms = if residual_hz.fract() == 0.0 {
         sync4d_precomputed_waveforms(residual_hz as i32)
     } else {
@@ -579,6 +580,14 @@ fn sync4d(spec: &ModeSpec, baseband: &[Complex32], start_index: isize, residual_
     } else {
         None
     };
+
+    if let Some(precomputed) = precomputed_waveforms
+        && let Some(sync) =
+            sync4d_fast_precomputed(spec, baseband, valid_samples, start_index, precomputed, sync_scale)
+    {
+        return sync;
+    }
+
     let mut sync = 0.0f32;
     for (block_index, (&block_start, waveform)) in spec
         .geometry
@@ -594,12 +603,62 @@ fn sync4d(spec: &ModeSpec, baseband: &[Complex32], start_index: isize, residual_
                 valid_samples,
                 sample_index,
                 &precomputed[block_index],
+                sync_scale,
             )
         } else {
-            sync4d_block(baseband, valid_samples, sample_index, waveform, tweak_step)
+            sync4d_block(baseband, valid_samples, sample_index, waveform, tweak_step, sync_scale)
         };
     }
     sync
+}
+
+#[inline(always)]
+fn sync4d_fast_precomputed(
+    spec: &ModeSpec,
+    baseband: &[Complex32],
+    valid_samples: usize,
+    start_index: isize,
+    waveforms: &[Vec<Complex32>],
+    sync_scale: f32,
+) -> Option<f32> {
+    let waveform_len = waveforms.first()?.len();
+    if waveform_len == 0 {
+        return Some(0.0);
+    }
+
+    let symbol_samples = spec.baseband_symbol_samples() as isize;
+    let last_block_start = *spec.geometry.sync_block_starts.last()? as isize * symbol_samples;
+    let last_sample_index = start_index + last_block_start + ((waveform_len - 1) * 2) as isize;
+    if start_index < 0 || last_sample_index >= valid_samples as isize {
+        return None;
+    }
+
+    let start_index = start_index as usize;
+    let mut sync = 0.0f32;
+    for (block_index, waveform) in waveforms.iter().enumerate() {
+        let block_start =
+            start_index + spec.geometry.sync_block_starts[block_index] * spec.baseband_symbol_samples();
+        sync += sync4d_block_precomputed_full(baseband, block_start, waveform, sync_scale);
+    }
+    Some(sync)
+}
+
+#[inline(always)]
+fn sync4d_block_precomputed_full(
+    baseband: &[Complex32],
+    mut sample_index: usize,
+    waveform_conj: &[Complex32],
+    sync_scale: f32,
+) -> f32 {
+    let mut corr_re = 0.0f32;
+    let mut corr_im = 0.0f32;
+    for &expected_conj in waveform_conj {
+        let sample = unsafe { *baseband.get_unchecked(sample_index) };
+        corr_re += sample.re * expected_conj.re - sample.im * expected_conj.im;
+        corr_im += sample.re * expected_conj.im + sample.im * expected_conj.re;
+        sample_index += 2;
+    }
+    (corr_re * corr_re + corr_im * corr_im).sqrt() * sync_scale
 }
 
 fn sync4d_block(
@@ -608,6 +667,7 @@ fn sync4d_block(
     start_index: isize,
     waveform: &[Complex32],
     tweak_step: Option<Complex32>,
+    sync_scale: f32,
 ) -> f32 {
     let Some((first_waveform_index, last_waveform_index)) =
         sync4d_overlap_range(start_index, waveform.len(), valid_samples)
@@ -631,26 +691,32 @@ fn sync4d_block(
             }
         }
     }
-    corr.norm_sqr()
+    corr.norm() * sync_scale
 }
 
+#[inline(always)]
 fn sync4d_block_precomputed(
     baseband: &[Complex32],
     valid_samples: usize,
     start_index: isize,
     waveform_conj: &[Complex32],
+    sync_scale: f32,
 ) -> f32 {
     let Some((first_waveform_index, last_waveform_index)) =
         sync4d_overlap_range(start_index, waveform_conj.len(), valid_samples)
     else {
         return 0.0;
     };
-    let mut corr = Complex32::new(0.0, 0.0);
+    let mut corr_re = 0.0f32;
+    let mut corr_im = 0.0f32;
     for index in first_waveform_index..=last_waveform_index {
         let sample_index = (start_index + (index * 2) as isize) as usize;
-        corr += baseband[sample_index] * waveform_conj[index];
+        let sample = unsafe { *baseband.get_unchecked(sample_index) };
+        let expected_conj = unsafe { *waveform_conj.get_unchecked(index) };
+        corr_re += sample.re * expected_conj.re - sample.im * expected_conj.im;
+        corr_im += sample.re * expected_conj.im + sample.im * expected_conj.re;
     }
-    corr.norm_sqr()
+    (corr_re * corr_re + corr_im * corr_im).sqrt() * sync_scale
 }
 
 fn sync4d_overlap_range(
