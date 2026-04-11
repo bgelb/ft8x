@@ -20,6 +20,8 @@ use crate::wave::{AudioBuffer, DecoderError, load_wav};
 #[cfg(test)]
 use crate::modes::ft8::FT8_SAMPLE_RATE;
 
+mod ft4;
+mod ft8;
 mod ft2;
 mod metrics;
 mod refine;
@@ -27,6 +29,8 @@ mod search;
 mod session;
 mod subtract;
 
+use ft4::*;
+use ft8::*;
 use ft2::*;
 use metrics::*;
 use refine::*;
