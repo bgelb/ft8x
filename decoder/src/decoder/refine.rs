@@ -3,14 +3,20 @@ use super::*;
 pub(super) fn refine_candidate(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
     coarse_start_seconds: f32,
     coarse_freq_hz: f32,
 ) -> Option<RefinedCandidate> {
-    let initial_baseband = downsample_candidate(long_spectrum, baseband_plan, coarse_freq_hz)?;
+    let initial_baseband = if spec.mode == Mode::Ft4 {
+        downsample_candidate_ft4_search(long_spectrum, baseband_plan, spec, coarse_freq_hz)?
+    } else {
+        downsample_candidate(long_spectrum, baseband_plan, spec, coarse_freq_hz)?
+    };
     let mut refined_basebands = Vec::new();
     refine_candidate_with_cache(
         long_spectrum,
         baseband_plan,
+        spec,
         &initial_baseband,
         &mut refined_basebands,
         coarse_start_seconds,
@@ -21,16 +27,28 @@ pub(super) fn refine_candidate(
 pub(super) fn refine_candidate_with_cache(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
     initial_baseband: &[Complex32],
     refined_basebands: &mut Vec<(i32, Vec<Complex32>)>,
     coarse_start_seconds: f32,
     coarse_freq_hz: f32,
 ) -> Option<RefinedCandidate> {
-    let baseband_rate_hz = ACTIVE_MODE.baseband_rate_hz();
+    if spec.mode == Mode::Ft4 {
+        return refine_candidate_ft4_with_cache(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            initial_baseband,
+            refined_basebands,
+            coarse_freq_hz,
+        );
+    }
+
+    let baseband_rate_hz = spec.baseband_rate_hz();
     let mut ibest = ((coarse_start_seconds * baseband_rate_hz).round()) as isize;
     let mut best_score = f32::NEG_INFINITY;
     for idt in (ibest - 10)..=(ibest + 10) {
-        let sync_score = sync8d(initial_baseband, idt, 0.0);
+        let sync_score = refined_sync_score(spec, initial_baseband, idt, 0.0);
         if sync_score > best_score {
             best_score = sync_score;
             ibest = idt;
@@ -40,8 +58,8 @@ pub(super) fn refine_candidate_with_cache(
     let mut best_freq_hz = coarse_freq_hz;
     best_score = f32::NEG_INFINITY;
     for ifr in -5..=5 {
-        let residual_hz = ACTIVE_MODE.residual_hz_from_half_step(ifr);
-        let sync_score = sync8d(initial_baseband, ibest, residual_hz);
+        let residual_hz = spec.residual_hz_from_half_step(ifr);
+        let sync_score = refined_sync_score(spec, initial_baseband, ibest, residual_hz);
         if sync_score > best_score {
             best_score = sync_score;
             best_freq_hz = coarse_freq_hz + residual_hz;
@@ -51,63 +69,269 @@ pub(super) fn refine_candidate_with_cache(
     let refined_baseband = cached_refined_baseband(
         long_spectrum,
         baseband_plan,
+        spec,
         refined_basebands,
         best_freq_hz,
     )?;
     let mut refined_ibest = ibest;
     best_score = f32::NEG_INFINITY;
     for delta in -4..=4 {
-        let sync_score = sync8d(refined_baseband, ibest + delta, 0.0);
+        let sync_score = refined_sync_score(spec, refined_baseband, ibest + delta, 0.0);
         if sync_score > best_score {
             best_score = sync_score;
             refined_ibest = ibest + delta;
         }
     }
 
-    let full_tones = extract_symbol_tones(refined_baseband, refined_ibest);
-    if sync_quality(&full_tones) <= 6 {
+    let full_tones = extract_symbol_tones(spec, refined_baseband, refined_ibest);
+    if sync_quality(spec, &full_tones)
+        <= match spec.mode {
+            Mode::Ft8 => 6,
+            Mode::Ft4 => 7,
+            Mode::Ft2 => 4,
+        }
+    {
         return None;
     }
-    let llr_sets = compute_bitmetric_passes(&full_tones);
-    let symbol_bit_llrs = compute_symbol_bit_llrs(&full_tones);
+    let llr_sets = compute_bitmetric_passes(spec, &full_tones);
+    let symbol_bit_llrs = compute_symbol_bit_llrs(spec, &full_tones);
     let start_seconds = (refined_ibest as f32 - 1.0) / baseband_rate_hz;
     Some(RefinedCandidate {
         start_seconds,
         freq_hz: best_freq_hz,
         sync_score: best_score,
-        snr_db: estimate_snr_db(&full_tones),
+        snr_db: estimate_snr_db(spec, &full_tones),
         llr_sets,
         symbol_bit_llrs,
     })
 }
 
+fn refine_candidate_ft4_with_cache(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
+    initial_baseband: &[Complex32],
+    refined_basebands: &mut Vec<(i32, Vec<Complex32>)>,
+    coarse_freq_hz: f32,
+) -> Option<RefinedCandidate> {
+    refine_candidate_ft4_variants_with_cache(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        initial_baseband,
+        refined_basebands,
+        coarse_freq_hz,
+    )
+    .into_iter()
+    .max_by(|left, right| left.sync_score.total_cmp(&right.sync_score))
+}
+
+fn ft4_start_seconds_from_ibest(spec: &ModeSpec, ibest: isize) -> f32 {
+    debug_assert_eq!(spec.mode, Mode::Ft4);
+    // WSJT-X uses the literal constant 666.67 for FT4 `ibest -> dt` conversion.
+    // Matching that truncation path exactly matters because subtraction rounds the
+    // resulting start sample, and the exact downsample rate (12000/18) differs by
+    // enough to shift some candidates by one sample.
+    ibest as f32 / 666.67
+}
+
+pub(super) fn refine_candidate_ft4_variants_with_cache(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
+    initial_baseband: &[Complex32],
+    refined_basebands: &mut Vec<(i32, Vec<Complex32>)>,
+    coarse_freq_hz: f32,
+) -> Vec<RefinedCandidate> {
+    debug_assert_eq!(spec.mode, Mode::Ft4);
+
+    const FT4_SEGMENT_SEED_LIMIT: usize = 1;
+
+    let mut segment_one_score = f32::NEG_INFINITY;
+    let mut winners = Vec::<(isize, f32, f32)>::new();
+    let segment_ranges = [(108isize, 560isize), (560, 1012), (-344, 108)];
+
+    for (segment_index, (coarse_start, coarse_end)) in segment_ranges.into_iter().enumerate() {
+        let mut coarse_seeds = Vec::<(f32, isize, f32)>::new();
+        for residual_hz in (-12..=12).step_by(3).map(|value| value as f32) {
+            let mut start_index = coarse_start;
+            while start_index <= coarse_end {
+                let score = sync4d(spec, initial_baseband, start_index, residual_hz);
+                if score >= 1.2 {
+                    coarse_seeds.push((score, start_index, residual_hz));
+                }
+                start_index += 4;
+            }
+        }
+        coarse_seeds.sort_by(|left, right| right.0.total_cmp(&left.0));
+        let mut segment_winners = Vec::<(isize, f32, f32)>::new();
+
+        for (_, coarse_ibest, coarse_residual_hz) in coarse_seeds {
+            let coarse_freq_hz_seed = coarse_freq_hz + coarse_residual_hz;
+            let coarse_duplicate =
+                segment_winners
+                    .iter()
+                    .any(|(existing_ibest, existing_freq_hz, _)| {
+                        (*existing_ibest - coarse_ibest).abs() <= 24
+                            && (*existing_freq_hz - coarse_freq_hz_seed).abs() <= 5.0
+                    });
+            if coarse_duplicate {
+                continue;
+            }
+
+            let mut fine_best_score = f32::NEG_INFINITY;
+            let mut fine_ibest = coarse_ibest;
+            let mut fine_residual_hz = coarse_residual_hz;
+            for residual_hz in ((coarse_residual_hz as i32 - 4)..=(coarse_residual_hz as i32 + 4))
+                .map(|v| v as f32)
+            {
+                for start_index in (coarse_ibest - 5)..=(coarse_ibest + 5) {
+                    let score = sync4d(spec, initial_baseband, start_index, residual_hz);
+                    if score > fine_best_score {
+                        fine_best_score = score;
+                        fine_ibest = start_index;
+                        fine_residual_hz = residual_hz;
+                    }
+                }
+            }
+
+            if fine_best_score < 1.2 {
+                continue;
+            }
+            if segment_index == 0 {
+                segment_one_score = segment_one_score.max(fine_best_score);
+            }
+            if segment_index > 0 && fine_best_score < segment_one_score {
+                continue;
+            }
+            let freq_hz = coarse_freq_hz + fine_residual_hz;
+            let duplicate = segment_winners
+                .iter()
+                .any(|(existing_ibest, existing_freq_hz, _)| {
+                    (*existing_ibest - fine_ibest).abs() <= 8
+                        && (*existing_freq_hz - freq_hz).abs() <= 5.0
+                });
+            if duplicate {
+                continue;
+            }
+            segment_winners.push((fine_ibest, freq_hz, fine_best_score));
+            if segment_winners.len() >= FT4_SEGMENT_SEED_LIMIT {
+                break;
+            }
+        }
+        winners.extend(segment_winners);
+    }
+
+    let mut refined = Vec::new();
+    for (ibest, freq_hz, score) in winners {
+        let Some(refined_baseband) = cached_refined_baseband(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            refined_basebands,
+            freq_hz,
+        ) else {
+            continue;
+        };
+        let start_seconds = ft4_start_seconds_from_ibest(spec, ibest);
+        let Some((llr_sets, symbol_bit_llrs, snr_db)) =
+            compute_ft4_candidate_metrics(spec, refined_baseband, ibest, true)
+        else {
+            continue;
+        };
+        refined.push(RefinedCandidate {
+            start_seconds,
+            freq_hz,
+            sync_score: score,
+            snr_db,
+            llr_sets,
+            symbol_bit_llrs,
+        });
+    }
+    refined
+}
+
+fn refined_sync_score(
+    spec: &ModeSpec,
+    baseband: &[Complex32],
+    start_index: isize,
+    residual_hz: f32,
+) -> f32 {
+    match spec.mode {
+        Mode::Ft4 => sync4d(spec, baseband, start_index, residual_hz),
+        Mode::Ft8 | Mode::Ft2 => sync8d(spec, baseband, start_index, residual_hz),
+    }
+}
+
 pub(super) fn extract_candidate_at(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
     start_seconds: f32,
     freq_hz: f32,
 ) -> Option<RefinedCandidate> {
-    let baseband = downsample_candidate(long_spectrum, baseband_plan, freq_hz)?;
-    extract_candidate_from_baseband(&baseband, start_seconds, freq_hz)
+    let baseband = downsample_candidate(long_spectrum, baseband_plan, spec, freq_hz)?;
+    extract_candidate_from_baseband(&baseband, spec, start_seconds, freq_hz)
+}
+
+pub(super) fn extract_candidate_at_relaxed(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
+    start_seconds: f32,
+    freq_hz: f32,
+) -> Option<RefinedCandidate> {
+    let baseband = downsample_candidate(long_spectrum, baseband_plan, spec, freq_hz)?;
+    extract_candidate_from_baseband_with_threshold(&baseband, spec, start_seconds, freq_hz, false)
 }
 
 pub(super) fn extract_candidate_from_baseband(
     baseband: &[Complex32],
+    spec: &ModeSpec,
     start_seconds: f32,
     freq_hz: f32,
 ) -> Option<RefinedCandidate> {
-    let start_index = (start_seconds * ACTIVE_MODE.baseband_rate_hz()).round() as isize;
-    let full_tones = extract_symbol_tones(baseband, start_index);
-    if sync_quality(&full_tones) <= 6 {
+    extract_candidate_from_baseband_with_threshold(baseband, spec, start_seconds, freq_hz, true)
+}
+
+fn extract_candidate_from_baseband_with_threshold(
+    baseband: &[Complex32],
+    spec: &ModeSpec,
+    start_seconds: f32,
+    freq_hz: f32,
+    enforce_sync_quality: bool,
+) -> Option<RefinedCandidate> {
+    let start_index = (start_seconds * spec.baseband_rate_hz()).round() as isize;
+    if spec.mode == Mode::Ft4 {
+        let (llr_sets, symbol_bit_llrs, snr_db) =
+            compute_ft4_candidate_metrics(spec, baseband, start_index, enforce_sync_quality)?;
+        return Some(RefinedCandidate {
+            start_seconds,
+            freq_hz,
+            sync_score: refined_sync_score(spec, baseband, start_index, 0.0),
+            snr_db,
+            llr_sets,
+            symbol_bit_llrs,
+        });
+    }
+    let full_tones = extract_symbol_tones(spec, baseband, start_index);
+    if enforce_sync_quality
+        && sync_quality(spec, &full_tones)
+            <= match spec.mode {
+                Mode::Ft8 => 6,
+                Mode::Ft4 => 7,
+                Mode::Ft2 => 4,
+            }
+    {
         return None;
     }
-    let llr_sets = compute_bitmetric_passes(&full_tones);
-    let symbol_bit_llrs = compute_symbol_bit_llrs(&full_tones);
+    let llr_sets = compute_bitmetric_passes(spec, &full_tones);
+    let symbol_bit_llrs = compute_symbol_bit_llrs(spec, &full_tones);
     Some(RefinedCandidate {
         start_seconds,
         freq_hz,
-        sync_score: sync8d(baseband, start_index, 0.0),
-        snr_db: estimate_snr_db(&full_tones),
+        sync_score: refined_sync_score(spec, baseband, start_index, 0.0),
+        snr_db: estimate_snr_db(spec, &full_tones),
         llr_sets,
         symbol_bit_llrs,
     })
@@ -116,6 +340,7 @@ pub(super) fn extract_candidate_from_baseband(
 pub(super) fn cached_refined_baseband<'a>(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
     cache: &'a mut Vec<(i32, Vec<Complex32>)>,
     freq_hz: f32,
 ) -> Option<&'a [Complex32]> {
@@ -123,18 +348,18 @@ pub(super) fn cached_refined_baseband<'a>(
     if let Some(index) = cache.iter().position(|(cached_key, _)| *cached_key == key) {
         return Some(cache[index].1.as_slice());
     }
-    let baseband = downsample_candidate(long_spectrum, baseband_plan, freq_hz)?;
+    let baseband = downsample_candidate(long_spectrum, baseband_plan, spec, freq_hz)?;
     cache.push((key, baseband));
     cache.last().map(|(_, baseband)| baseband.as_slice())
 }
 
-pub(super) fn build_long_spectrum(audio: &AudioBuffer) -> LongSpectrum {
-    let plan = LongSpectrumPlan::global();
+pub(super) fn build_long_spectrum(audio: &AudioBuffer, spec: &ModeSpec) -> LongSpectrum {
+    let plan = LongSpectrumPlan::for_mode(spec.mode);
     let fft = &plan.forward;
     let mut input = fft.make_input_vec();
     let mut spectrum = fft.make_output_vec();
 
-    let usable = audio.samples.len().min(LONG_INPUT_SAMPLES);
+    let usable = audio.samples.len().min(long_input_samples(spec));
     input[..usable].copy_from_slice(&audio.samples[..usable]);
     input[usable..].fill(0.0);
 
@@ -143,22 +368,36 @@ pub(super) fn build_long_spectrum(audio: &AudioBuffer) -> LongSpectrum {
 }
 
 impl LongSpectrumPlan {
-    pub(super) fn global() -> &'static Self {
-        static PLAN: OnceLock<LongSpectrumPlan> = OnceLock::new();
-        PLAN.get_or_init(|| {
-            let mut planner = RealFftPlanner::<f32>::new();
-            Self {
-                forward: planner.plan_fft_forward(LONG_FFT_SAMPLES),
+    pub(super) fn for_mode(mode: Mode) -> &'static Self {
+        match mode {
+            Mode::Ft8 => {
+                static PLAN: OnceLock<LongSpectrumPlan> = OnceLock::new();
+                PLAN.get_or_init(|| LongSpectrumPlan::new(mode.spec()))
             }
-        })
+            Mode::Ft4 => {
+                static PLAN: OnceLock<LongSpectrumPlan> = OnceLock::new();
+                PLAN.get_or_init(|| LongSpectrumPlan::new(mode.spec()))
+            }
+            Mode::Ft2 => {
+                static PLAN: OnceLock<LongSpectrumPlan> = OnceLock::new();
+                PLAN.get_or_init(|| LongSpectrumPlan::new(mode.spec()))
+            }
+        }
+    }
+
+    fn new(spec: &ModeSpec) -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        Self {
+            forward: planner.plan_fft_forward(spec.search.long_fft_samples),
+        }
     }
 }
 
 impl BasebandPlan {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(spec: &ModeSpec) -> Self {
         let mut planner = FftPlanner::<f32>::new();
         Self {
-            inverse: planner.plan_fft_inverse(BASEBAND_SAMPLES),
+            inverse: planner.plan_fft_inverse(spec.baseband_samples()),
         }
     }
 }
@@ -166,57 +405,146 @@ impl BasebandPlan {
 pub(super) fn downsample_candidate(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
     freq_hz: f32,
 ) -> Option<Vec<Complex32>> {
-    let fft_bin_hz = ACTIVE_MODE.fft_bin_hz();
+    if spec.mode == Mode::Ft4 {
+        return downsample_candidate_ft4(long_spectrum, baseband_plan, spec, freq_hz);
+    }
+
+    let fft_bin_hz = spec.fft_bin_hz();
     let i0 = (freq_hz / fft_bin_hz).round() as isize;
-    let ib = ((ACTIVE_MODE.band_low_hz(freq_hz) / fft_bin_hz).round() as isize).max(1);
-    let it = ((ACTIVE_MODE.band_high_hz(freq_hz) / fft_bin_hz).round() as isize)
-        .min((LONG_FFT_SAMPLES / 2) as isize);
+    let ib = ((spec.band_low_hz(freq_hz) / fft_bin_hz).round() as isize).max(1);
+    let it = ((spec.band_high_hz(freq_hz) / fft_bin_hz).round() as isize)
+        .min((spec.search.long_fft_samples / 2) as isize);
     if i0 <= 0 || ib >= it {
         return None;
     }
 
-    let mut baseband = vec![Complex32::new(0.0, 0.0); BASEBAND_SAMPLES];
+    let mut baseband = vec![Complex32::new(0.0, 0.0); spec.baseband_samples()];
     let copied = copy_band_into_baseband(
         &mut baseband,
         &long_spectrum.bins,
         ib as usize,
         it as usize + 1,
     );
-    if copied <= BASEBAND_TAPER_LEN * 2 {
+    if copied <= spec.baseband_taper_len() * 2 {
         return None;
     }
 
-    apply_symmetric_taper(&mut baseband[..copied], baseband_taper());
+    apply_symmetric_taper(&mut baseband[..copied], baseband_taper(spec.mode));
 
     let shift = (i0 - ib).max(0) as usize;
     let rotate = shift.min(baseband.len());
     baseband.rotate_left(rotate);
 
     baseband_plan.inverse.process(&mut baseband);
-    let scale = 1.0 / (LONG_FFT_SAMPLES as f32 * BASEBAND_SAMPLES as f32).sqrt();
+    let scale = 1.0 / (spec.search.long_fft_samples as f32 * spec.baseband_samples() as f32).sqrt();
     for sample in &mut baseband {
         *sample *= scale;
     }
     Some(baseband)
 }
 
-pub(super) fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
-    let geometry = &ACTIVE_MODE.geometry;
+fn downsample_candidate_ft4(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
+    freq_hz: f32,
+) -> Option<Vec<Complex32>> {
+    downsample_candidate_ft4_with_normalization(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        freq_hz,
+        spec.baseband_symbol_samples() * spec.geometry.message_symbols,
+    )
+}
+
+pub(super) fn downsample_candidate_ft4_search(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
+    freq_hz: f32,
+) -> Option<Vec<Complex32>> {
+    downsample_candidate_ft4_with_normalization(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        freq_hz,
+        spec.baseband_samples(),
+    )
+}
+
+fn downsample_candidate_ft4_with_normalization(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
+    freq_hz: f32,
+    norm_samples: usize,
+) -> Option<Vec<Complex32>> {
+    debug_assert_eq!(spec.mode, Mode::Ft4);
+    let nfft2 = spec.baseband_samples();
+    let i0 = (freq_hz / spec.fft_bin_hz()).round() as isize;
+    let max_bin = long_spectrum.bins.len().saturating_sub(1) as isize;
+    if !(0..=max_bin).contains(&i0) {
+        return None;
+    }
+
+    let mut baseband = vec![Complex32::new(0.0, 0.0); nfft2];
+    baseband[0] = long_spectrum.bins[i0 as usize];
+    for offset in 1..=(nfft2 / 2) {
+        let plus = i0 + offset as isize;
+        let minus = i0 - offset as isize;
+        if (0..=max_bin).contains(&plus) {
+            baseband[offset] = long_spectrum.bins[plus as usize];
+        }
+        if (0..=max_bin).contains(&minus) {
+            baseband[nfft2 - offset] = long_spectrum.bins[minus as usize];
+        }
+    }
+
+    let scale = 1.0 / nfft2 as f32;
+    for (value, &gain) in baseband.iter_mut().zip(ft4_downsample_window(spec).iter()) {
+        *value *= gain * scale;
+    }
+    baseband_plan.inverse.process(&mut baseband);
+
+    let rms =
+        (baseband.iter().map(|value| value.norm_sqr()).sum::<f32>() / norm_samples as f32).sqrt();
+    if rms > 0.0 {
+        for value in &mut baseband {
+            *value /= rms;
+        }
+    }
+    Some(baseband)
+}
+
+pub(super) fn sync8d(
+    spec: &ModeSpec,
+    baseband: &[Complex32],
+    start_index: isize,
+    residual_hz: f32,
+) -> f32 {
+    let geometry = &spec.geometry;
     let mut sync = 0.0f32;
-    let valid_samples = baseband.len().min(ACTIVE_MODE.baseband_valid_samples());
-    let waveforms = sync8d_waveforms();
-    let tweak = (residual_hz != 0.0).then(|| sync8d_tweak(residual_hz));
-    for (offset, tone) in geometry.costas_pattern.iter().copied().enumerate() {
-        for &block_start in geometry.sync_block_starts {
+    let baseband_symbol_samples = spec.baseband_symbol_samples();
+    let valid_samples = baseband.len().min(spec.baseband_valid_samples());
+    let waveforms = sync8d_waveforms(spec.mode);
+    let tweak = (residual_hz != 0.0).then(|| sync8d_tweak(spec, residual_hz));
+    for (&block_start, pattern) in geometry
+        .sync_block_starts
+        .iter()
+        .zip(geometry.sync_patterns.iter().copied())
+    {
+        for (offset, tone) in pattern.iter().copied().enumerate() {
             let symbol_start =
-                start_index + ((block_start + offset) * BASEBAND_SYMBOL_SAMPLES) as isize;
-            if symbol_start < 0 || symbol_start as usize + BASEBAND_SYMBOL_SAMPLES > valid_samples {
+                start_index + ((block_start + offset) * baseband_symbol_samples) as isize;
+            if symbol_start < 0 || symbol_start as usize + baseband_symbol_samples > valid_samples {
                 continue;
             }
             let segment =
-                &baseband[symbol_start as usize..symbol_start as usize + BASEBAND_SYMBOL_SAMPLES];
+                &baseband[symbol_start as usize..symbol_start as usize + baseband_symbol_samples];
             let mut corr = Complex32::new(0.0, 0.0);
             for (index, sample) in segment.iter().copied().enumerate() {
                 let mut sync_wave = waveforms[tone][index];
@@ -231,38 +559,128 @@ pub(super) fn sync8d(baseband: &[Complex32], start_index: isize, residual_hz: f3
     sync
 }
 
+fn sync4d(spec: &ModeSpec, baseband: &[Complex32], start_index: isize, residual_hz: f32) -> f32 {
+    debug_assert_eq!(spec.mode, Mode::Ft4);
+    let valid_samples = baseband.len().min(spec.baseband_valid_samples());
+    if valid_samples == 0 {
+        return 0.0;
+    }
+
+    let tweak = sync4d_tweak(spec, residual_hz);
+    let mut sync = 0.0f32;
+    for (&block_start, waveform) in spec
+        .geometry
+        .sync_block_starts
+        .iter()
+        .zip(sync4d_waveforms().iter())
+    {
+        let sample_index = start_index + (block_start * spec.baseband_symbol_samples()) as isize;
+        sync += sync4d_block(baseband, valid_samples, sample_index, waveform, &tweak);
+    }
+    sync
+}
+
+fn sync4d_block(
+    baseband: &[Complex32],
+    valid_samples: usize,
+    start_index: isize,
+    waveform: &[Complex32],
+    tweak: &[Complex32],
+) -> f32 {
+    let mut corr = Complex32::new(0.0, 0.0);
+    for (index, (&expected, &tweak_value)) in waveform.iter().zip(tweak.iter()).enumerate() {
+        let sample_index = start_index + (index * 2) as isize;
+        if !(0..valid_samples as isize).contains(&sample_index) {
+            continue;
+        }
+        corr += baseband[sample_index as usize] * (expected * tweak_value).conj();
+    }
+    corr.norm()
+}
+
 pub(super) fn extract_symbol_tones(
+    spec: &ModeSpec,
     baseband: &[Complex32],
     start_index: isize,
 ) -> Vec<[Complex32; 8]> {
-    let geometry = &ACTIVE_MODE.geometry;
+    if spec.mode == Mode::Ft4 {
+        return extract_symbol_tones_ft4(spec, baseband, start_index);
+    }
+
+    let geometry = &spec.geometry;
+    let baseband_symbol_samples = spec.baseband_symbol_samples();
+    let basis = sync8d_basis(spec.mode);
     let mut tones = vec![[Complex32::new(0.0, 0.0); 8]; geometry.message_symbols];
-    let valid_samples = baseband.len().min(ACTIVE_MODE.baseband_valid_samples());
+    let valid_samples = baseband.len().min(spec.baseband_valid_samples());
     for (symbol_index, symbol_tones) in tones.iter_mut().enumerate() {
-        let sample_index = start_index + (symbol_index * BASEBAND_SYMBOL_SAMPLES) as isize;
-        if sample_index < 0 || sample_index as usize + BASEBAND_SYMBOL_SAMPLES > valid_samples {
+        let sample_index = start_index + (symbol_index * baseband_symbol_samples) as isize;
+        if sample_index < 0 || sample_index as usize + baseband_symbol_samples > valid_samples {
             continue;
         }
         let segment =
-            &baseband[sample_index as usize..sample_index as usize + BASEBAND_SYMBOL_SAMPLES];
+            &baseband[sample_index as usize..sample_index as usize + baseband_symbol_samples];
         for (tone, slot) in symbol_tones.iter_mut().enumerate() {
-            *slot = correlate_tone_nominal(segment, tone);
+            *slot = correlate_tone_nominal(segment, &basis[tone]);
         }
     }
     tones
 }
 
-pub(super) fn baseband_taper() -> &'static [f32] {
-    static TAPER: OnceLock<Vec<f32>> = OnceLock::new();
-    TAPER.get_or_init(|| {
-        let taper_len = ACTIVE_MODE.baseband_taper_len();
-        // Legacy raised-cosine taper applied symmetrically after copying the candidate band.
+fn extract_symbol_tones_ft4(
+    spec: &ModeSpec,
+    baseband: &[Complex32],
+    start_index: isize,
+) -> Vec<[Complex32; 8]> {
+    debug_assert_eq!(spec.mode, Mode::Ft4);
+    let geometry = &spec.geometry;
+    let symbol_samples = spec.baseband_symbol_samples();
+    let fft = ft4_symbol_fft();
+    let valid_samples = baseband.len().min(spec.baseband_valid_samples());
+    let mut tones = vec![[Complex32::new(0.0, 0.0); 8]; geometry.message_symbols];
+
+    for (symbol_index, symbol_tones) in tones.iter_mut().enumerate() {
+        let sample_index = start_index + (symbol_index * symbol_samples) as isize;
+        if sample_index < 0 || sample_index as usize + symbol_samples > valid_samples {
+            continue;
+        }
+        let mut spectrum =
+            baseband[sample_index as usize..sample_index as usize + symbol_samples].to_vec();
+        fft.process(&mut spectrum);
+        for tone in 0..4 {
+            symbol_tones[tone] = spectrum[tone];
+        }
+    }
+
+    tones
+}
+
+pub(super) fn baseband_taper(mode: Mode) -> &'static [f32] {
+    fn build(spec: &ModeSpec) -> Vec<f32> {
+        let taper_len = spec.baseband_taper_len();
+        if taper_len == 0 {
+            return vec![1.0];
+        }
         (0..=taper_len)
             .map(|index| {
                 0.5 * (1.0 + (index as f32 * std::f32::consts::PI / taper_len as f32).cos())
             })
             .collect()
-    })
+    }
+
+    match mode {
+        Mode::Ft8 => {
+            static TAPER: OnceLock<Vec<f32>> = OnceLock::new();
+            TAPER.get_or_init(|| build(mode.spec()))
+        }
+        Mode::Ft4 => {
+            static TAPER: OnceLock<Vec<f32>> = OnceLock::new();
+            TAPER.get_or_init(|| build(mode.spec()))
+        }
+        Mode::Ft2 => {
+            static TAPER: OnceLock<Vec<f32>> = OnceLock::new();
+            TAPER.get_or_init(|| build(mode.spec()))
+        }
+    }
 }
 
 // Copy the requested FFT bins into the downsample buffer and return the copied prefix length.
@@ -286,68 +704,192 @@ pub(super) fn apply_symmetric_taper(baseband: &mut [Complex32], taper: &[f32]) {
     }
 }
 
-pub(super) fn correlate_tone_nominal(segment: &[Complex32], tone: usize) -> Complex32 {
-    let basis = sync8d_basis();
+pub(super) fn correlate_tone_nominal(segment: &[Complex32], basis: &[Complex32]) -> Complex32 {
     let mut acc = Complex32::new(0.0, 0.0);
     for (index, sample) in segment.iter().copied().enumerate() {
-        acc += sample * basis[tone][index];
+        acc += sample * basis[index];
     }
     acc
 }
 
-pub(super) fn sync8d_basis() -> &'static [[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8] {
-    static BASIS: OnceLock<[[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8]> = OnceLock::new();
-    BASIS.get_or_init(|| {
-        std::array::from_fn(|tone| {
-            let tone = tone as f32;
-            let mut phase = 0.0f32;
-            let delta = 2.0 * std::f32::consts::PI * tone / BASEBAND_SYMBOL_SAMPLES as f32;
-            std::array::from_fn(|index| {
-                let sample = Complex32::new(phase.cos(), -phase.sin());
-                if index + 1 < BASEBAND_SYMBOL_SAMPLES {
-                    phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
-                }
-                sample
+pub(super) fn sync8d_basis(mode: Mode) -> &'static [Vec<Complex32>] {
+    fn build(spec: &ModeSpec, invert_imag: bool) -> Vec<Vec<Complex32>> {
+        let n = spec.baseband_symbol_samples();
+        (0..8)
+            .map(|tone| {
+                let tone = tone as f32;
+                let mut phase = 0.0f32;
+                let delta = 2.0 * std::f32::consts::PI * tone / n as f32;
+                (0..n)
+                    .map(|index| {
+                        let sample = if invert_imag {
+                            Complex32::new(phase.cos(), -phase.sin())
+                        } else {
+                            Complex32::new(phase.cos(), phase.sin())
+                        };
+                        if index + 1 < n {
+                            phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
+                        }
+                        sample
+                    })
+                    .collect()
             })
-        })
-    })
-}
+            .collect()
+    }
 
-pub(super) fn sync8d_waveforms() -> &'static [[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8] {
-    static WAVEFORMS: OnceLock<[[Complex32; BASEBAND_SYMBOL_SAMPLES]; 8]> = OnceLock::new();
-    WAVEFORMS.get_or_init(|| {
-        std::array::from_fn(|tone| {
-            let tone = tone as f32;
-            let mut phase = 0.0f32;
-            let delta = 2.0 * std::f32::consts::PI * tone / BASEBAND_SYMBOL_SAMPLES as f32;
-            std::array::from_fn(|index| {
-                let sample = Complex32::new(phase.cos(), phase.sin());
-                if index + 1 < BASEBAND_SYMBOL_SAMPLES {
-                    phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
-                }
-                sample
-            })
-        })
-    })
-}
-
-pub(super) fn sync8d_tweak(residual_hz: f32) -> [Complex32; BASEBAND_SYMBOL_SAMPLES] {
-    let mut phase = 0.0f32;
-    let delta = 2.0 * std::f32::consts::PI * residual_hz / ACTIVE_MODE.baseband_rate_hz();
-    std::array::from_fn(|index| {
-        let sample = Complex32::new(phase.cos(), phase.sin());
-        if index + 1 < BASEBAND_SYMBOL_SAMPLES {
-            phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
+    match mode {
+        Mode::Ft8 => {
+            static BASIS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
+            BASIS.get_or_init(|| build(mode.spec(), true))
         }
-        sample
+        Mode::Ft4 => {
+            static BASIS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
+            BASIS.get_or_init(|| build(mode.spec(), true))
+        }
+        Mode::Ft2 => {
+            static BASIS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
+            BASIS.get_or_init(|| build(mode.spec(), true))
+        }
+    }
+}
+
+fn ft4_symbol_fft() -> &'static Arc<dyn Fft<f32>> {
+    static FFT: OnceLock<Arc<dyn Fft<f32>>> = OnceLock::new();
+    FFT.get_or_init(|| {
+        let mut planner = FftPlanner::<f32>::new();
+        planner.plan_fft_forward(Mode::Ft4.spec().baseband_symbol_samples())
     })
 }
 
-pub(super) fn sync_quality(full_tones: &[[Complex32; 8]]) -> usize {
-    let geometry = &ACTIVE_MODE.geometry;
+pub(super) fn sync8d_waveforms(mode: Mode) -> &'static [Vec<Complex32>] {
+    match mode {
+        Mode::Ft8 => {
+            static WAVEFORMS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
+            WAVEFORMS.get_or_init(|| {
+                sync8d_basis(mode)
+                    .iter()
+                    .map(|row| row.iter().map(|sample| sample.conj()).collect())
+                    .collect()
+            })
+        }
+        Mode::Ft4 => {
+            static WAVEFORMS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
+            WAVEFORMS.get_or_init(|| {
+                sync8d_basis(mode)
+                    .iter()
+                    .map(|row| row.iter().map(|sample| sample.conj()).collect())
+                    .collect()
+            })
+        }
+        Mode::Ft2 => {
+            static WAVEFORMS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
+            WAVEFORMS.get_or_init(|| {
+                sync8d_basis(mode)
+                    .iter()
+                    .map(|row| row.iter().map(|sample| sample.conj()).collect())
+                    .collect()
+            })
+        }
+    }
+}
+
+pub(super) fn sync8d_tweak(spec: &ModeSpec, residual_hz: f32) -> Vec<Complex32> {
+    let mut phase = 0.0f32;
+    let delta = 2.0 * std::f32::consts::PI * residual_hz / spec.baseband_rate_hz();
+    (0..spec.baseband_symbol_samples())
+        .map(|index| {
+            let sample = Complex32::new(phase.cos(), phase.sin());
+            if index + 1 < spec.baseband_symbol_samples() {
+                phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
+            }
+            sample
+        })
+        .collect()
+}
+
+fn sync4d_waveforms() -> &'static [Vec<Complex32>] {
+    static WAVEFORMS: OnceLock<Vec<Vec<Complex32>>> = OnceLock::new();
+    WAVEFORMS.get_or_init(|| {
+        let spec = Mode::Ft4.spec();
+        let n = spec.baseband_symbol_samples();
+        let half_symbol = n / 2;
+        spec.geometry
+            .sync_patterns
+            .iter()
+            .map(|pattern| {
+                let mut waveform = Vec::with_capacity(pattern.len() * half_symbol);
+                let mut phase = 0.0f32;
+                for &tone in *pattern {
+                    let delta = 2.0 * std::f32::consts::PI * tone as f32 / n as f32;
+                    for _ in 0..half_symbol {
+                        waveform.push(Complex32::new(phase.cos(), phase.sin()));
+                        phase = (phase + 2.0 * delta).rem_euclid(2.0 * std::f32::consts::PI);
+                    }
+                }
+                waveform
+            })
+            .collect()
+    })
+}
+
+fn sync4d_tweak(spec: &ModeSpec, residual_hz: f32) -> Vec<Complex32> {
+    let half_symbol = spec.baseband_symbol_samples() / 2;
+    let len = spec.geometry.sync_patterns[0].len() * half_symbol;
+    let sample_rate_hz = spec.baseband_rate_hz() * 0.5;
+    let delta = 2.0 * std::f32::consts::PI * residual_hz / sample_rate_hz;
+    let mut phase = 0.0f32;
+    (0..len)
+        .map(|index| {
+            let sample = Complex32::new(phase.cos(), phase.sin());
+            if index + 1 < len {
+                phase = (phase + delta).rem_euclid(2.0 * std::f32::consts::PI);
+            }
+            sample
+        })
+        .collect()
+}
+
+fn ft4_downsample_window(spec: &ModeSpec) -> &'static [f32] {
+    static WINDOW: OnceLock<Vec<f32>> = OnceLock::new();
+    WINDOW.get_or_init(|| {
+        debug_assert_eq!(spec.mode, Mode::Ft4);
+        let nfft2 = spec.baseband_samples();
+        let mut window = vec![0.0f32; nfft2];
+        let baud = spec.geometry.tone_spacing_hz;
+        let df = spec.fft_bin_hz();
+        let iwt = ((0.5 * baud) / df) as usize;
+        let iwf = ((4.0 * baud) / df) as usize;
+        let pi = std::f32::consts::PI;
+
+        if iwt > 0 {
+            for (index, slot) in window.iter_mut().take(iwt).enumerate() {
+                let phase = pi * (iwt - index - 1) as f32 / iwt as f32;
+                *slot = 0.5 * (1.0 + phase.cos());
+            }
+            for (index, slot) in window.iter_mut().skip(iwt + iwf).take(iwt).enumerate() {
+                let phase = pi * index as f32 / iwt as f32;
+                *slot = 0.5 * (1.0 + phase.cos());
+            }
+        }
+        for slot in window.iter_mut().skip(iwt).take(iwf) {
+            *slot = 1.0;
+        }
+
+        let iws = (baud / df) as usize;
+        window.rotate_left(iws);
+        window
+    })
+}
+
+pub(super) fn sync_quality(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) -> usize {
+    let geometry = &spec.geometry;
     let mut matches = 0usize;
-    for (offset, expected_tone) in geometry.costas_pattern.iter().copied().enumerate() {
-        for &block_start in geometry.sync_block_starts {
+    for (&block_start, pattern) in geometry
+        .sync_block_starts
+        .iter()
+        .zip(geometry.sync_patterns.iter().copied())
+    {
+        for (offset, expected_tone) in pattern.iter().copied().enumerate() {
             let symbol = &full_tones[block_start + offset];
             let best_tone = symbol
                 .iter()
@@ -363,8 +905,8 @@ pub(super) fn sync_quality(full_tones: &[[Complex32; 8]]) -> usize {
     matches
 }
 
-pub(super) fn estimate_snr_db(full_tones: &[[Complex32; 8]]) -> i32 {
-    let data_positions = ACTIVE_MODE.geometry.data_symbol_positions;
+pub(super) fn estimate_snr_db(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) -> i32 {
+    let data_positions = spec.geometry.data_symbol_positions;
     let mut maxima = Vec::with_capacity(data_positions.len());
     let mut all = Vec::with_capacity(data_positions.len() * 8);
     for &symbol_index in data_positions {
@@ -388,8 +930,9 @@ mod tests {
 
     #[test]
     fn tail_samples_past_valid_window_do_not_change_extracted_tones() {
-        let valid = ACTIVE_MODE.tuning.baseband_valid_samples;
-        let len = valid + BASEBAND_SYMBOL_SAMPLES * 4;
+        let spec = Mode::Ft8.spec();
+        let valid = spec.refine.baseband_valid_samples;
+        let len = valid + spec.baseband_symbol_samples() * 4;
         let clean = vec![Complex32::new(0.0, 0.0); len];
         let mut dirty = clean.clone();
         for sample in &mut dirty[valid..] {
@@ -397,22 +940,31 @@ mod tests {
         }
 
         assert_eq!(
-            extract_symbol_tones(&clean, 0),
-            extract_symbol_tones(&dirty, 0)
+            extract_symbol_tones(spec, &clean, 0),
+            extract_symbol_tones(spec, &dirty, 0)
         );
     }
 
     #[test]
     fn baseband_taper_application_is_symmetric() {
-        let copied = BASEBAND_TAPER_LEN * 2 + 8;
+        let spec = Mode::Ft8.spec();
+        let copied = spec.baseband_taper_len() * 2 + 8;
         let mut gains: Vec<_> = vec![1.0f32; copied]
             .into_iter()
             .map(|value| Complex32::new(value, 0.0))
             .collect();
-        apply_symmetric_taper(&mut gains, baseband_taper());
+        apply_symmetric_taper(&mut gains, baseband_taper(spec.mode));
 
-        for index in 0..=BASEBAND_TAPER_LEN {
+        for index in 0..=spec.baseband_taper_len() {
             assert_eq!(gains[index], gains[copied - 1 - index]);
         }
+    }
+
+    #[test]
+    fn ft4_refined_start_seconds_match_stock_ibest_mapping() {
+        let spec = Mode::Ft4.spec();
+        let ibest = 65;
+        let expected = 65.0 / 666.67;
+        assert!((ft4_start_seconds_from_ibest(spec, ibest) - expected).abs() < 1e-8);
     }
 }

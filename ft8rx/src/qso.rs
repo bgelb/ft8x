@@ -2,8 +2,8 @@ use crate::config::AppConfig;
 use crate::next_slot_boundary;
 use chrono::{DateTime, Utc};
 use ft8_decoder::{
-    DecodeStage, ReplyWord, StructuredInfoValue, StructuredMessage, TxDirectedPayload, TxMessage,
-    WaveformOptions, synthesize_tx_message,
+    DecodeStage, Mode, ReplyWord, StructuredInfoValue, StructuredMessage, TxDirectedPayload,
+    TxMessage, WaveformOptions, synthesize_tx_message,
 };
 use rigctl::K3s;
 use rigctl::audio::{AudioDevice, play_mono_samples_until};
@@ -1699,6 +1699,7 @@ impl TxBackend for RigTxBackend {
         let synthesized = synthesize_tx_message(
             &request.message,
             &WaveformOptions {
+                mode: Mode::Ft8,
                 base_freq_hz: request.tx_freq_hz,
                 start_seconds: 0.5,
                 total_seconds: 15.0,
@@ -2806,8 +2807,9 @@ mod tests {
         let synthesized = synthesize_tx_message(
             &message,
             &WaveformOptions {
+                mode: Mode::Ft8,
                 base_freq_hz: 1_000.0,
-                ..WaveformOptions::default()
+                ..WaveformOptions::for_mode(Mode::Ft8)
             },
         )
         .expect("synthesize tx message");

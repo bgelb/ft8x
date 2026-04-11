@@ -11,8 +11,8 @@ use clap::Parser;
 use config::AppConfig;
 use ft8_decoder::{
     AudioBuffer, CallModifier, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage,
-    DecoderSession, DecoderState, StageDecodeReport, StructuredCallField, StructuredCallValue,
-    StructuredInfoField, StructuredInfoValue, StructuredMessage,
+    DecoderSession, DecoderState, Mode as DecoderMode, StageDecodeReport, StructuredCallField,
+    StructuredCallValue, StructuredInfoField, StructuredInfoValue, StructuredMessage,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qso::{
@@ -6030,7 +6030,7 @@ fn samples_to_duration(sample_rate_hz: u32, sample_count: usize) -> Duration {
 }
 
 fn stage_sample_count(sample_rate_hz: u32, stage: DecodeStage) -> usize {
-    (((stage.required_samples() as u64 * sample_rate_hz as u64)
+    (((stage.required_samples(DecoderMode::Ft8.spec()) as u64 * sample_rate_hz as u64)
         + (DECODER_SAMPLE_RATE_HZ as u64 / 2))
         / DECODER_SAMPLE_RATE_HZ as u64) as usize
 }
@@ -6048,7 +6048,7 @@ fn slot_capture_end(slot_start: SystemTime, sample_rate_hz: u32) -> Result<Syste
 fn stage_capture_end(slot_start: SystemTime, stage: DecodeStage) -> Result<SystemTime, AppError> {
     slot_start
         .checked_add(Duration::from_secs_f64(
-            stage.required_samples() as f64 / DECODER_SAMPLE_RATE_HZ as f64,
+            stage.required_samples(DecoderMode::Ft8.spec()) as f64 / DECODER_SAMPLE_RATE_HZ as f64,
         ))
         .ok_or(AppError::Clock)
 }

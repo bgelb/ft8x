@@ -49,7 +49,7 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_*.py' -q
 
       - name: Decoder tests
-        run: cargo test --manifest-path decoder/Cargo.toml
+        run: cargo test --manifest-path decoder/Cargo.toml --lib --bins
 
       - name: Audio library tests
         run: cargo test --manifest-path audiolib/Cargo.toml
@@ -59,3 +59,25 @@ jobs:
 
       - name: FT8RX tests
         run: cargo test --manifest-path ft8rx/Cargo.toml
+
+  decoder-distilled:
+    name: Decoder distilled mixed regressions
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            decoder -> decoder/target
+
+      - name: FT4/FT2 distilled mixed regression fixtures
+        run: >
+          cargo test
+          --manifest-path decoder/Cargo.toml
+          --test distilled_regressions
+          -- --test-threads=1

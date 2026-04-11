@@ -1,0 +1,728 @@
+{
+  "mode": "ft4",
+  "profile": "medium",
+  "case_count": 20,
+  "cases": [
+    {
+      "id": "ft4-mixed-00109",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC -07",
+        "W1XYZ K1ABC FN31",
+        "W1XYZ K1ABC RR73"
+      ],
+      "wav_file": "wav/ft4-mixed-00109.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RR73",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.0
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1650.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.1
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-00405",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC -07",
+        "W1XYZ K1ABC R-07",
+        "W1XYZ K1ABC RR73"
+      ],
+      "wav_file": "wav/ft4-mixed-00405.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RR73",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.0
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.1
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": true,
+          "freq_hz": 900.0,
+          "start_seconds": 0.1
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-01070",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC RRR"
+      ],
+      "wav_file": "wav/ft4-mixed-01070.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RRR",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.05
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RRR",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.35
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-02578",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "CQ K1ABC",
+        "W1XYZ K1ABC -07",
+        "W1XYZ K1ABC RR73"
+      ],
+      "wav_file": "wav/ft4-mixed-02578.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.1
+        },
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.35
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RR73",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.05
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-02773",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "CQ K1ABC",
+        "W1XYZ K1ABC -07",
+        "W1XYZ K1ABC RR73"
+      ],
+      "wav_file": "wav/ft4-mixed-02773.wav",
+      "signals": [
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "",
+          "acknowledge": false,
+          "freq_hz": 1900.0,
+          "start_seconds": 0.05
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RR73",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.1
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-03071",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC FN31"
+      ],
+      "wav_file": "wav/ft4-mixed-03071.wav",
+      "signals": [
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.05
+        },
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.0
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.35
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-03342",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "CQ K1ABC",
+        "CQ K1ABC FN31",
+        "W1XYZ K1ABC 73"
+      ],
+      "wav_file": "wav/ft4-mixed-03342.wav",
+      "signals": [
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.1
+        },
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.35
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "73",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.35
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-04441",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "CQ K1ABC",
+        "CQ K1ABC FN31",
+        "W1XYZ K1ABC -07"
+      ],
+      "wav_file": "wav/ft4-mixed-04441.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.1
+        },
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.35
+        },
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1650.0,
+          "start_seconds": 0.0
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-04650",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC FN31"
+      ],
+      "wav_file": "wav/ft4-mixed-04650.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.05
+        },
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.35
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-04886",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC 73"
+      ],
+      "wav_file": "wav/ft4-mixed-04886.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "73",
+          "acknowledge": false,
+          "freq_hz": 1650.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RRR",
+          "acknowledge": false,
+          "freq_hz": 1650.0,
+          "start_seconds": 0.1
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "73",
+          "acknowledge": false,
+          "freq_hz": 1650.0,
+          "start_seconds": 0.05
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-02656",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC 73",
+        "W1XYZ K1ABC FN31",
+        "W1XYZ K1ABC RR73"
+      ],
+      "wav_file": "wav/ft4-mixed-02656.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "73",
+          "acknowledge": false,
+          "freq_hz": 1900.0,
+          "start_seconds": 0.1
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1150.0,
+          "start_seconds": 0.35
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RR73",
+          "acknowledge": false,
+          "freq_hz": 1900.0,
+          "start_seconds": 0.2
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-01238",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "CQ K1ABC FN31",
+        "W1XYZ K1ABC RRR"
+      ],
+      "wav_file": "wav/ft4-mixed-01238.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RRR",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.0
+        },
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1150.0,
+          "start_seconds": 0.2
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-03240",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC 73",
+        "W1XYZ K1ABC FN31",
+        "W1XYZ K1ABC RRR"
+      ],
+      "wav_file": "wav/ft4-mixed-03240.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1650.0,
+          "start_seconds": 0.05
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RRR",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "73",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.05
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-00396",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [],
+      "wav_file": "wav/ft4-mixed-00396.wav",
+      "signals": [
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.0
+        },
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.1
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-00595",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "CQ K1ABC FN31",
+        "W1XYZ K1ABC RRR"
+      ],
+      "wav_file": "wav/ft4-mixed-00595.wav",
+      "signals": [
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.35
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RRR",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.05
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RRR",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.1
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-04396",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "CQ K1ABC",
+        "W1XYZ K1ABC R-07"
+      ],
+      "wav_file": "wav/ft4-mixed-04396.wav",
+      "signals": [
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": true,
+          "freq_hz": 1650.0,
+          "start_seconds": 0.2
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-00773",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC 73",
+        "W1XYZ K1ABC FN31"
+      ],
+      "wav_file": "wav/ft4-mixed-00773.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "73",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.35
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1400.0,
+          "start_seconds": 0.0
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "FN31",
+          "acknowledge": false,
+          "freq_hz": 1650.0,
+          "start_seconds": 0.1
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-03000",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC 73",
+        "W1XYZ K1ABC R-07"
+      ],
+      "wav_file": "wav/ft4-mixed-03000.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": true,
+          "freq_hz": 1150.0,
+          "start_seconds": 0.0
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "73",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.2
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-04783",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "W1XYZ K1ABC RR73"
+      ],
+      "wav_file": "wav/ft4-mixed-04783.wav",
+      "signals": [
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RR73",
+          "acknowledge": false,
+          "freq_hz": 900.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RR73",
+          "acknowledge": false,
+          "freq_hz": 1900.0,
+          "start_seconds": 0.0
+        }
+      ],
+      "expected_source": "stock"
+    },
+    {
+      "id": "ft4-mixed-00477",
+      "mode": "ft4",
+      "cohort": "mixed",
+      "noise_dbfs": -28.0,
+      "expected_messages": [
+        "CQ K1ABC",
+        "W1XYZ K1ABC -07",
+        "W1XYZ K1ABC RR73"
+      ],
+      "wav_file": "wav/ft4-mixed-00477.wav",
+      "signals": [
+        {
+          "first": "CQ",
+          "second": "K1ABC",
+          "info": "",
+          "acknowledge": false,
+          "freq_hz": 1150.0,
+          "start_seconds": 0.35
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "RR73",
+          "acknowledge": false,
+          "freq_hz": 650.0,
+          "start_seconds": 0.2
+        },
+        {
+          "first": "W1XYZ",
+          "second": "K1ABC",
+          "info": "-07",
+          "acknowledge": false,
+          "freq_hz": 1900.0,
+          "start_seconds": 0.1
+        }
+      ],
+      "expected_source": "stock"
+    }
+  ]
+}

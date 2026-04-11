@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::crc;
+use crate::modes::Mode;
+use crate::modes::ft4::FT4_RVEC;
 use crate::protocol::{
     CALL_MAX22, CALL_NTOKENS, CALL_STANDARD_BASE, FIELD_DAY_SECTIONS, FTX_DXPEDITION_LAYOUT,
     FTX_EU_VHF_LAYOUT, FTX_FIELD_DAY_LAYOUT, FTX_FREE_TEXT_FIELD, FTX_FREE_TEXT_SUBTYPE_FIELD,
@@ -535,18 +537,43 @@ impl HashResolver {
     }
 }
 
-pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
-    if codeword.len() < FTX_INFO_BITS {
+pub fn unpack_message_for_mode(mode: Mode, codeword: &[u8]) -> Option<Payload> {
+    let info_bits = match mode {
+        Mode::Ft8 | Mode::Ft4 => FTX_INFO_BITS,
+        Mode::Ft2 => FTX_MESSAGE_BITS + 13,
+    };
+    if codeword.len() < info_bits {
         return None;
     }
     let message_bits = &codeword[..FTX_MESSAGE_BITS];
-    let crc_bits = &codeword[FTX_MESSAGE_BITS..FTX_INFO_BITS];
-    if !crc::crc_matches(message_bits, crc_bits) {
+    let crc_bits = &codeword[FTX_MESSAGE_BITS..info_bits];
+    let crc_ok = match mode {
+        Mode::Ft8 | Mode::Ft4 => crc::crc_matches(message_bits, crc_bits),
+        Mode::Ft2 => crc::crc_matches_ft2(message_bits, crc_bits),
+    };
+    if !crc_ok {
         return None;
     }
+    let decoded_message_bits = if mode == Mode::Ft4 {
+        message_bits
+            .iter()
+            .zip(FT4_RVEC.iter())
+            .map(|(&bit, &mask)| bit ^ mask)
+            .collect::<Vec<_>>()
+    } else {
+        message_bits.to_vec()
+    };
+    parse_message_bits(&decoded_message_bits)
+}
 
+#[cfg(test)]
+pub(crate) fn unpack_message(codeword: &[u8]) -> Option<Payload> {
+    unpack_message_for_mode(Mode::Ft8, codeword)
+}
+
+fn parse_message_bits(message_bits: &[u8]) -> Option<Payload> {
     let i3 = read_bit_field(message_bits, FTX_STANDARD_LAYOUT.kind) as u8;
-    match i3 {
+    let payload = match i3 {
         0 => {
             let n3 = read_bit_field(message_bits, FTX_FREE_TEXT_SUBTYPE_FIELD) as u8;
             match n3 {
@@ -705,6 +732,44 @@ pub fn unpack_message(codeword: &[u8]) -> Option<Payload> {
             n3: None,
             message_bits: message_bits.to_vec(),
         })),
+    }?;
+
+    validate_payload(&payload).then_some(payload)
+}
+
+fn validate_payload(payload: &Payload) -> bool {
+    fn valid_standard_call(callsign: &str) -> bool {
+        !callsign.is_empty()
+            && !callsign.contains(' ')
+            && callsign
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    }
+
+    fn valid_call_field(field: &CallField) -> bool {
+        match field {
+            CallField::Standard(callsign) => valid_standard_call(callsign),
+            _ => true,
+        }
+    }
+
+    match payload {
+        Payload::Standard(message) => {
+            valid_call_field(&message.first) && valid_call_field(&message.second)
+        }
+        Payload::FieldDay(message) => {
+            valid_call_field(&message.first) && valid_call_field(&message.second)
+        }
+        Payload::RttyContest(message) => {
+            valid_call_field(&message.first) && valid_call_field(&message.second)
+        }
+        Payload::Dxpedition(message) => {
+            valid_call_field(&message.completed_call) && valid_call_field(&message.next_call)
+        }
+        Payload::EuVhf(_)
+        | Payload::Nonstandard(_)
+        | Payload::FreeText(_)
+        | Payload::Unsupported(_) => true,
     }
 }
 

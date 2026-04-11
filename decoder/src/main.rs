@@ -3,10 +3,15 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 use ft8_decoder::{
-    DecodeOptions, DecodeProfile, GridReport, WaveformOptions, debug_candidate_truth_wav_file,
-    debug_candidate_wav_file, decode_wav_file, encode_standard_message, parse_standard_info,
-    write_rectangular_standard_wav,
+    DecodeOptions, DecodeProfile, GridReport, Mode, TxRttyExchange, WaveformOptions,
+    debug_candidate_truth_wav_file, debug_candidate_wav_file, debug_ft2_trace_wav_file,
+    debug_ft4_decode174_wav_file, debug_ft4_metrics_wav_file, debug_ft4_search_probe_wav_file,
+    debug_ft4_variants_wav_file, debug_search_wav_file, decode_wav_file,
+    encode_rtty_contest_message, encode_standard_message, encode_standard_message_for_mode,
+    parse_standard_info, subtract_truth_wav_file, write_rectangular_standard_wav, write_wav,
 };
+
+type CliResult<T> = Result<T, std::io::Error>;
 
 #[derive(Debug, Parser)]
 #[command(name = "ft8-decoder")]
@@ -43,12 +48,21 @@ enum Command {
         #[arg(long, default_value = "medium")]
         profile: String,
 
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        no_subtraction: bool,
+
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
     },
     DebugCandidate {
         #[arg(value_name = "WAV")]
         wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
 
         #[arg(long)]
         dt_seconds: f32,
@@ -59,9 +73,43 @@ enum Command {
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
     },
+    DebugSearch {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long, default_value_t = 200.0)]
+        min_freq_hz: f32,
+
+        #[arg(long, default_value_t = 4000.0)]
+        max_freq_hz: f32,
+
+        #[arg(long, default_value_t = 600)]
+        max_candidates: usize,
+
+        #[arg(long, default_value_t = 200)]
+        max_successes: usize,
+
+        #[arg(long, default_value_t = 3)]
+        search_passes: usize,
+
+        #[arg(long, default_value = "medium")]
+        profile: String,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        no_subtraction: bool,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
     DebugStandardCandidate {
         #[arg(value_name = "WAV")]
         wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
 
         #[arg(long)]
         dt_seconds: f32,
@@ -74,6 +122,186 @@ enum Command {
 
         #[arg(long, action = ArgAction::SetTrue)]
         pretty: bool,
+    },
+    DebugFt4Variants {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugFt4Metrics {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugFt4Decode174 {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, default_value_t = 1)]
+        llr_set: usize,
+
+        #[arg(long, default_value_t = 2)]
+        max_osd: isize,
+
+        #[arg(long, default_value_t = 2)]
+        norder: usize,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugFt4SearchProbe {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugFt2Trace {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long, default_value_t = 375.0)]
+        min_freq_hz: f32,
+
+        #[arg(long, default_value_t = 3000.0)]
+        max_freq_hz: f32,
+
+        #[arg(long, default_value_t = 10)]
+        max_candidates: usize,
+
+        #[arg(long, default_value = "medium")]
+        profile: String,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugRttyContestCandidate {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, default_value_t = false)]
+        tu: bool,
+
+        #[arg(long)]
+        first: String,
+
+        #[arg(long)]
+        second: String,
+
+        #[arg(long, default_value_t = false)]
+        acknowledge: bool,
+
+        #[arg(long)]
+        report: u16,
+
+        #[arg(long)]
+        exchange: String,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    SubtractStandardCandidate {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(value_name = "OUTPUT_WAV")]
+        output_wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long)]
+        message: String,
+    },
+    SubtractCodewordCandidate {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(value_name = "OUTPUT_WAV")]
+        output_wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long)]
+        codeword_bits: String,
+    },
+    SubtractRttyContestCandidate {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(value_name = "OUTPUT_WAV")]
+        output_wav: PathBuf,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long)]
+        dt_seconds: f32,
+
+        #[arg(long)]
+        freq_hz: f32,
+
+        #[arg(long, default_value_t = false)]
+        tu: bool,
+
+        #[arg(long)]
+        first: String,
+
+        #[arg(long)]
+        second: String,
+
+        #[arg(long, default_value_t = false)]
+        acknowledge: bool,
+
+        #[arg(long)]
+        report: u16,
+
+        #[arg(long)]
+        exchange: String,
     },
     GenerateStandard {
         #[arg(value_name = "OUTPUT_WAV")]
@@ -91,18 +319,64 @@ enum Command {
         #[arg(long, default_value_t = false)]
         acknowledge: bool,
 
-        #[arg(long, default_value_t = 1_000.0)]
-        freq_hz: f32,
+        #[arg(long)]
+        freq_hz: Option<f32>,
 
-        #[arg(long, default_value_t = 0.5)]
-        start_seconds: f32,
+        #[arg(long)]
+        start_seconds: Option<f32>,
 
-        #[arg(long, default_value_t = 15.0)]
-        total_seconds: f32,
+        #[arg(long)]
+        total_seconds: Option<f32>,
 
-        #[arg(long, default_value_t = 0.8)]
-        amplitude: f32,
+        #[arg(long)]
+        amplitude: Option<f32>,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
     },
+}
+
+fn invalid_input(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn parse_mode(mode: &str) -> CliResult<Mode> {
+    mode.parse::<Mode>().map_err(invalid_input)
+}
+
+fn parse_profile(profile: &str) -> CliResult<DecodeProfile> {
+    profile.parse::<DecodeProfile>().map_err(invalid_input)
+}
+
+fn decode_options_for_mode(mode: Mode) -> DecodeOptions {
+    DecodeOptions::for_mode(mode)
+}
+
+fn waveform_options_for_mode(mode: Mode) -> WaveformOptions {
+    WaveformOptions::for_mode(mode)
+}
+
+fn decode_options_with_overrides(
+    mode: Mode,
+    profile: DecodeProfile,
+    min_freq_hz: f32,
+    max_freq_hz: f32,
+    max_candidates: usize,
+    max_successes: usize,
+    search_passes: usize,
+    disable_subtraction: bool,
+) -> DecodeOptions {
+    DecodeOptions {
+        mode,
+        profile,
+        min_freq_hz,
+        max_freq_hz,
+        max_candidates,
+        max_successes,
+        search_passes,
+        disable_subtraction,
+        ..decode_options_for_mode(mode)
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -117,20 +391,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_successes,
             search_passes,
             profile,
+            mode,
+            no_subtraction,
             pretty,
         } => {
-            let profile = profile.parse::<DecodeProfile>().map_err(|message| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-            })?;
-            let options = DecodeOptions {
+            let profile = parse_profile(&profile)?;
+            let mode = parse_mode(&mode)?;
+            let options = decode_options_with_overrides(
+                mode,
                 profile,
                 min_freq_hz,
                 max_freq_hz,
                 max_candidates,
                 max_successes,
                 search_passes,
-                ..DecodeOptions::default()
-            };
+                no_subtraction,
+            );
 
             let report = decode_wav_file(&wav, &options)?;
             if json {
@@ -151,11 +427,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::DebugCandidate {
             wav,
+            mode,
             dt_seconds,
             freq_hz,
             pretty,
         } => {
-            let report = debug_candidate_wav_file(&wav, dt_seconds, freq_hz)?;
+            let mode = parse_mode(&mode)?;
+            let report = debug_candidate_wav_file(&wav, mode, dt_seconds, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugSearch {
+            wav,
+            min_freq_hz,
+            max_freq_hz,
+            max_candidates,
+            max_successes,
+            search_passes,
+            profile,
+            mode,
+            no_subtraction,
+            pretty,
+        } => {
+            let profile = parse_profile(&profile)?;
+            let mode = parse_mode(&mode)?;
+            let options = decode_options_with_overrides(
+                mode,
+                profile,
+                min_freq_hz,
+                max_freq_hz,
+                max_candidates,
+                max_successes,
+                search_passes,
+                no_subtraction,
+            );
+            let report = debug_search_wav_file(&wav, &options)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -164,21 +473,137 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::DebugStandardCandidate {
             wav,
+            mode,
             dt_seconds,
             freq_hz,
             message,
             pretty,
         } => {
-            let (first, second, acknowledge, info) = parse_rendered_standard_message(&message)
-                .map_err(|message| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-                })?;
-            let frame =
-                encode_standard_message(&first, &second, acknowledge, &info).map_err(|error| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-                })?;
+            let mode = parse_mode(&mode)?;
+            let (first, second, acknowledge, info) =
+                parse_rendered_standard_message(&message).map_err(invalid_input)?;
+            let frame = encode_standard_message_for_mode(mode, &first, &second, acknowledge, &info)
+                .map_err(|error| invalid_input(error.to_string()))?;
+            let report = debug_candidate_truth_wav_file(
+                &wav,
+                mode,
+                dt_seconds,
+                freq_hz,
+                &frame.codeword_bits,
+            )?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt4Variants {
+            wav,
+            freq_hz,
+            pretty,
+        } => {
+            let report = debug_ft4_variants_wav_file(&wav, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt4Metrics {
+            wav,
+            dt_seconds,
+            freq_hz,
+            pretty,
+        } => {
+            let report = debug_ft4_metrics_wav_file(&wav, dt_seconds, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt4Decode174 {
+            wav,
+            dt_seconds,
+            freq_hz,
+            llr_set,
+            max_osd,
+            norder,
+            pretty,
+        } => {
             let report =
-                debug_candidate_truth_wav_file(&wav, dt_seconds, freq_hz, &frame.codeword_bits)?;
+                debug_ft4_decode174_wav_file(&wav, dt_seconds, freq_hz, llr_set, max_osd, norder)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt4SearchProbe {
+            wav,
+            freq_hz,
+            pretty,
+        } => {
+            let report = debug_ft4_search_probe_wav_file(&wav, freq_hz)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugFt2Trace {
+            wav,
+            min_freq_hz,
+            max_freq_hz,
+            max_candidates,
+            profile,
+            pretty,
+        } => {
+            let profile = parse_profile(&profile)?;
+            let options = DecodeOptions {
+                mode: Mode::Ft2,
+                profile,
+                min_freq_hz,
+                max_freq_hz,
+                max_candidates,
+                ..decode_options_for_mode(Mode::Ft2)
+            };
+            let report = debug_ft2_trace_wav_file(&wav, &options)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugRttyContestCandidate {
+            wav,
+            mode,
+            dt_seconds,
+            freq_hz,
+            tu,
+            first,
+            second,
+            acknowledge,
+            report,
+            exchange,
+            pretty,
+        } => {
+            let mode = parse_mode(&mode)?;
+            let exchange = if let Ok(serial) = exchange.parse::<u16>() {
+                TxRttyExchange::Serial(serial)
+            } else {
+                TxRttyExchange::Multiplier(exchange)
+            };
+            let frame =
+                encode_rtty_contest_message(tu, &first, &second, acknowledge, report, &exchange)
+                    .map_err(|error| invalid_input(error.to_string()))?;
+            let report = debug_candidate_truth_wav_file(
+                &wav,
+                mode,
+                dt_seconds,
+                freq_hz,
+                &frame.codeword_bits,
+            )?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -195,14 +620,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_seconds,
             total_seconds,
             amplitude,
+            mode,
         } => {
             let info = parse_standard_info(&info)?;
-            let options = WaveformOptions {
-                base_freq_hz: freq_hz,
-                start_seconds,
-                total_seconds,
-                amplitude,
-            };
+            let mode = parse_mode(&mode)?;
+            let mut options = waveform_options_for_mode(mode);
+            if let Some(freq_hz) = freq_hz {
+                options.base_freq_hz = freq_hz;
+            }
+            if let Some(start_seconds) = start_seconds {
+                options.start_seconds = start_seconds;
+            }
+            if let Some(total_seconds) = total_seconds {
+                options.total_seconds = total_seconds;
+            }
+            if let Some(amplitude) = amplitude {
+                options.amplitude = amplitude;
+            }
             let frame = write_rectangular_standard_wav(
                 &output_wav,
                 &first,
@@ -225,6 +659,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 second,
                 rendered_info.trim()
             );
+        }
+        Command::SubtractStandardCandidate {
+            wav,
+            output_wav,
+            mode,
+            dt_seconds,
+            freq_hz,
+            message,
+        } => {
+            let mode = parse_mode(&mode)?;
+            let (first, second, acknowledge, info) =
+                parse_rendered_standard_message(&message).map_err(invalid_input)?;
+            let frame = encode_standard_message_for_mode(mode, &first, &second, acknowledge, &info)
+                .map_err(|error| invalid_input(error.to_string()))?;
+            let residual =
+                subtract_truth_wav_file(&wav, mode, dt_seconds, freq_hz, &frame.codeword_bits)?
+                    .ok_or_else(|| invalid_input("unable to build subtraction residual"))?;
+            write_wav(&output_wav, &residual)?;
+        }
+        Command::SubtractCodewordCandidate {
+            wav,
+            output_wav,
+            mode,
+            dt_seconds,
+            freq_hz,
+            codeword_bits,
+        } => {
+            let mode = parse_mode(&mode)?;
+            let bits: Vec<u8> = codeword_bits
+                .chars()
+                .map(|ch| match ch {
+                    '0' => Ok(0u8),
+                    '1' => Ok(1u8),
+                    _ => Err(invalid_input("codeword bits must contain only 0/1")),
+                })
+                .collect::<Result<_, _>>()?;
+            let residual = subtract_truth_wav_file(&wav, mode, dt_seconds, freq_hz, &bits)?
+                .ok_or_else(|| invalid_input("unable to build subtraction residual"))?;
+            write_wav(&output_wav, &residual)?;
+        }
+        Command::SubtractRttyContestCandidate {
+            wav,
+            output_wav,
+            mode,
+            dt_seconds,
+            freq_hz,
+            tu,
+            first,
+            second,
+            acknowledge,
+            report,
+            exchange,
+        } => {
+            let mode = parse_mode(&mode)?;
+            let exchange = if let Ok(serial) = exchange.parse::<u16>() {
+                TxRttyExchange::Serial(serial)
+            } else {
+                TxRttyExchange::Multiplier(exchange)
+            };
+            let frame =
+                encode_rtty_contest_message(tu, &first, &second, acknowledge, report, &exchange)
+                    .map_err(|error| invalid_input(error.to_string()))?;
+            let residual =
+                subtract_truth_wav_file(&wav, mode, dt_seconds, freq_hz, &frame.codeword_bits)?
+                    .ok_or_else(|| invalid_input("unable to build subtraction residual"))?;
+            write_wav(&output_wav, &residual)?;
         }
     }
     Ok(())
