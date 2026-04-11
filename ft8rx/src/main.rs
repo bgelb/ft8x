@@ -57,6 +57,7 @@ const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
 const CQ_ACTIVITY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const DIRECT_CALL_PANE_RETENTION: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_QUEUE_NO_MSG_RETRY_DELAY: Duration = Duration::from_secs(35);
 const DEFAULT_QUEUE_NO_FWD_RETRY_DELAY: Duration = Duration::from_secs(300);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -2663,7 +2664,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <div class="third-row">
       <section class="panel direct-panel">
-        <div class="label">Direct Calls</div>
+          <div class="label">Direct Calls (1h)</div>
         <div class="value" id="direct-count">0 heard</div>
         <div class="detail-block">
           <div class="label">Messages To Or From Our Call</div>
@@ -5418,8 +5419,17 @@ fn refresh_web_snapshot(
     };
     guard.stations = station_tracker.web_station_summaries();
     guard.station_logs = station_tracker.web_logs();
-    let mut direct_calls = station_tracker.web_direct_calls(our_call);
-    direct_calls.extend_from_slice(qso_direct_calls);
+    let direct_calls_since = now
+        .checked_sub(DIRECT_CALL_PANE_RETENTION)
+        .unwrap_or(UNIX_EPOCH);
+    let direct_calls_since_ms = system_time_to_epoch_ms(direct_calls_since);
+    let mut direct_calls = station_tracker.web_direct_calls(our_call, direct_calls_since);
+    direct_calls.extend(
+        qso_direct_calls
+            .iter()
+            .filter(|entry| entry.sort_epoch_ms >= direct_calls_since_ms)
+            .cloned(),
+    );
     direct_calls.sort_by_key(|entry| entry.sort_epoch_ms);
     guard.direct_calls = direct_calls;
     guard.qso = qso_snapshot.clone();
@@ -7011,10 +7021,12 @@ impl StationTracker {
             .collect()
     }
 
-    fn web_direct_calls(&self, our_call: &str) -> Vec<WebDirectCallLog> {
+    fn web_direct_calls(&self, our_call: &str, since: SystemTime) -> Vec<WebDirectCallLog> {
         self.logs
             .iter()
             .filter(|entry| {
+                entry.received_at >= since
+                    &&
                 entry.peer.as_ref().map(|peer| self.peer_display(peer))
                     == Some(our_call.to_string())
             })
