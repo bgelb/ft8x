@@ -671,7 +671,7 @@ pub(super) fn sync8_score(
     let row_len = spec.sync_fft_samples() / 2 + 1;
     let sync_steps_per_symbol = spec.search.sync_step_divisor;
     let tone_bin_stride = spec.sync_tone_bin_stride();
-    let tone_count = spec.tone_count();
+    let sync_tone_span = spec.sync_tone_span_bins();
     let mut block_signal = vec![0.0f32; geometry.sync_block_starts.len()];
     let mut block_band = vec![0.0f32; geometry.sync_block_starts.len()];
 
@@ -689,7 +689,7 @@ pub(super) fn sync8_score(
             }
             let row = (row_start as usize - 1) * row_len;
             block_signal[block_index] += symbol_power[row + bin + tone_bin_stride * costas];
-            for tone in 0..tone_count {
+            for tone in 0..sync_tone_span {
                 block_band[block_index] += symbol_power[row + bin + tone_bin_stride * tone];
             }
         }
@@ -713,7 +713,8 @@ pub(super) fn sync8_score(
 }
 
 pub(super) fn ratio_sync_score(spec: &ModeSpec, signal: f32, band_total: f32) -> f32 {
-    let noise = (band_total - signal) / (spec.tone_count().saturating_sub(1).max(1)) as f32;
+    let noise =
+        (band_total - signal) / (spec.sync_tone_span_bins().saturating_sub(1).max(1)) as f32;
     if noise > 0.0 { signal / noise } else { 0.0 }
 }
 

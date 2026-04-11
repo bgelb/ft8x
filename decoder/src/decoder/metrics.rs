@@ -445,7 +445,7 @@ pub(super) fn decode_llr_set(
     max_osd: isize,
     counters: &mut DecodeCounters,
 ) -> Option<(Payload, Vec<u8>, usize)> {
-    let Some((bits, iterations)) = parity.decode_with_maxosd(llrs, max_osd) else {
+    let Some((bits, iterations)) = parity.decode_for_mode_with_maxosd(mode, llrs, max_osd) else {
         return None;
     };
     if bits.iter().all(|bit| *bit == 0) {
@@ -471,7 +471,7 @@ pub(super) fn decode_llr_set_with_known_bits(
     counters: &mut DecodeCounters,
 ) -> Option<(Payload, Vec<u8>, usize)> {
     let Some((bits, iterations)) =
-        parity.decode_with_known_bits_and_maxosd(llrs, known_bits, max_osd)
+        parity.decode_for_mode_with_known_bits_and_maxosd(mode, llrs, known_bits, max_osd)
     else {
         return None;
     };

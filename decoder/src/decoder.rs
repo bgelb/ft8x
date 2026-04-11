@@ -463,6 +463,9 @@ fn long_input_samples(spec: &ModeSpec) -> usize {
 }
 
 fn stock_window_audio<'a>(audio: &'a AudioBuffer, mode: Mode) -> Cow<'a, AudioBuffer> {
+    if mode == Mode::Ft8 {
+        return Cow::Borrowed(audio);
+    }
     let max_samples = mode.spec().search.long_input_samples;
     if audio.samples.len() <= max_samples {
         Cow::Borrowed(audio)
