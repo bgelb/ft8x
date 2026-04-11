@@ -120,8 +120,8 @@ impl WaveformOptions {
         Self {
             mode,
             base_freq_hz: spec.default_frequency_hz(),
-            start_seconds: spec.default_start_seconds(),
-            total_seconds: spec.default_total_seconds(),
+            start_seconds: 0.0,
+            total_seconds: spec.frame_seconds(),
             amplitude: spec.default_amplitude(),
         }
     }
@@ -658,6 +658,36 @@ pub fn synthesize_rectangular_waveform(
         sample_rate_hz,
         samples,
     })
+}
+
+pub fn pad_audio_buffer(
+    audio: &AudioBuffer,
+    start_seconds: f32,
+    total_seconds: f32,
+) -> Result<AudioBuffer, EncodeError> {
+    let total_samples = (total_seconds * audio.sample_rate_hz as f32).round() as usize;
+    let start_sample = (start_seconds * audio.sample_rate_hz as f32).round() as usize;
+    if start_sample + audio.samples.len() > total_samples {
+        return Err(EncodeError::WaveformTooShort);
+    }
+    let mut samples = vec![0.0f32; total_samples];
+    samples[start_sample..start_sample + audio.samples.len()].copy_from_slice(&audio.samples);
+    Ok(AudioBuffer {
+        sample_rate_hz: audio.sample_rate_hz,
+        samples,
+    })
+}
+
+pub fn pad_audio_buffer_for_mode(
+    audio: &AudioBuffer,
+    mode: Mode,
+) -> Result<AudioBuffer, EncodeError> {
+    let spec = mode.spec();
+    pad_audio_buffer(
+        audio,
+        spec.default_start_seconds(),
+        spec.default_total_seconds(),
+    )
 }
 
 pub fn synthesize_channel_reference_for_mode(
@@ -1350,13 +1380,15 @@ mod tests {
             &frame,
             &WaveformOptions {
                 mode: Mode::Ft4,
-                total_seconds: 7.5,
-                ..WaveformOptions::default()
+                ..WaveformOptions::for_mode(Mode::Ft4)
             },
         )
         .expect("ft4 waveform");
         assert_eq!(audio.sample_rate_hz, 12_000);
-        assert_eq!(audio.samples.len(), 90_000);
+        assert_eq!(
+            audio.samples.len(),
+            Mode::Ft4.spec().geometry.frame_samples()
+        );
     }
 
     #[test]
@@ -1389,13 +1421,60 @@ mod tests {
             &frame,
             &WaveformOptions {
                 mode: Mode::Ft2,
-                total_seconds: 2.5,
-                ..WaveformOptions::default()
+                ..WaveformOptions::for_mode(Mode::Ft2)
             },
         )
         .expect("ft2 waveform");
         assert_eq!(audio.sample_rate_hz, 12_000);
-        assert_eq!(audio.samples.len(), 30_000);
+        assert_eq!(
+            audio.samples.len(),
+            Mode::Ft2.spec().geometry.frame_samples()
+        );
+    }
+
+    #[test]
+    fn waveform_options_for_mode_default_to_exact_frame_audio() {
+        for mode in [Mode::Ft8, Mode::Ft4, Mode::Ft2] {
+            let waveform = WaveformOptions::for_mode(mode);
+            let spec = mode.spec();
+            assert_eq!(waveform.start_seconds, 0.0);
+            assert_eq!(waveform.total_seconds, spec.frame_seconds());
+            assert_eq!(waveform.base_freq_hz, spec.default_frequency_hz());
+            assert_eq!(waveform.amplitude, spec.default_amplitude());
+        }
+    }
+
+    #[test]
+    fn pad_audio_buffer_for_mode_places_raw_waveform_at_nominal_slot_offset() {
+        let frame = encode_standard_message_for_mode(
+            Mode::Ft8,
+            "K1ABC",
+            "W1XYZ",
+            false,
+            &GridReport::Grid("FN31".to_string()),
+        )
+        .expect("encode ft8");
+        let raw_audio =
+            synthesize_rectangular_waveform(&frame, &WaveformOptions::for_mode(Mode::Ft8))
+                .expect("raw waveform");
+        let padded = pad_audio_buffer_for_mode(&raw_audio, Mode::Ft8).expect("padded waveform");
+        let start_sample = (Mode::Ft8.spec().default_start_seconds()
+            * raw_audio.sample_rate_hz as f32)
+            .round() as usize;
+        assert_eq!(
+            padded.samples.len(),
+            (Mode::Ft8.spec().default_total_seconds() * raw_audio.sample_rate_hz as f32).round()
+                as usize
+        );
+        assert!(
+            padded.samples[..start_sample]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert_eq!(
+            &padded.samples[start_sample..start_sample + raw_audio.samples.len()],
+            raw_audio.samples.as_slice()
+        );
     }
 
     #[test]

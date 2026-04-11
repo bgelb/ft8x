@@ -791,9 +791,7 @@ impl QsoController {
         let Some(target_slot) = session.next_tx_slot else {
             return;
         };
-        let key_time = target_slot
-            .checked_sub(Duration::from_millis(PRE_KEY_MS))
-            .unwrap_or(target_slot);
+        let key_time = tx_key_time_for_slot(target_slot, session.app_mode);
         if now < key_time {
             return;
         }
@@ -2277,10 +2275,8 @@ fn run_tx_thread(
     event_tx: mpsc::Sender<TxEvent>,
 ) {
     let _busy_guard = TxBusyGuard::new(tx_busy);
-    let key_target = request
-        .target_slot
-        .checked_sub(Duration::from_millis(PRE_KEY_MS))
-        .unwrap_or(request.target_slot);
+    let symbol_start = tx_symbol_start_for_slot(request.target_slot, request.app_mode);
+    let key_target = tx_key_time_for_slot(request.target_slot, request.app_mode);
     if wait_until(key_target, &cancel) {
         let _ = event_tx.send(TxEvent::Aborted {
             session_id: request.session_id,
@@ -2320,7 +2316,7 @@ fn run_tx_thread(
         }
     };
 
-    if wait_until(request.target_slot, &cancel) {
+    if wait_until(symbol_start, &cancel) {
         force_rx(&rig);
         let _ = event_tx.send(TxEvent::Aborted {
             session_id: request.session_id,
@@ -2417,9 +2413,7 @@ fn with_rig<T>(
 
 fn first_matching_slot_after(now: SystemTime, family: SlotFamily, app_mode: Mode) -> SystemTime {
     let mut slot = crate::next_slot_boundary_for_mode(app_mode, now);
-    let key_time = slot
-        .checked_sub(Duration::from_millis(PRE_KEY_MS))
-        .unwrap_or(slot);
+    let key_time = tx_key_time_for_slot(slot, app_mode);
     if now >= key_time {
         slot += crate::slot_duration_for_mode(app_mode);
     }
@@ -2439,6 +2433,17 @@ fn next_matching_slot_after(
         slot += crate::slot_duration_for_mode(app_mode);
     }
     Some(slot)
+}
+
+fn tx_symbol_start_for_slot(slot_start: SystemTime, app_mode: Mode) -> SystemTime {
+    slot_start + Duration::from_secs_f32(app_mode.spec().nominal_start_seconds())
+}
+
+fn tx_key_time_for_slot(slot_start: SystemTime, app_mode: Mode) -> SystemTime {
+    let symbol_start = tx_symbol_start_for_slot(slot_start, app_mode);
+    symbol_start
+        .checked_sub(Duration::from_millis(PRE_KEY_MS))
+        .unwrap_or(symbol_start)
 }
 
 fn schedule_next_tx_slot(session: &ActiveSession, rx_slot_start: SystemTime) -> Option<SystemTime> {
@@ -3194,8 +3199,14 @@ mod tests {
             true,
             rx_slot_start + Duration::from_secs(15),
         ));
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
         let snapshot = controller.snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
         assert!(snapshot.active);
         assert_eq!(snapshot.partner_call.as_deref(), Some("K2ABC"));
@@ -3251,8 +3262,14 @@ mod tests {
             true,
             rx_slot_start + Duration::from_secs(15),
         ));
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
         let snapshot = controller.snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
         assert!(snapshot.active);
         assert_eq!(snapshot.partner_call.as_deref(), Some("K2ABC"));
@@ -3312,7 +3329,10 @@ mod tests {
             },
             rx_slot_start + Duration::from_secs(16),
         ));
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
         if let Some(session) = controller.session.as_ref() {
             if let Some(tx) = session.in_flight_tx.as_ref() {
                 assert_eq!(tx.message_text, "K1ABC RR73; K2ABC <N1VF> -03");
@@ -3575,8 +3595,10 @@ mod tests {
             session.state = QsoState::Send73Once;
             session.next_tx_slot = Some(first_matching_slot_after(now, SlotFamily::Odd, Mode::Ft8));
         }
-        controller.tick(now + Duration::from_secs(15));
-        controller.tick(now + Duration::from_secs(15));
+        let tx_slot = first_matching_slot_after(now, SlotFamily::Odd, Mode::Ft8);
+        let tx_time = tx_key_time_for_slot(tx_slot, Mode::Ft8);
+        controller.tick(tx_time);
+        controller.tick(tx_time);
         assert!(!controller.snapshot(now).active);
     }
 
@@ -3647,7 +3669,10 @@ mod tests {
             session.state = QsoState::SendRRR;
             session.next_tx_slot = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(30));
         }
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(30));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            Mode::Ft8,
+        ));
         controller.on_full_decode(
             SystemTime::UNIX_EPOCH + Duration::from_secs(15),
             &[directed_decode("K1ABC", "ZZ9", ToUsEvent::Other)],
@@ -3659,15 +3684,24 @@ mod tests {
                 .state,
             "send_rrr"
         );
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(45));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(45),
+            Mode::Ft8,
+        ));
         let snapshot = controller.snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(45));
         assert!(snapshot.active);
         assert_eq!(snapshot.state, "send_rrr");
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
         let snapshot = controller.snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
         assert!(snapshot.active);
         assert_eq!(snapshot.state, "send_73_once");
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
         assert!(
             !controller
                 .snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(60))
@@ -3696,13 +3730,19 @@ mod tests {
             session.state = QsoState::SendRRR;
             session.next_tx_slot = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(30));
         }
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(30));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            Mode::Ft8,
+        ));
         controller.on_full_decode(
             SystemTime::UNIX_EPOCH + Duration::from_secs(15),
             &[directed_decode("K1ABC", "ZZ9", ToUsEvent::Other)],
             SystemTime::UNIX_EPOCH + Duration::from_secs(30),
         );
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(45));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(45),
+            Mode::Ft8,
+        ));
         controller.on_full_decode(
             SystemTime::UNIX_EPOCH + Duration::from_secs(45),
             &[directed_decode(
@@ -3712,7 +3752,10 @@ mod tests {
             )],
             SystemTime::UNIX_EPOCH + Duration::from_secs(59),
         );
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
         let snapshot = controller.snapshot(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
         assert!(snapshot.active);
         assert_eq!(snapshot.state, "send_73");
@@ -3795,7 +3838,10 @@ mod tests {
         if let Some(session) = controller.session.as_mut() {
             session.state = QsoState::SendRR73;
         }
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        ));
         assert!(controller.snapshot(now).active);
         controller.on_full_decode(
             SystemTime::UNIX_EPOCH + Duration::from_secs(45),
@@ -3806,7 +3852,10 @@ mod tests {
         controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
         let snapshot = controller.snapshot(now);
         assert!(snapshot.active);
-        controller.tick(SystemTime::UNIX_EPOCH + Duration::from_secs(90));
+        controller.tick(tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(90),
+            Mode::Ft8,
+        ));
         let snapshot = controller.snapshot(now);
         assert!(!snapshot.active);
         assert!(

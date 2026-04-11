@@ -31,8 +31,8 @@ fn decode_options_for_mode_follow_mode_spec_defaults() {
         assert_eq!(options.tx_freq_hz, spec.search.nfqso_hz);
         assert_eq!(waveform.mode, mode);
         assert_eq!(waveform.base_freq_hz, spec.default_frequency_hz());
-        assert_eq!(waveform.start_seconds, spec.default_start_seconds());
-        assert_eq!(waveform.total_seconds, spec.default_total_seconds());
+        assert_eq!(waveform.start_seconds, 0.0);
+        assert_eq!(waveform.total_seconds, spec.frame_seconds());
         assert_eq!(waveform.amplitude, spec.default_amplitude());
     }
 }

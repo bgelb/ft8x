@@ -28,9 +28,10 @@ pub use encode::{
     WaveformOptions, channel_symbols_from_codeword_bits,
     channel_symbols_from_codeword_bits_for_mode, encode_dxpedition_message, encode_eu_vhf_message,
     encode_field_day_message, encode_nonstandard_message, encode_rtty_contest_message,
-    encode_standard_message, encode_standard_message_for_mode, parse_standard_info,
-    synthesize_channel_reference, synthesize_channel_reference_for_mode,
-    synthesize_rectangular_waveform, synthesize_tx_message, write_rectangular_standard_wav,
+    encode_standard_message, encode_standard_message_for_mode, pad_audio_buffer,
+    pad_audio_buffer_for_mode, parse_standard_info, synthesize_channel_reference,
+    synthesize_channel_reference_for_mode, synthesize_rectangular_waveform, synthesize_tx_message,
+    write_rectangular_standard_wav,
 };
 pub use message::{
     CallModifier, GridReport, HashedCallField10, HashedCallField12, HashedCallField22,

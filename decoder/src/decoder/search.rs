@@ -257,8 +257,8 @@ pub(super) fn debug_ft4_search_probe_pcm(
         let candidate_bin = (((best.freq_hz - probe.f_offset_hz) / probe.df_hz).round() as isize)
             .clamp(0, probe.raw_savg.len().saturating_sub(1) as isize)
             as usize;
-        let probe_bins =
-            ((target_bin as isize - FT4_PROBE_RADIUS_BINS)..=(target_bin as isize + FT4_PROBE_RADIUS_BINS))
+        let probe_bins = ((target_bin as isize - FT4_PROBE_RADIUS_BINS)
+            ..=(target_bin as isize + FT4_PROBE_RADIUS_BINS))
             .filter_map(|bin| {
                 let index = usize::try_from(bin).ok()?;
                 let savg = *probe.raw_savg.get(index)?;
@@ -369,10 +369,10 @@ fn collect_candidates_ft4_with_probe(
     }
 
     let df = spec.sync_bin_hz();
-    let nfa =
-        ((options.min_freq_hz / df).round() as usize).max((WSJTX_FREQ_MIN_HZ / df).round() as usize);
-    let nfb =
-        ((options.max_freq_hz / df).round() as usize).min((WSJTX_FREQ_MAX_HZ / df).round() as usize);
+    let nfa = ((options.min_freq_hz / df).round() as usize)
+        .max((WSJTX_FREQ_MIN_HZ / df).round() as usize);
+    let nfb = ((options.max_freq_hz / df).round() as usize)
+        .min((WSJTX_FREQ_MAX_HZ / df).round() as usize);
     if nfa >= nfb || nfb > nh1 {
         return (Vec::new(), None);
     }
@@ -495,10 +495,9 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
     let mut baseline = vec![0.0f32; savg.len()];
     for (bin, slot) in baseline.iter_mut().enumerate().take(ib + 1).skip(ia) {
         let t = bin as f64 - i0;
-        let db =
-            coeffs[0]
-                + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4])))
-                + BASELINE_DB_OFFSET;
+        let db = coeffs[0]
+            + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4])))
+            + BASELINE_DB_OFFSET;
         *slot = 10.0f64.powf(db / 10.0) as f32;
     }
     baseline
@@ -507,7 +506,8 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
 pub(super) fn percentile_10(values: &[f32]) -> f32 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|left, right| left.total_cmp(right));
-    let rank = ((sorted.len() as f32 * WSJTX_PERCENTILE_10).round() as usize).clamp(1, sorted.len());
+    let rank =
+        ((sorted.len() as f32 * WSJTX_PERCENTILE_10).round() as usize).clamp(1, sorted.len());
     let index = rank - 1;
     sorted[index]
 }

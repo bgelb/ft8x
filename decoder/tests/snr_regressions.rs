@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use ft8_decoder::{
     AudioBuffer, DecodeOptions, GridReport, Mode, WaveformOptions, decode_pcm,
-    encode_standard_message_for_mode, parse_standard_info, synthesize_rectangular_waveform,
-    write_wav,
+    encode_standard_message_for_mode, pad_audio_buffer_for_mode, parse_standard_info,
+    synthesize_rectangular_waveform, write_wav,
 };
 use serde::Deserialize;
 
@@ -73,7 +73,11 @@ fn synthesized_snr_regressions_track_stock_within_one_db() {
     }
 
     if !failures.is_empty() {
-        panic!("{} SNR regression cases failed:\n{}", SNR_MANIFEST, failures.join("\n"));
+        panic!(
+            "{} SNR regression cases failed:\n{}",
+            SNR_MANIFEST,
+            failures.join("\n")
+        );
     }
 }
 
@@ -109,20 +113,16 @@ fn manifest_path() -> PathBuf {
 fn synthesize_case(case: &SnrCase, mode: Mode) -> AudioBuffer {
     let info: GridReport = parse_standard_info(&case.info)
         .unwrap_or_else(|error| panic!("{}: invalid info {:?}: {error}", case.id, case.info));
-    let frame = encode_standard_message_for_mode(
-        mode,
-        &case.first,
-        &case.second,
-        false,
-        &info,
-    )
-    .unwrap_or_else(|error| panic!("{}: encode failed: {error}", case.id));
+    let frame = encode_standard_message_for_mode(mode, &case.first, &case.second, false, &info)
+        .unwrap_or_else(|error| panic!("{}: encode failed: {error}", case.id));
 
     let mut waveform = WaveformOptions::for_mode(mode);
     waveform.base_freq_hz = case.base_freq_hz;
     waveform.amplitude *= case.signal_gain;
-    let mut audio = synthesize_rectangular_waveform(&frame, &waveform)
+    let raw_audio = synthesize_rectangular_waveform(&frame, &waveform)
         .unwrap_or_else(|error| panic!("{}: synthesize failed: {error}", case.id));
+    let mut audio = pad_audio_buffer_for_mode(&raw_audio, mode)
+        .unwrap_or_else(|error| panic!("{}: pad failed: {error}", case.id));
     add_deterministic_noise(&mut audio, case.noise_sigma, case.noise_seed);
     audio
 }
