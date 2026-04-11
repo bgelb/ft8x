@@ -5850,7 +5850,7 @@ fn extract_slot_capture(
 ) -> Result<Vec<i16>, AppError> {
     Ok(capture.extract_window(
         slot_start,
-        full_slot_sample_count(capture.config().sample_rate_hz, mode),
+        full_decode_sample_count(capture.config().sample_rate_hz, mode),
     )?)
 }
 
@@ -6359,8 +6359,10 @@ fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}-{}", std::process::id(), name))
 }
 
-fn full_slot_sample_count(sample_rate_hz: u32, mode: DecoderMode) -> usize {
-    (((slot_millis_for_mode(mode) as u128) * sample_rate_hz as u128) / 1000) as usize
+fn full_decode_sample_count(sample_rate_hz: u32, mode: DecoderMode) -> usize {
+    let decoder_samples = DecodeStage::Full.required_samples(mode.spec()) as u64;
+    let numerator = decoder_samples * sample_rate_hz as u64 + (DECODER_SAMPLE_RATE_HZ as u64 / 2);
+    (numerator / DECODER_SAMPLE_RATE_HZ as u64) as usize
 }
 
 fn samples_to_duration(sample_rate_hz: u32, sample_count: usize) -> Duration {
@@ -6375,7 +6377,7 @@ fn stage_sample_count(sample_rate_hz: u32, mode: DecoderMode, stage: DecodeStage
 
 fn capture_window_duration(sample_rate_hz: u32, mode: DecoderMode) -> Duration {
     Duration::from_secs_f64(
-        full_slot_sample_count(sample_rate_hz, mode) as f64 / sample_rate_hz as f64,
+        full_decode_sample_count(sample_rate_hz, mode) as f64 / sample_rate_hz as f64,
     )
 }
 
@@ -8302,6 +8304,26 @@ mod tests {
         assert_eq!(
             calling_frequency_hz(Band::M6, DecoderMode::Ft2),
             calling_frequency_hz(Band::M6, DecoderMode::Ft8)
+        );
+    }
+
+    #[test]
+    fn full_decode_sample_window_matches_decoder_mode_spec() {
+        assert_eq!(
+            full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft8),
+            180_000
+        );
+        assert_eq!(
+            full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4),
+            72_576
+        );
+        assert_eq!(
+            full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft2),
+            30_000
+        );
+        assert_eq!(
+            capture_window_duration(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4),
+            Duration::from_secs_f64(72_576.0 / 12_000.0)
         );
     }
 
