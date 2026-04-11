@@ -108,6 +108,28 @@ impl DecoderSession {
             )));
         }
 
+        if options.mode == Mode::Ft2 {
+            let report = decode_ft2(audio, options)?;
+            let state = state.cloned().unwrap_or_default();
+            let (new_decodes, updated_decodes) = diff_decodes(&self.last_decodes, &report.decodes);
+            self.last_decodes = report
+                .decodes
+                .iter()
+                .cloned()
+                .map(|decode| (decode.text.clone(), decode))
+                .collect();
+            self.emitted_stages.push(stage);
+            return Ok((
+                StageDecodeReport {
+                    stage,
+                    report,
+                    new_decodes,
+                    updated_decodes,
+                },
+                state,
+            ));
+        }
+
         let search = match stage {
             DecodeStage::Early41 => {
                 let early_audio = zero_tail(audio, early_41_samples(spec));

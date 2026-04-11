@@ -1339,6 +1339,26 @@ mod tests {
     }
 
     #[test]
+    fn ft2_session_full_stage_uses_dedicated_decoder_path() {
+        let options = DecodeOptions {
+            mode: Mode::Ft2,
+            ..DecodeOptions::for_mode(Mode::Ft2)
+        };
+        let spec = options.mode.spec();
+        let mut session = DecoderSession::new();
+        let full = AudioBuffer {
+            sample_rate_hz: spec.geometry.sample_rate_hz,
+            samples: vec![0.0; long_input_samples(spec)],
+        };
+        let updates = session
+            .decode_available(&full, &options)
+            .expect("ft2 full decode");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].stage, DecodeStage::Full);
+        assert!(updates[0].report.decodes.is_empty());
+    }
+
+    #[test]
     fn decode_pcm_with_state_resolves_hash22_callsign() {
         let learned_frame =
             encode_nonstandard_message("K1ABC", "HF19NY", false, ReplyWord::Blank, true)

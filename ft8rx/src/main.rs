@@ -8342,6 +8342,61 @@ mod tests {
     }
 
     #[test]
+    fn ft2_full_stage_decode_silence_does_not_panic() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(30);
+        let samples = vec![0i16; full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft2)];
+        let result = std::panic::catch_unwind(|| {
+            let mut session = DecoderSession::new();
+            let mut state = DecoderState::new();
+            decode_stage_from_samples(
+                &mut session,
+                &mut state,
+                &samples,
+                DECODER_SAMPLE_RATE_HZ,
+                DecoderMode::Ft2,
+                DecodeStage::Full,
+                slot_start,
+                None,
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "ft2 full-stage decode panicked inside decode worker path"
+        );
+        let report = result.expect("panic-free decode").expect("decode stage result");
+        assert_eq!(report.stage, DecodeStage::Full);
+        assert!(report.report.decodes.is_empty());
+    }
+
+    #[test]
+    fn ft2_full_stage_decode_resampled_silence_does_not_panic() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(30);
+        let source_rate = 48_000;
+        let samples = vec![0i16; full_decode_sample_count(source_rate, DecoderMode::Ft2)];
+        let result = std::panic::catch_unwind(|| {
+            let mut session = DecoderSession::new();
+            let mut state = DecoderState::new();
+            decode_stage_from_samples(
+                &mut session,
+                &mut state,
+                &samples,
+                source_rate,
+                DecoderMode::Ft2,
+                DecodeStage::Full,
+                slot_start,
+                None,
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "ft2 full-stage resampled decode panicked inside decode worker path"
+        );
+        let report = result.expect("panic-free decode").expect("decode stage result");
+        assert_eq!(report.stage, DecodeStage::Full);
+        assert!(report.report.decodes.is_empty());
+    }
+
+    #[test]
     fn non_ft8_modes_only_schedule_full_decode_stage() {
         let slot_start = UNIX_EPOCH + Duration::from_secs(30);
         let before_full_ready = slot_start + Duration::from_secs(1);
