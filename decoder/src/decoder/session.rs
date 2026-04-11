@@ -3,6 +3,17 @@ use std::collections::HashSet;
 use super::*;
 use crate::message::{Payload, ReplyWord, StructuredMessage};
 
+const FT8_UTC_PLACEHOLDER: &str = "000000";
+const FT8_BASELINE_DB_REFERENCE: f32 = 40.0;
+const FT8_REPORTED_SNR_DENOMINATOR: f32 = 3.0e6;
+const FT8_REPORTED_SNR_MIN_ARG: f32 = 0.001;
+const FT8_REPORTED_SNR_ARG_THRESHOLD: f32 = 0.1;
+const FT8_REPORTED_SNR_DB_OFFSET: f32 = 27.0;
+const FT8_REPORTED_SNR_FLOOR_DB: f32 = -24.0;
+const FT4_REPORTED_SNR_SIGNAL_FLOOR: f32 = 1.0;
+const FT4_REPORTED_SNR_DB_OFFSET: f32 = 14.8;
+const FT4_REPORTED_SNR_FLOOR_DB: f32 = -21.0;
+
 pub(super) struct DebugSearchTrace {
     pub(super) search: SearchResult,
     pub(super) passes: Vec<SearchPassTrace>,
@@ -333,7 +344,7 @@ pub(super) fn build_decode_report_with_resolver(
             Mode::Ft4 | Mode::Ft2 => success.snr_db,
         };
         let decode = DecodedMessage {
-            utc: "000000".to_string(),
+            utc: FT8_UTC_PLACEHOLDER.to_string(),
             snr_db: reported_snr_db,
             dt_seconds: success.candidate.dt_seconds,
             freq_hz: success.candidate.freq_hz,
@@ -411,26 +422,32 @@ fn ft8_reported_snr_db(
         .sum::<f32>();
     let bin = ((success.candidate.freq_hz / spec.sync_bin_hz()).round() as isize)
         .clamp(0, context.baseline_db.len().saturating_sub(1) as isize) as usize;
-    let xbase = 10.0f32.powf(0.1 * (context.baseline_db[bin] - 40.0));
+    let xbase =
+        10.0f32.powf(0.1 * (context.baseline_db[bin] - FT8_BASELINE_DB_REFERENCE));
     if !xbase.is_finite() || xbase <= 0.0 {
         return None;
     }
 
-    let mut xsnr = 0.001f32;
-    let arg = xsig / xbase / 3.0e6 - 1.0;
-    if arg > 0.1 {
+    let mut xsnr = FT8_REPORTED_SNR_MIN_ARG;
+    let arg = xsig / xbase / FT8_REPORTED_SNR_DENOMINATOR - 1.0;
+    if arg > FT8_REPORTED_SNR_ARG_THRESHOLD {
         xsnr = arg;
     }
-    Some((10.0 * xsnr.log10() - 27.0).max(-24.0).round() as i32)
+    Some(
+        (10.0 * xsnr.log10() - FT8_REPORTED_SNR_DB_OFFSET)
+            .max(FT8_REPORTED_SNR_FLOOR_DB)
+            .round() as i32,
+    )
 }
 
 fn ft4_reported_snr_db(coarse_score: f32) -> i32 {
-    let xsnr = if coarse_score > 1.0 {
-        10.0 * (coarse_score - 1.0).log10() - 14.8
+    let xsnr = if coarse_score > FT4_REPORTED_SNR_SIGNAL_FLOOR {
+        10.0 * (coarse_score - FT4_REPORTED_SNR_SIGNAL_FLOOR).log10()
+            - FT4_REPORTED_SNR_DB_OFFSET
     } else {
-        -21.0
+        FT4_REPORTED_SNR_FLOOR_DB
     };
-    xsnr.max(-21.0).round() as i32
+    xsnr.max(FT4_REPORTED_SNR_FLOOR_DB).round() as i32
 }
 
 pub(super) fn build_decoder_state(

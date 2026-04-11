@@ -8,6 +8,12 @@ use ft8_decoder::{
 use serde::Deserialize;
 
 const SNR_MANIFEST: &str = "data/snr_regressions.json";
+const STOCK_SNR_TOLERANCE_DB: i32 = 1;
+const NOISE_LCG_MULTIPLIER: u64 = 6364136223846793005;
+const NOISE_LCG_INCREMENT: u64 = 1;
+const NOISE_HIGH_WORD_SCALE: f32 = 4294967296.0;
+const GAUSSIANISH_SUM_TERMS: usize = 12;
+const GAUSSIANISH_ZERO_MEAN_OFFSET: f32 = 6.0;
 
 #[derive(Debug, Deserialize)]
 struct SnrManifest {
@@ -58,7 +64,7 @@ fn synthesized_snr_regressions_track_stock_within_one_db() {
             continue;
         };
         let delta = (actual.snr_db - case.expected_stock_snr_db).abs();
-        if delta > 1 {
+        if delta > STOCK_SNR_TOLERANCE_DB {
             failures.push(format!(
                 "{}: expected stock SNR {}, got {}",
                 case.id, case.expected_stock_snr_db, actual.snr_db
@@ -138,12 +144,14 @@ fn add_deterministic_noise(audio: &mut AudioBuffer, sigma: f32, seed: u64) {
 
 fn gaussianish_unit(state: &mut u64) -> f32 {
     let mut sum = 0.0f32;
-    for _ in 0..12 {
+    // A 12-uniform sum gives a cheap deterministic pseudo-Gaussian source for
+    // the CI fixtures without adding a new RNG dependency.
+    for _ in 0..GAUSSIANISH_SUM_TERMS {
         *state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
-        let uniform = ((*state >> 32) as f32) / 4294967296.0;
+            .wrapping_mul(NOISE_LCG_MULTIPLIER)
+            .wrapping_add(NOISE_LCG_INCREMENT);
+        let uniform = ((*state >> 32) as f32) / NOISE_HIGH_WORD_SCALE;
         sum += uniform;
     }
-    sum - 6.0
+    sum - GAUSSIANISH_ZERO_MEAN_OFFSET
 }
