@@ -39,8 +39,10 @@ pub(super) fn ft8_reported_snr_db(
     )?;
     let start_index = (success.candidate.start_seconds * spec.baseband_rate_hz()).round() as isize;
     let full_tones = extract_symbol_tones(spec, &baseband, start_index);
-    let channel_symbols =
-        crate::encode::channel_symbols_from_codeword_bits_for_mode(Mode::Ft8, &success.codeword_bits)?;
+    let channel_symbols = crate::encode::channel_symbols_from_codeword_bits_for_mode(
+        Mode::Ft8,
+        &success.codeword_bits,
+    )?;
     if channel_symbols.len() != full_tones.len() {
         return None;
     }
@@ -52,8 +54,7 @@ pub(super) fn ft8_reported_snr_db(
         .sum::<f32>();
     let bin = ((success.candidate.freq_hz / spec.sync_bin_hz()).round() as isize)
         .clamp(0, context.baseline_db.len().saturating_sub(1) as isize) as usize;
-    let xbase =
-        10.0f32.powf(0.1 * (context.baseline_db[bin] - BASELINE_DB_REFERENCE_LEVEL));
+    let xbase = 10.0f32.powf(0.1 * (context.baseline_db[bin] - BASELINE_DB_REFERENCE_LEVEL));
     if !xbase.is_finite() || xbase <= 0.0 {
         return None;
     }
@@ -160,9 +161,9 @@ fn spectrum_baseline_db(
     let mut baseline = vec![0.0f32; nh1 + 1];
     for (bin, slot) in baseline.iter_mut().enumerate().take(ib + 1).skip(ia) {
         let t = bin as f64 - i0;
-        *slot =
-            (coeffs[0] + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4])))
-                + BASELINE_DB_OFFSET) as f32;
+        *slot = (coeffs[0]
+            + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4])))
+            + BASELINE_DB_OFFSET) as f32;
     }
     Some(baseline)
 }

@@ -303,6 +303,10 @@ impl ModeSpec {
     pub const fn default_amplitude(&self) -> f32 {
         self.waveform.default_amplitude
     }
+
+    pub fn frame_seconds(&self) -> f32 {
+        self.geometry.frame_samples() as f32 / self.geometry.sample_rate_hz as f32
+    }
 }
 
 pub fn all_costas_positions(geometry: &FrameGeometry) -> Vec<(usize, usize)> {

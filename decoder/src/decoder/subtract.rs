@@ -306,6 +306,7 @@ mod tests {
             },
         )
         .expect("audio");
+        let audio = crate::encode::pad_audio_buffer_for_mode(&audio, mode).expect("padded audio");
         let reference = crate::encode::synthesize_channel_reference_for_mode(
             mode,
             &frame.channel_symbols,

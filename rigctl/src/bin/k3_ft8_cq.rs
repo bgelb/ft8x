@@ -81,8 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_meter_mode = rig.get_tx_meter_mode().unwrap_or(TxMeterMode::Rf);
     let tx_wave = synthesize_ft8_cq(&cli.callsign, cli.base_freq_hz, cli.drive_level)?;
     let slot_start = next_ft8_slot(SystemTime::now());
+    let symbol_start =
+        slot_start + Duration::from_secs_f32(Mode::Ft8.spec().nominal_start_seconds());
     let pre_key = Duration::from_millis(150);
-    let key_time = slot_start.checked_sub(pre_key).unwrap_or(slot_start);
+    let key_time = symbol_start.checked_sub(pre_key).unwrap_or(symbol_start);
 
     println!(
         "output_device={} ({})",
@@ -99,19 +101,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.drive_level
     );
     println!(
-        "slot_start_utc={} key_time_utc={}",
+        "slot_start_utc={} symbol_start_utc={} key_time_utc={}",
         format_system_time(slot_start),
+        format_system_time(symbol_start),
         format_system_time(key_time)
     );
 
     sleep_until(key_time);
     rig.set_tx_meter_mode(TxMeterMode::Rf)?;
     let mut tx = TxGuard::enter(&mut rig)?;
-    thread::sleep(
-        slot_start
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO),
-    );
+    sleep_until(symbol_start);
     println!("transmitting at {}", format_system_time(SystemTime::now()));
     let output_device_for_thread = output_device.clone();
     let sample_rate_hz = tx_wave.sample_rate_hz;
@@ -181,9 +180,8 @@ fn synthesize_ft8_cq(
         &WaveformOptions {
             mode: Mode::Ft8,
             base_freq_hz,
-            start_seconds: 0.5,
-            total_seconds: 15.0,
             amplitude,
+            ..WaveformOptions::for_mode(Mode::Ft8)
         },
     )?;
     Ok(waveform)

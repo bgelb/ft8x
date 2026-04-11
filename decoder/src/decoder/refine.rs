@@ -582,8 +582,14 @@ fn sync4d(spec: &ModeSpec, baseband: &[Complex32], start_index: isize, residual_
     };
 
     if let Some(precomputed) = precomputed_waveforms
-        && let Some(sync) =
-            sync4d_fast_precomputed(spec, baseband, valid_samples, start_index, precomputed, sync_scale)
+        && let Some(sync) = sync4d_fast_precomputed(
+            spec,
+            baseband,
+            valid_samples,
+            start_index,
+            precomputed,
+            sync_scale,
+        )
     {
         return sync;
     }
@@ -606,7 +612,14 @@ fn sync4d(spec: &ModeSpec, baseband: &[Complex32], start_index: isize, residual_
                 sync_scale,
             )
         } else {
-            sync4d_block(baseband, valid_samples, sample_index, waveform, tweak_step, sync_scale)
+            sync4d_block(
+                baseband,
+                valid_samples,
+                sample_index,
+                waveform,
+                tweak_step,
+                sync_scale,
+            )
         };
     }
     sync
@@ -636,8 +649,8 @@ fn sync4d_fast_precomputed(
     let start_index = start_index as usize;
     let mut sync = 0.0f32;
     for (block_index, waveform) in waveforms.iter().enumerate() {
-        let block_start =
-            start_index + spec.geometry.sync_block_starts[block_index] * spec.baseband_symbol_samples();
+        let block_start = start_index
+            + spec.geometry.sync_block_starts[block_index] * spec.baseband_symbol_samples();
         sync += sync4d_block_precomputed_full(baseband, block_start, waveform, sync_scale);
     }
     Some(sync)
@@ -741,7 +754,8 @@ fn sync4d_overlap_range(
     } else {
         waveform_len - 1
     };
-    (first_waveform_index <= last_waveform_index).then_some((first_waveform_index, last_waveform_index))
+    (first_waveform_index <= last_waveform_index)
+        .then_some((first_waveform_index, last_waveform_index))
 }
 
 pub(super) fn extract_symbol_tones(
