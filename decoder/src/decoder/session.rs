@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use super::*;
 use crate::message::{Payload, ReplyWord, StructuredMessage};
 
+const DECODE_UTC_PLACEHOLDER: &str = "000000";
+
 pub(super) struct DebugSearchTrace {
     pub(super) search: SearchResult,
     pub(super) passes: Vec<SearchPassTrace>,
@@ -305,6 +307,9 @@ pub(super) fn build_decode_report_with_resolver(
     let resolver = base_state
         .map(|state| state.resolver.clone())
         .unwrap_or_default();
+    let ft8_snr_context = (options.mode == Mode::Ft8)
+        .then(|| build_ft8_reported_snr_context(audio, options))
+        .flatten();
 
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
@@ -316,9 +321,16 @@ pub(super) fn build_decode_report_with_resolver(
         if text.trim().is_empty() {
             continue;
         }
+        let reported_snr_db = match success.mode {
+            Mode::Ft8 => ft8_snr_context
+                .as_ref()
+                .and_then(|context| ft8_reported_snr_db(context, &success))
+                .unwrap_or(success.snr_db),
+            Mode::Ft4 | Mode::Ft2 => success.snr_db,
+        };
         let decode = DecodedMessage {
-            utc: "000000".to_string(),
-            snr_db: success.snr_db,
+            utc: DECODE_UTC_PLACEHOLDER.to_string(),
+            snr_db: reported_snr_db,
             dt_seconds: success.candidate.dt_seconds,
             freq_hz: success.candidate.freq_hz,
             text: text.clone(),
@@ -939,7 +951,10 @@ fn build_successful_decode(
             score: refined.sync_score.max(candidate_score),
         },
         ldpc_iterations: iterations,
-        snr_db: refined.snr_db,
+        snr_db: match mode {
+            Mode::Ft4 => ft4_reported_snr_db(candidate_score),
+            Mode::Ft8 | Mode::Ft2 => refined.snr_db,
+        },
     }
 }
 

@@ -2,6 +2,22 @@ use super::*;
 
 const HANN_WINDOW_WEIGHT: f32 = 0.5;
 const PARABOLIC_PEAK_WEIGHT: f32 = 0.5;
+pub(super) const WSJTX_SIGNAL_SCALE: f32 = 300.0;
+const WSJTX_FREQ_MIN_HZ: f32 = 200.0;
+pub(super) const WSJTX_FREQ_MAX_HZ: f32 = 4910.0;
+pub(super) const BASELINE_WINDOW_MIN_HZ: f32 = 100.0;
+pub(super) const BASELINE_SEGMENTS: usize = 10;
+pub(super) const BASELINE_MAX_POINTS: usize = 1000;
+pub(super) const BASELINE_DB_OFFSET: f64 = 0.65;
+const WSJTX_PERCENTILE_10: f32 = 0.10;
+const FT4_SAVG_SMOOTH_RADIUS_BINS: usize = 7;
+const FT4_SAVG_SMOOTH_WIDTH_BINS: usize = FT4_SAVG_SMOOTH_RADIUS_BINS * 2 + 1;
+const FT4_PROBE_RADIUS_BINS: isize = 3;
+const FT4_TOP_CANDIDATES_FOR_PROBE: usize = 8;
+const NUTTALL_COEFF_A0: f32 = 0.3635819;
+const NUTTALL_COEFF_A1: f32 = -0.4891775;
+const NUTTALL_COEFF_A2: f32 = 0.1365995;
+const NUTTALL_COEFF_A3: f32 = -0.0106411;
 
 pub(super) fn search_grid(audio: &AudioBuffer, options: &DecodeOptions) -> SearchGrid {
     let spec = options.mode.spec();
@@ -241,7 +257,8 @@ pub(super) fn debug_ft4_search_probe_pcm(
         let candidate_bin = (((best.freq_hz - probe.f_offset_hz) / probe.df_hz).round() as isize)
             .clamp(0, probe.raw_savg.len().saturating_sub(1) as isize)
             as usize;
-        let probe_bins = ((target_bin as isize - 3)..=(target_bin as isize + 3))
+        let probe_bins =
+            ((target_bin as isize - FT4_PROBE_RADIUS_BINS)..=(target_bin as isize + FT4_PROBE_RADIUS_BINS))
             .filter_map(|bin| {
                 let index = usize::try_from(bin).ok()?;
                 let savg = *probe.raw_savg.get(index)?;
@@ -300,6 +317,7 @@ fn collect_candidates_ft4_with_probe(
 ) -> (Vec<DecodeCandidate>, Option<Ft4SearchProbeState>) {
     let spec = options.mode.spec();
     debug_assert_eq!(spec.mode, Mode::Ft4);
+    // Stock FT4 coarse search consumes the 21 * 3456 sample `NMAX` window.
     const FT4_STOCK_SEARCH_SAMPLES: usize = 21 * 3456;
 
     let nfft = spec.sync_fft_samples();
@@ -316,7 +334,7 @@ fn collect_candidates_ft4_with_probe(
     let mut spectrum = fft.make_output_vec();
     let window = ft4_nuttall_window(nfft);
     let mut savg = vec![0.0f32; nh1 + 1];
-    let fac = 1.0f32 / 300.0;
+    let fac = 1.0f32 / WSJTX_SIGNAL_SCALE;
     let frame_limit = sample_len.saturating_sub(nfft) / nstep;
     let mut frames = 0usize;
     for frame in 0..frame_limit {
@@ -342,13 +360,19 @@ fn collect_candidates_ft4_with_probe(
     }
 
     let mut savsm = vec![0.0f32; nh1 + 1];
-    for bin in 8..=nh1.saturating_sub(7) {
-        savsm[bin] = savg[bin - 7..=bin + 7].iter().copied().sum::<f32>() / 15.0;
+    for bin in FT4_SAVG_SMOOTH_RADIUS_BINS..=nh1.saturating_sub(FT4_SAVG_SMOOTH_RADIUS_BINS) {
+        savsm[bin] = savg[bin - FT4_SAVG_SMOOTH_RADIUS_BINS..=bin + FT4_SAVG_SMOOTH_RADIUS_BINS]
+            .iter()
+            .copied()
+            .sum::<f32>()
+            / FT4_SAVG_SMOOTH_WIDTH_BINS as f32;
     }
 
     let df = spec.sync_bin_hz();
-    let nfa = ((options.min_freq_hz / df).round() as usize).max((200.0 / df).round() as usize);
-    let nfb = ((options.max_freq_hz / df).round() as usize).min((4910.0 / df).round() as usize);
+    let nfa =
+        ((options.min_freq_hz / df).round() as usize).max((WSJTX_FREQ_MIN_HZ / df).round() as usize);
+    let nfb =
+        ((options.max_freq_hz / df).round() as usize).min((WSJTX_FREQ_MAX_HZ / df).round() as usize);
     if nfa >= nfb || nfb > nh1 {
         return (Vec::new(), None);
     }
@@ -376,7 +400,7 @@ fn collect_candidates_ft4_with_probe(
             0.0
         };
         let freq_hz = (bin as f32 + del) * df + f_offset;
-        if !(200.0..=4910.0).contains(&freq_hz) {
+        if !(WSJTX_FREQ_MIN_HZ..=WSJTX_FREQ_MAX_HZ).contains(&freq_hz) {
             continue;
         }
         let score = savsm[bin] - 0.25 * (savsm[bin - 1] - savsm[bin + 1]) * del;
@@ -405,23 +429,31 @@ fn collect_candidates_ft4_with_probe(
         raw_savg: savg,
         raw_sbase: sbase,
         raw_savsm: savsm,
-        top_candidates: selected.iter().take(8).cloned().collect(),
+        top_candidates: selected
+            .iter()
+            .take(FT4_TOP_CANDIDATES_FOR_PROBE)
+            .cloned()
+            .collect(),
     });
     (selected, probe)
 }
 
+pub(super) fn build_nuttall_window(nfft: usize) -> Vec<f32> {
+    let pi = std::f32::consts::PI;
+    (0..nfft)
+        .map(|index| {
+            let phase = 2.0 * pi * index as f32 / nfft as f32;
+            NUTTALL_COEFF_A0
+                + NUTTALL_COEFF_A1 * phase.cos()
+                + NUTTALL_COEFF_A2 * (2.0 * phase).cos()
+                + NUTTALL_COEFF_A3 * (3.0 * phase).cos()
+        })
+        .collect()
+}
+
 fn ft4_nuttall_window(nfft: usize) -> &'static [f32] {
     static WINDOW: OnceLock<Vec<f32>> = OnceLock::new();
-    WINDOW.get_or_init(|| {
-        let pi = std::f32::consts::PI;
-        (0..nfft)
-            .map(|index| {
-                let phase = 2.0 * pi * index as f32 / nfft as f32;
-                0.3635819 - 0.4891775 * phase.cos() + 0.1365995 * (2.0 * phase).cos()
-                    - 0.0106411 * (3.0 * phase).cos()
-            })
-            .collect()
-    })
+    WINDOW.get_or_init(|| build_nuttall_window(nfft))
 }
 
 fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
@@ -433,15 +465,15 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
         *value = 10.0 * value.max(1e-12).log10();
     }
 
-    let nseg = 10usize;
+    let nseg = BASELINE_SEGMENTS;
     let nlen = (ib - ia + 1) / nseg;
     if nlen == 0 {
         return vec![0.0f32; savg.len()];
     }
     // Match WSJT-X ft4_baseline.f90 exactly: integer midpoint, not half-bin midpoint.
     let i0 = ((ib - ia + 1) / 2) as f64;
-    let mut xs = Vec::<f64>::with_capacity(1000);
-    let mut ys = Vec::<f64>::with_capacity(1000);
+    let mut xs = Vec::<f64>::with_capacity(BASELINE_MAX_POINTS);
+    let mut ys = Vec::<f64>::with_capacity(BASELINE_MAX_POINTS);
 
     for seg in 0..nseg {
         let ja = ia + seg * nlen;
@@ -449,7 +481,7 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
         let base = percentile_10(&spectrum_db[ja..=jb]);
         for (offset, &value) in spectrum_db[ja..=jb].iter().enumerate() {
             if value <= base {
-                if xs.len() >= 1000 {
+                if xs.len() >= BASELINE_MAX_POINTS {
                     continue;
                 }
                 let bin = ja + offset;
@@ -464,21 +496,23 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
     for (bin, slot) in baseline.iter_mut().enumerate().take(ib + 1).skip(ia) {
         let t = bin as f64 - i0;
         let db =
-            coeffs[0] + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4]))) + 0.65;
+            coeffs[0]
+                + t * (coeffs[1] + t * (coeffs[2] + t * (coeffs[3] + t * coeffs[4])))
+                + BASELINE_DB_OFFSET;
         *slot = 10.0f64.powf(db / 10.0) as f32;
     }
     baseline
 }
 
-fn percentile_10(values: &[f32]) -> f32 {
+pub(super) fn percentile_10(values: &[f32]) -> f32 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|left, right| left.total_cmp(right));
-    let rank = ((sorted.len() as f32 * 0.10).round() as usize).clamp(1, sorted.len());
+    let rank = ((sorted.len() as f32 * WSJTX_PERCENTILE_10).round() as usize).clamp(1, sorted.len());
     let index = rank - 1;
     sorted[index]
 }
 
-fn polyfit_degree4(xs: &[f64], ys: &[f64]) -> Option<[f64; 5]> {
+pub(super) fn polyfit_degree4(xs: &[f64], ys: &[f64]) -> Option<[f64; 5]> {
     if xs.len() != ys.len() || xs.len() < 5 {
         return None;
     }
