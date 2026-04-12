@@ -705,12 +705,14 @@ impl QsoController {
                             message_text,
                             ..
                         } => {
-                            let completed_compound =
-                                matches!(*state, QsoState::SendRR73 | QsoState::Send73Once)
-                                    && session
-                                        .pending_compound_handoff
-                                        .as_ref()
-                                        .is_some_and(|handoff| handoff.tx_text == *message_text);
+                            let completed_compound_handoff = session
+                                .in_flight_tx
+                                .as_ref()
+                                .and_then(|tx| tx.compound_handoff.clone())
+                                .filter(|handoff| {
+                                    matches!(*state, QsoState::SendRR73 | QsoState::Send73Once)
+                                        && handoff.tx_text == *message_text
+                                });
                             session.in_flight_tx = None;
                             Self::push_transcript(
                                 session,
@@ -719,8 +721,8 @@ impl QsoController {
                                 *state,
                                 "tx complete".to_string(),
                             );
-                            if completed_compound {
-                                compound_handoff_after = session.pending_compound_handoff.clone();
+                            if let Some(handoff) = completed_compound_handoff {
+                                compound_handoff_after = Some(handoff);
                                 exit_after = Some("compound_handoff_sent".to_string());
                             } else if *state == QsoState::Send73Once {
                                 exit_after = Some("send_73_once_complete".to_string());
@@ -868,6 +870,9 @@ impl QsoController {
                     target_slot,
                     state: session.state,
                     message_text: message_text.clone(),
+                    compound_handoff: session.pending_compound_handoff.clone().filter(|_| {
+                        matches!(session.state, QsoState::SendRR73 | QsoState::Send73Once)
+                    }),
                 });
                 session.next_tx_slot = None;
                 Self::log_fsm(
@@ -1583,6 +1588,7 @@ struct InFlightTx {
     target_slot: SystemTime,
     state: QsoState,
     message_text: String,
+    compound_handoff: Option<PendingCompoundHandoff>,
 }
 
 #[derive(Debug, Clone)]
@@ -2638,6 +2644,53 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ManualTxState {
+        active: bool,
+        events: VecDeque<TxEvent>,
+        launches: Vec<String>,
+    }
+
+    struct ManualTxBackend {
+        state: Arc<Mutex<ManualTxState>>,
+    }
+
+    impl ManualTxBackend {
+        fn new(state: Arc<Mutex<ManualTxState>>) -> Self {
+            Self { state }
+        }
+    }
+
+    impl TxBackend for ManualTxBackend {
+        fn start(&mut self, request: TxRequest) -> Result<(), String> {
+            let mut state = self.state.lock().expect("manual tx state");
+            state.active = true;
+            state.launches.push(request.message_text);
+            Ok(())
+        }
+
+        fn abort(&mut self) {
+            let mut state = self.state.lock().expect("manual tx state");
+            state.active = false;
+        }
+
+        fn poll_event(&mut self) -> Option<TxEvent> {
+            let mut state = self.state.lock().expect("manual tx state");
+            let event = state.events.pop_front();
+            if matches!(
+                event,
+                Some(TxEvent::Completed { .. } | TxEvent::Aborted { .. } | TxEvent::Error { .. })
+            ) {
+                state.active = false;
+            }
+            event
+        }
+
+        fn is_active(&self) -> bool {
+            self.state.lock().expect("manual tx state").active
+        }
+    }
+
     fn sample_config() -> AppConfig {
         AppConfig {
             station: StationConfig {
@@ -3341,6 +3394,94 @@ mod tests {
                 assert_eq!(tx.message_text, "K1ABC RR73; K2ABC <N1VF> -03");
             }
         }
+    }
+
+    #[test]
+    fn launched_compound_handoff_still_completes_after_reserved_text_refresh() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            start_command("K1ABC", 1225.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        controller.session.as_mut().expect("session").state = QsoState::SendSig;
+        controller.on_full_decode(
+            rx_slot_start,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::Ack)],
+            rx_slot_start + Duration::from_secs(15),
+        );
+        assert!(controller.maybe_arm_compound_handoff(
+            rx_slot_start,
+            CompoundHandoffPlan {
+                next_station: StationStartInfo {
+                    callsign: "K2ABC".to_string(),
+                    last_heard_at: rx_slot_start,
+                    last_heard_slot_family: SlotFamily::Odd,
+                    last_snr_db: -11,
+                    last_text: Some("N1VF K2ABC FN20".to_string()),
+                    last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                },
+            },
+            true,
+            rx_slot_start + Duration::from_secs(15),
+        ));
+
+        let launch_time = tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        );
+        controller.tick(launch_time);
+        let launched_text = controller
+            .session
+            .as_ref()
+            .and_then(|session| session.in_flight_tx.as_ref())
+            .map(|tx| tx.message_text.clone())
+            .expect("launched text");
+        assert_eq!(launched_text, "K1ABC RR73; K2ABC <N1VF> -11");
+
+        assert!(controller.refresh_reserved_compound_next_station(
+            StationStartInfo {
+                callsign: "K2ABC".to_string(),
+                last_heard_at: rx_slot_start,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -3,
+                last_text: Some("N1VF K2ABC FN20".to_string()),
+                last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+            },
+            launch_time + Duration::from_secs(1),
+        ));
+        let refreshed_text = controller
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_compound_handoff.as_ref())
+            .map(|handoff| handoff.tx_text.clone())
+            .expect("pending handoff text");
+        assert_eq!(refreshed_text, "K1ABC RR73; K2ABC <N1VF> -03");
+
+        backend_state
+            .lock()
+            .expect("manual tx state")
+            .events
+            .push_back(TxEvent::Completed {
+                session_id: 1,
+                state: QsoState::SendRR73,
+                message_text: launched_text,
+            });
+        controller.tick(launch_time + Duration::from_secs(2));
+
+        let snapshot = controller.snapshot(launch_time + Duration::from_secs(2));
+        assert!(snapshot.active);
+        assert_eq!(snapshot.partner_call.as_deref(), Some("K2ABC"));
+        assert_eq!(snapshot.state, "send_sig");
+        let outcomes = controller.drain_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].exit_reason, "compound_handoff_sent");
     }
 
     #[test]
