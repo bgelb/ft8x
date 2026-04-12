@@ -1540,6 +1540,9 @@ impl QsoController {
         if event.has_partner_message() {
             return true;
         }
+        if matches!(session.state, QsoState::SendRR73) && matches!(stage, DecodeStage::Early47) {
+            return true;
+        }
         matches!(stage, DecodeStage::Full)
     }
 }
@@ -3496,6 +3499,66 @@ mod tests {
             now + Duration::from_secs(15),
         );
         assert!(!controller.snapshot(now).active);
+    }
+
+    #[test]
+    fn send_rr73_exits_on_early47_when_partner_is_silent() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
+            }),
+            now,
+        );
+        if let Some(session) = controller.session.as_mut() {
+            session.state = QsoState::SendRR73;
+        }
+        controller.on_decode_stage(
+            now + Duration::from_secs(15),
+            DecodeStage::Early47,
+            &[],
+            now + Duration::from_secs(15),
+        );
+        assert!(!controller.snapshot(now).active);
+    }
+
+    #[test]
+    fn send_rr73_does_not_exit_on_early41_when_partner_is_silent() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -9,
+                last_text: None,
+                last_structured_json: None,
+            }),
+            now,
+        );
+        if let Some(session) = controller.session.as_mut() {
+            session.state = QsoState::SendRR73;
+        }
+        controller.on_decode_stage(
+            now + Duration::from_secs(15),
+            DecodeStage::Early41,
+            &[],
+            now + Duration::from_secs(15),
+        );
+        let snapshot = controller.snapshot(now);
+        assert!(snapshot.active);
+        assert_eq!(snapshot.state, "send_rr73");
     }
 
     #[test]
