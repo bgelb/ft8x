@@ -39,10 +39,14 @@ pub struct AudioDevice {
 }
 
 pub struct PreparedMonoPlayback {
+    writer: PreparedMonoPlaybackWriter,
+    interleaved: Vec<i16>,
+}
+
+pub struct PreparedMonoPlaybackWriter {
     #[cfg(target_os = "linux")]
     pcm: alsa::pcm::PCM,
     channels: usize,
-    interleaved: Vec<i16>,
 }
 
 #[derive(Debug, Clone)]
@@ -427,7 +431,8 @@ pub fn play_interleaved_samples_i16_until(
     }
 
     let pcm = prepare_playback_pcm(device, sample_rate_hz, channels.max(1))?;
-    write_interleaved_samples_i16_until(&pcm, channels.max(1), samples, cancel)
+    write_interleaved_samples_i16_until(&pcm, channels.max(1), samples, cancel)?;
+    finalize_interleaved_playback(&pcm, cancel)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -450,8 +455,7 @@ pub fn prepare_mono_playback(
 ) -> Result<PreparedMonoPlayback> {
     let channel_count = channels.max(1);
     Ok(PreparedMonoPlayback {
-        pcm: prepare_playback_pcm(device, sample_rate_hz, channel_count)?,
-        channels: channel_count,
+        writer: prepare_mono_playback_writer(device, sample_rate_hz, channel_count)?,
         interleaved: interleave_mono_samples_i16(samples, channel_count),
     })
 }
@@ -466,14 +470,87 @@ pub fn prepare_mono_playback(
     Err(Error::UnsupportedPlatform)
 }
 
+#[cfg(target_os = "linux")]
+pub fn prepare_mono_playback_writer(
+    device: &AudioDevice,
+    sample_rate_hz: u32,
+    channels: usize,
+) -> Result<PreparedMonoPlaybackWriter> {
+    let channel_count = channels.max(1);
+    Ok(PreparedMonoPlaybackWriter {
+        pcm: prepare_playback_pcm(device, sample_rate_hz, channel_count)?,
+        channels: channel_count,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn prepare_mono_playback_writer(
+    _device: &AudioDevice,
+    _sample_rate_hz: u32,
+    _channels: usize,
+) -> Result<PreparedMonoPlaybackWriter> {
+    Err(Error::UnsupportedPlatform)
+}
+
 impl PreparedMonoPlayback {
     #[cfg(target_os = "linux")]
     pub fn play_until(self, cancel: Option<&AtomicBool>) -> Result<()> {
-        write_interleaved_samples_i16_until(&self.pcm, self.channels, &self.interleaved, cancel)
+        self.writer
+            .write_interleaved_until(&self.interleaved, cancel)?;
+        self.writer.finish(cancel)
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn play_until(self, _cancel: Option<&AtomicBool>) -> Result<()> {
+        Err(Error::UnsupportedPlatform)
+    }
+}
+
+impl PreparedMonoPlaybackWriter {
+    #[cfg(target_os = "linux")]
+    pub fn write_mono_samples_until(
+        &self,
+        samples: &[f32],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        let interleaved = interleave_mono_samples_i16(samples, self.channels);
+        self.write_interleaved_until(&interleaved, cancel)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn write_interleaved_until(
+        &self,
+        samples: &[i16],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        write_interleaved_samples_i16_until(&self.pcm, self.channels, samples, cancel)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn finish(self, cancel: Option<&AtomicBool>) -> Result<()> {
+        finalize_interleaved_playback(&self.pcm, cancel)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn write_mono_samples_until(
+        &self,
+        _samples: &[f32],
+        _cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        Err(Error::UnsupportedPlatform)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn write_interleaved_until(
+        &self,
+        _samples: &[i16],
+        _cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        Err(Error::UnsupportedPlatform)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn finish(self, _cancel: Option<&AtomicBool>) -> Result<()> {
         Err(Error::UnsupportedPlatform)
     }
 }
@@ -561,6 +638,13 @@ fn write_interleaved_samples_i16_until(
             }
         }
     }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn finalize_interleaved_playback(pcm: &alsa::pcm::PCM, cancel: Option<&AtomicBool>) -> Result<()> {
+    use alsa::pcm::State;
 
     if cancel
         .map(|flag| flag.load(Ordering::Relaxed))

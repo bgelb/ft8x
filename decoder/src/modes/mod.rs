@@ -160,6 +160,13 @@ impl ModeSpec {
         self.refine.nominal_start_seconds
     }
 
+    pub const fn late_bind_safe_prefix_samples(&self) -> Option<usize> {
+        match self.mode {
+            Mode::Ft8 => Some(crate::modes::ft8::FT8_LATE_BIND_SAFE_PREFIX_SAMPLES),
+            Mode::Ft4 | Mode::Ft2 => None,
+        }
+    }
+
     pub fn sync_fft_samples(&self) -> usize {
         self.geometry.symbol_samples * self.search.sync_fft_symbol_window
     }
