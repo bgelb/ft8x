@@ -1305,10 +1305,6 @@ impl WorkQueueState {
             self.scheduler_status = "auto disabled".to_string();
             return None;
         }
-        if self.current_mode == DecoderMode::Ft2 {
-            self.scheduler_status = "ft2 rx-only".to_string();
-            return None;
-        }
         if qso_busy {
             self.scheduler_status = "waiting: qso active".to_string();
             return None;
@@ -1449,11 +1445,7 @@ impl WorkQueueState {
             odd_tx_freq_hz: self.odd_tx_freq_hz,
             no_message_retry_delay_seconds: self.no_message_retry_delay.as_secs(),
             no_forward_retry_delay_seconds: self.no_forward_retry_delay.as_secs(),
-            scheduler_status: if self.current_mode == DecoderMode::Ft2 {
-                "ft2 rx-only".to_string()
-            } else {
-                self.scheduler_status.clone()
-            },
+            scheduler_status: self.scheduler_status.clone(),
             entries,
         }
     }
@@ -2791,7 +2783,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     const canvas = document.getElementById('waterfall');
     const ctx = canvas.getContext('2d');
     const BAND_OPTIONS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m', '6m'];
-    const APP_MODE_OPTIONS = ['FT8', 'FT4', 'FT2'];
+    const APP_MODE_OPTIONS = ['FT8', 'FT4'];
     const POWER_OPTIONS = ['5', '10', '20', '50', '100'];
     let selectedCall = null;
     let lastSnapshot = null;
@@ -3329,7 +3321,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const queue = data.queue || {};
       const station = selectedStation(data);
       const qso = data.qso || {};
-      const rxOnly = data.app_mode === 'FT2';
       const readyQueueEntry = (queue.entries || []).find((entry) => entry.ready);
       const candidateStation = station || (readyQueueEntry ? stationMap(data).get(readyQueueEntry.callsign) : null);
       const txParity = qso.active ? qso.tx_slot_family : inferredTxParity(candidateStation);
@@ -3357,8 +3348,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
       snr.textContent = qso.latest_partner_snr_db == null ? '-' : `${qso.latest_partner_snr_db} dB`;
       if (qso.active) {
         hint.textContent = `TX ${qso.selected_tx_freq_hz?.toFixed(0) ?? '-'} Hz, ${qso.tx_slot_family ?? '?'} slots. Escape stops immediately.`;
-      } else if (rxOnly) {
-        hint.textContent = 'FT2 is RX-only in ft8rx. Queueing and decode display remain active, but CQ and QSO TX are disabled.';
       } else if (data.rig_tune_active) {
         hint.textContent = 'Tune tone active. Queue dispatch is paused until TX returns to RX.';
       } else if (candidateStation) {
@@ -3387,11 +3376,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
         transcript.scrollTop = transcript.scrollHeight;
       }
       stop.disabled = !qso.active && !qso.tx_active;
-      autoToggle.disabled = !!data.rig_tune_active || rxOnly;
-      evenFreqInput.disabled = !!qso.tx_active || !!data.rig_tune_active || rxOnly;
-      oddFreqInput.disabled = !!qso.tx_active || !!data.rig_tune_active || rxOnly;
-      evenAutoPick.disabled = rxOnly || !autoPickAllowed(data, 'even');
-      oddAutoPick.disabled = rxOnly || !autoPickAllowed(data, 'odd');
+      autoToggle.disabled = !!data.rig_tune_active;
+      evenFreqInput.disabled = !!qso.tx_active || !!data.rig_tune_active;
+      oddFreqInput.disabled = !!qso.tx_active || !!data.rig_tune_active;
+      evenAutoPick.disabled = !autoPickAllowed(data, 'even');
+      oddAutoPick.disabled = !autoPickAllowed(data, 'odd');
       evenAutoPick.textContent = autoPickAllowed(data, 'even') ? 'Auto-Pick Even' : 'Auto-Pick Even';
       oddAutoPick.textContent = autoPickAllowed(data, 'odd') ? 'Auto-Pick Odd' : 'Auto-Pick Odd';
     }
@@ -4355,7 +4344,7 @@ async fn api_rig_config_handler(
             );
         }
     };
-    let app_mode = match request.app_mode.parse::<DecoderMode>() {
+    let app_mode = match parse_supported_app_mode(&request.app_mode) {
         Ok(mode) => mode,
         Err(error) => {
             return (
@@ -4406,6 +4395,14 @@ async fn api_rig_config_handler(
             message: "rig config queued".to_string(),
         }),
     )
+}
+
+fn parse_supported_app_mode(value: &str) -> Result<DecoderMode, String> {
+    let mode = value.parse::<DecoderMode>()?;
+    match mode {
+        DecoderMode::Ft8 | DecoderMode::Ft4 => Ok(mode),
+        DecoderMode::Ft2 => Err("FT2 is not supported in ft8rx; use FT8 or FT4".to_string()),
+    }
 }
 
 async fn api_rig_tune_handler(State(state): State<WebAppState>) -> (StatusCode, Json<ApiStatus>) {
@@ -5734,19 +5731,10 @@ fn calling_frequency_hz(band: Band, app_mode: DecoderMode) -> u64 {
         (DecoderMode::Ft4, Band::M12) => 24_919_000,
         (DecoderMode::Ft4, Band::M10) => 28_180_000,
         (DecoderMode::Ft4, Band::M6) => 50_318_000,
-        (DecoderMode::Ft2, Band::M160) => 1_843_000,
-        (DecoderMode::Ft2, Band::M80) => 3_578_000,
-        (DecoderMode::Ft2, Band::M40) => 7_052_000,
-        (DecoderMode::Ft2, Band::M30) => 10_144_000,
-        (DecoderMode::Ft2, Band::M20) => 14_084_000,
-        (DecoderMode::Ft2, Band::M17) => 18_108_000,
-        (DecoderMode::Ft2, Band::M15) => 21_144_000,
-        (DecoderMode::Ft2, Band::M12) => 24_923_000,
-        (DecoderMode::Ft2, Band::M10) => 28_184_000,
-        (DecoderMode::Ft4, Band::M160)
-        | (DecoderMode::Ft4, Band::M60)
-        | (DecoderMode::Ft2, Band::M60)
-        | (DecoderMode::Ft2, Band::M6) => calling_frequency_hz(band, DecoderMode::Ft8),
+        (DecoderMode::Ft4, Band::M160) | (DecoderMode::Ft4, Band::M60) => {
+            calling_frequency_hz(band, DecoderMode::Ft8)
+        }
+        (DecoderMode::Ft2, _) => unreachable!("FT2 is not supported in ft8rx"),
         (_, Band::Xvtr(_)) => 0,
     }
 }
@@ -6265,17 +6253,11 @@ fn ms_to_signed_seconds(ms: i128) -> f32 {
     ms as f32 / 1000.0
 }
 
-fn stage_display_label(mode: DecoderMode, stage: DecodeStage) -> &'static str {
+fn stage_display_label(_mode: DecoderMode, stage: DecodeStage) -> &'static str {
     match stage {
         DecodeStage::Early41 => "early",
         DecodeStage::Early47 => "mid",
-        DecodeStage::Full => {
-            if mode == DecoderMode::Ft8 {
-                "full"
-            } else {
-                "full"
-            }
-        }
+        DecodeStage::Full => "full",
     }
 }
 
@@ -6283,7 +6265,7 @@ fn slot_millis_for_mode(mode: DecoderMode) -> u64 {
     match mode {
         DecoderMode::Ft8 => 15_000,
         DecoderMode::Ft4 => 7_500,
-        DecoderMode::Ft2 => 2_500,
+        DecoderMode::Ft2 => unreachable!("FT2 is not supported in ft8rx"),
     }
 }
 
@@ -8308,16 +8290,8 @@ mod tests {
             14_080_000
         );
         assert_eq!(
-            calling_frequency_hz(Band::M20, DecoderMode::Ft2),
-            14_084_000
-        );
-        assert_eq!(
-            calling_frequency_hz(Band::M60, DecoderMode::Ft2),
+            calling_frequency_hz(Band::M60, DecoderMode::Ft4),
             calling_frequency_hz(Band::M60, DecoderMode::Ft8)
-        );
-        assert_eq!(
-            calling_frequency_hz(Band::M6, DecoderMode::Ft2),
-            calling_frequency_hz(Band::M6, DecoderMode::Ft8)
         );
     }
 
@@ -8332,19 +8306,16 @@ mod tests {
             72_576
         );
         assert_eq!(
-            full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft2),
-            30_000
-        );
-        assert_eq!(
             capture_window_duration(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4),
             Duration::from_secs_f64(72_576.0 / 12_000.0)
         );
     }
 
     #[test]
-    fn ft2_full_stage_decode_silence_does_not_panic() {
+    fn ft4_full_stage_decode_silence_does_not_panic() {
         let slot_start = UNIX_EPOCH + Duration::from_secs(30);
-        let samples = vec![0i16; full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft2)];
+        let samples =
+            vec![0i16; full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4)];
         let result = std::panic::catch_unwind(|| {
             let mut session = DecoderSession::new();
             let mut state = DecoderState::new();
@@ -8353,7 +8324,7 @@ mod tests {
                 &mut state,
                 &samples,
                 DECODER_SAMPLE_RATE_HZ,
-                DecoderMode::Ft2,
+                DecoderMode::Ft4,
                 DecodeStage::Full,
                 slot_start,
                 None,
@@ -8361,18 +8332,20 @@ mod tests {
         });
         assert!(
             result.is_ok(),
-            "ft2 full-stage decode panicked inside decode worker path"
+            "ft4 full-stage decode panicked inside decode worker path"
         );
-        let report = result.expect("panic-free decode").expect("decode stage result");
+        let report = result
+            .expect("panic-free decode")
+            .expect("decode stage result");
         assert_eq!(report.stage, DecodeStage::Full);
         assert!(report.report.decodes.is_empty());
     }
 
     #[test]
-    fn ft2_full_stage_decode_resampled_silence_does_not_panic() {
+    fn ft4_full_stage_decode_resampled_silence_does_not_panic() {
         let slot_start = UNIX_EPOCH + Duration::from_secs(30);
         let source_rate = 48_000;
-        let samples = vec![0i16; full_decode_sample_count(source_rate, DecoderMode::Ft2)];
+        let samples = vec![0i16; full_decode_sample_count(source_rate, DecoderMode::Ft4)];
         let result = std::panic::catch_unwind(|| {
             let mut session = DecoderSession::new();
             let mut state = DecoderState::new();
@@ -8381,7 +8354,7 @@ mod tests {
                 &mut state,
                 &samples,
                 source_rate,
-                DecoderMode::Ft2,
+                DecoderMode::Ft4,
                 DecodeStage::Full,
                 slot_start,
                 None,
@@ -8389,21 +8362,21 @@ mod tests {
         });
         assert!(
             result.is_ok(),
-            "ft2 full-stage resampled decode panicked inside decode worker path"
+            "ft4 full-stage resampled decode panicked inside decode worker path"
         );
-        let report = result.expect("panic-free decode").expect("decode stage result");
+        let report = result
+            .expect("panic-free decode")
+            .expect("decode stage result");
         assert_eq!(report.stage, DecodeStage::Full);
         assert!(report.report.decodes.is_empty());
     }
 
     #[test]
-    fn non_ft8_modes_only_schedule_full_decode_stage() {
+    fn ft4_only_schedules_full_decode_stage() {
         let slot_start = UNIX_EPOCH + Duration::from_secs(30);
         let before_full_ready = slot_start + Duration::from_secs(1);
         let ft4_full_ready = stage_capture_end(DecoderMode::Ft4, slot_start, DecodeStage::Full)
             .expect("ft4 full ready");
-        let ft2_full_ready = stage_capture_end(DecoderMode::Ft2, slot_start, DecodeStage::Full)
-            .expect("ft2 full ready");
 
         assert_eq!(
             SlotStageState::default().next_due_stage(
@@ -8418,22 +8391,6 @@ mod tests {
                 DecoderMode::Ft4,
                 slot_start,
                 Some(ft4_full_ready)
-            ),
-            Some(DecodeStage::Full)
-        );
-        assert_eq!(
-            SlotStageState::default().next_due_stage(
-                DecoderMode::Ft2,
-                slot_start,
-                Some(before_full_ready)
-            ),
-            None
-        );
-        assert_eq!(
-            SlotStageState::default().next_due_stage(
-                DecoderMode::Ft2,
-                slot_start,
-                Some(ft2_full_ready)
             ),
             Some(DecodeStage::Full)
         );
@@ -8454,7 +8411,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_scheduler_blocks_dispatch_in_ft2_rx_only_mode() {
+    fn queue_scheduler_can_dispatch_in_ft4_mode() {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let config = sample_app_config();
         let mut tracker = StationTracker::default();
@@ -8462,15 +8419,14 @@ mod tests {
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         queue.auto_enabled = true;
         queue.set_current_band(Some("20m".to_string()));
-        queue.set_current_mode(DecoderMode::Ft2);
+        queue.set_current_mode(DecoderMode::Ft4);
         queue.add_station("K1ABC", now, now).expect("queued");
 
-        assert!(
-            queue
-                .scheduler_pick(now + Duration::from_secs(1), &tracker, false, false)
-                .is_none()
-        );
-        assert_eq!(queue.scheduler_status, "ft2 rx-only");
+        let dispatch = queue
+            .scheduler_pick(now + Duration::from_secs(8), &tracker, false, false)
+            .expect("dispatch");
+        assert_eq!(dispatch.callsign, "K1ABC");
+        assert_eq!(queue.scheduler_status, "dispatching K1ABC");
     }
 
     #[test]
@@ -8527,9 +8483,15 @@ mod tests {
             stage_display_label(DecoderMode::Ft4, DecodeStage::Full),
             "full"
         );
+    }
+
+    #[test]
+    fn parse_supported_app_mode_rejects_ft2() {
+        assert_eq!(parse_supported_app_mode("ft8"), Ok(DecoderMode::Ft8));
+        assert_eq!(parse_supported_app_mode("ft4"), Ok(DecoderMode::Ft4));
         assert_eq!(
-            stage_display_label(DecoderMode::Ft2, DecodeStage::Full),
-            "full"
+            parse_supported_app_mode("ft2"),
+            Err("FT2 is not supported in ft8rx; use FT8 or FT4".to_string())
         );
     }
 
