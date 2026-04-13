@@ -2,7 +2,7 @@
 
 `ft8rx` is the receive, control, and web UI application for this repo. It combines:
 
-- FT8 audio capture and decode
+- FT8 and FT4 audio capture and decode
 - rig control
 - a queue-based QSO scheduler
 - an automated QSO FSM

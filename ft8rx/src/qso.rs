@@ -3432,10 +3432,8 @@ mod tests {
             rx_slot_start + Duration::from_secs(15),
         ));
 
-        let launch_time = tx_key_time_for_slot(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
-            Mode::Ft8,
-        );
+        let launch_time =
+            tx_key_time_for_slot(SystemTime::UNIX_EPOCH + Duration::from_secs(60), Mode::Ft8);
         controller.tick(launch_time);
         let launched_text = controller
             .session
