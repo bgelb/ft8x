@@ -735,21 +735,34 @@ impl QsoController {
                             message_text,
                             ..
                         } => {
+                            let changed = session
+                                .in_flight_tx
+                                .as_ref()
+                                .map(|tx| tx.state != *state || tx.message_text != *message_text)
+                                .unwrap_or(true);
                             if let Some(in_flight) = session.in_flight_tx.as_mut() {
                                 in_flight.state = *state;
                                 in_flight.message_text = message_text.clone();
-                                in_flight.compound_handoff =
-                                    session.pending_compound_handoff.clone().filter(|_| {
+                                in_flight.compound_handoff = session
+                                    .pending_compound_handoff
+                                    .clone()
+                                    .filter(|_| {
                                         matches!(*state, QsoState::SendRR73 | QsoState::Send73Once)
+                                    })
+                                    .map(|mut handoff| {
+                                        handoff.tx_text = message_text.clone();
+                                        handoff
                                     });
                             }
-                            Self::push_transcript(
-                                session,
-                                now,
-                                "SYS:",
-                                *state,
-                                format!("tx late-bind committed: {message_text}"),
-                            );
+                            if changed {
+                                Self::push_transcript(
+                                    session,
+                                    now,
+                                    "SYS:",
+                                    *state,
+                                    format!("tx late-bind committed: {message_text}"),
+                                );
+                            }
                         }
                         TxEvent::Completed {
                             state,
@@ -3957,6 +3970,90 @@ mod tests {
     }
 
     #[test]
+    fn committed_compound_handoff_still_completes_after_post_commit_refresh() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            start_command("K1ABC", 1225.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        controller.session.as_mut().expect("session").state = QsoState::SendSig;
+        controller.on_full_decode(
+            rx_slot_start,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::Ack)],
+            rx_slot_start + Duration::from_secs(15),
+        );
+        assert!(controller.maybe_arm_compound_handoff(
+            rx_slot_start,
+            CompoundHandoffPlan {
+                next_station: StationStartInfo {
+                    callsign: "K2ABC".to_string(),
+                    last_heard_at: rx_slot_start,
+                    last_heard_slot_family: SlotFamily::Odd,
+                    last_snr_db: -11,
+                    last_text: Some("N1VF K2ABC FN20".to_string()),
+                    last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                },
+            },
+            true,
+            rx_slot_start + Duration::from_secs(15),
+        ));
+
+        let launch_time = tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        );
+        controller.tick(launch_time);
+        backend_state
+            .lock()
+            .expect("manual tx state")
+            .events
+            .push_back(TxEvent::Committed {
+                session_id: 1,
+                state: QsoState::SendRR73,
+                message_text: "K1ABC RR73; K2ABC <N1VF> -11".to_string(),
+            });
+        controller.tick(launch_time + Duration::from_millis(100));
+
+        assert!(controller.refresh_reserved_compound_next_station(
+            StationStartInfo {
+                callsign: "K2ABC".to_string(),
+                last_heard_at: rx_slot_start,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -3,
+                last_text: Some("N1VF K2ABC FN20".to_string()),
+                last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+            },
+            launch_time + Duration::from_secs(1),
+        ));
+
+        backend_state
+            .lock()
+            .expect("manual tx state")
+            .events
+            .push_back(TxEvent::Completed {
+                session_id: 1,
+                state: QsoState::SendRR73,
+                message_text: "K1ABC RR73; K2ABC <N1VF> -11".to_string(),
+            });
+        controller.tick(launch_time + Duration::from_secs(2));
+
+        let snapshot = controller.snapshot(launch_time + Duration::from_secs(2));
+        assert!(snapshot.active);
+        assert_eq!(snapshot.partner_call.as_deref(), Some("K2ABC"));
+        assert_eq!(snapshot.state, "send_sig");
+        let outcomes = controller.drain_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].exit_reason, "compound_handoff_sent");
+    }
+
+    #[test]
     fn committed_ft8_send_sig_can_late_bind_to_rr73() {
         let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
         let mut controller = QsoController::new(
@@ -3997,6 +4094,53 @@ mod tests {
         );
         let backend = backend_state.lock().expect("manual tx state");
         assert_eq!(backend.updates, vec!["K1ABC N1VF RR73".to_string()]);
+    }
+
+    #[test]
+    fn committed_ft8_without_message_change_does_not_log_late_bind_commit() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("K1ABC", 1225.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        let target_slot = controller
+            .session
+            .as_ref()
+            .and_then(|session| session.next_tx_slot)
+            .expect("next tx slot");
+        controller.tick(tx_key_time_for_slot(target_slot, Mode::Ft8));
+
+        backend_state
+            .lock()
+            .expect("manual tx state")
+            .events
+            .push_back(TxEvent::Committed {
+                session_id: 1,
+                state: QsoState::SendGrid,
+                message_text: "K1ABC N1VF CM97".to_string(),
+            });
+        controller.tick(tx_key_time_for_slot(target_slot, Mode::Ft8) + Duration::from_millis(10));
+
+        let transcript = controller
+            .session
+            .as_ref()
+            .expect("session")
+            .transcript
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !transcript
+                .iter()
+                .any(|line| line.contains("tx late-bind committed:")),
+            "unexpected transcript lines: {transcript:?}"
+        );
     }
 
     #[test]
