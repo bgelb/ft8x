@@ -5,7 +5,7 @@ use ft8_decoder::{
     TxMessage, WaveformOptions, synthesize_tx_message,
 };
 use rigctl::K3s;
-use rigctl::audio::{AudioDevice, prepare_mono_playback};
+use rigctl::audio::{AudioDevice, prepare_mono_playback, prepare_mono_playback_writer};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -582,6 +582,25 @@ impl QsoController {
                     session.compound_rr73_ready_slot = Some(slot_start);
                 }
                 if committed_next_tx {
+                    let mut proposed = session.clone();
+                    proposed.state = next_state;
+                    proposed.no_fwd_count = 0;
+                    proposed.no_msg_count = 0;
+                    proposed.pending_action = None;
+                    if try_late_bind_session_update(
+                        self.backend.as_mut(),
+                        &self.config,
+                        session,
+                        proposed,
+                        now,
+                        format!(
+                            "late-bound current tx: state {} -> {}",
+                            previous_state.as_str(),
+                            next_state.as_str()
+                        ),
+                    ) {
+                        return;
+                    }
                     session.pending_action = Some(PendingAction::Transition(next_state));
                     Self::log_late_tx_switch_wanted(
                         session,
@@ -652,6 +671,17 @@ impl QsoController {
                         .as_ref()
                         .map(|tx| tx.message_text.as_str());
                     if current_tx != Some(desired_tx.as_str()) {
+                        let proposed = session.clone();
+                        if try_late_bind_session_update(
+                            self.backend.as_mut(),
+                            &self.config,
+                            session,
+                            proposed,
+                            now,
+                            format!("late-bound current tx: {desired_tx}"),
+                        ) {
+                            return;
+                        }
                         Self::log_late_tx_switch_wanted(
                             session,
                             now,
@@ -699,6 +729,40 @@ impl QsoController {
                                 *state,
                                 message_text.clone(),
                             );
+                        }
+                        TxEvent::Committed {
+                            state,
+                            message_text,
+                            ..
+                        } => {
+                            let changed = session
+                                .in_flight_tx
+                                .as_ref()
+                                .map(|tx| tx.state != *state || tx.message_text != *message_text)
+                                .unwrap_or(true);
+                            if let Some(in_flight) = session.in_flight_tx.as_mut() {
+                                in_flight.state = *state;
+                                in_flight.message_text = message_text.clone();
+                                in_flight.compound_handoff = session
+                                    .pending_compound_handoff
+                                    .clone()
+                                    .filter(|_| {
+                                        matches!(*state, QsoState::SendRR73 | QsoState::Send73Once)
+                                    })
+                                    .map(|mut handoff| {
+                                        handoff.tx_text = message_text.clone();
+                                        handoff
+                                    });
+                            }
+                            if changed {
+                                Self::push_transcript(
+                                    session,
+                                    now,
+                                    "SYS:",
+                                    *state,
+                                    format!("tx late-bind committed: {message_text}"),
+                                );
+                            }
                         }
                         TxEvent::Completed {
                             state,
@@ -856,6 +920,7 @@ impl QsoController {
         }
 
         let request = build_tx_request(&self.config, session, target_slot);
+        let launched_request = request.clone();
         let message_text = request.message_text.clone();
         match self.backend.start(request) {
             Ok(()) => {
@@ -866,14 +931,8 @@ impl QsoController {
                 ) {
                     session.sent_terminal_73 = true;
                 }
-                session.in_flight_tx = Some(InFlightTx {
-                    target_slot,
-                    state: session.state,
-                    message_text: message_text.clone(),
-                    compound_handoff: session.pending_compound_handoff.clone().filter(|_| {
-                        matches!(session.state, QsoState::SendRR73 | QsoState::Send73Once)
-                    }),
-                });
+                session.in_flight_tx =
+                    Some(update_in_flight_from_request(session, &launched_request));
                 session.next_tx_slot = None;
                 Self::log_fsm(
                     session,
@@ -961,37 +1020,46 @@ impl QsoController {
         station_info: StationStartInfo,
         now: SystemTime,
     ) -> bool {
+        let backend = &mut self.backend;
+        let config = &self.config;
         let Some(session) = &mut self.session else {
             return false;
         };
-        let Some(handoff) = &mut session.pending_compound_handoff else {
-            return false;
+        let (finished_call, next_call, next_text, tx_text, report_db) = {
+            let Some(handoff) = &mut session.pending_compound_handoff else {
+                return false;
+            };
+            if !handoff
+                .next_station
+                .callsign
+                .eq_ignore_ascii_case(&station_info.callsign)
+            {
+                return false;
+            }
+            handoff.next_station = station_info.clone();
+            let report_db = clamp_report_db(handoff.next_station.last_snr_db);
+            handoff.tx_text = format!(
+                "{} RR73; {} <{}> {:+03}",
+                handoff.finished_call,
+                handoff.next_station.callsign,
+                self.config.station.our_call,
+                report_db
+            );
+            (
+                handoff.finished_call.clone(),
+                handoff.next_station.callsign.clone(),
+                handoff.next_station.last_text.clone().unwrap_or_default(),
+                handoff.tx_text.clone(),
+                report_db,
+            )
         };
-        if !handoff
-            .next_station
-            .callsign
-            .eq_ignore_ascii_case(&station_info.callsign)
-        {
-            return false;
-        }
-        handoff.next_station = station_info.clone();
-        let report_db = clamp_report_db(handoff.next_station.last_snr_db);
-        handoff.tx_text = format!(
-            "{} RR73; {} <{}> {:+03}",
-            handoff.finished_call,
-            handoff.next_station.callsign,
-            self.config.station.our_call,
-            report_db
-        );
-        let next_text = handoff.next_station.last_text.clone().unwrap_or_default();
-        let tx_text = handoff.tx_text.clone();
         let last_rx_event = session
             .last_rx_event
             .clone()
             .unwrap_or_else(|| "none".to_string());
         info!(
-            finished_call = %handoff.finished_call,
-            next_call = %handoff.next_station.callsign,
+            finished_call = %finished_call,
+            next_call = %next_call,
             report_db,
             "qso_compound_handoff_refreshed"
         );
@@ -1005,6 +1073,18 @@ impl QsoController {
             Some(tx_text),
             now,
         );
+        let proposed = session.clone();
+        let _ = try_late_bind_session_update(
+            backend.as_mut(),
+            config,
+            session,
+            proposed,
+            now,
+            format!(
+                "late-bound current tx: refreshed compound handoff to {}",
+                next_call
+            ),
+        );
         true
     }
 
@@ -1015,6 +1095,8 @@ impl QsoController {
         allow_send_73_once: bool,
         now: SystemTime,
     ) -> bool {
+        let backend = &mut self.backend;
+        let config = &self.config;
         let Some(session) = &mut self.session else {
             return false;
         };
@@ -1074,6 +1156,27 @@ impl QsoController {
             Some(tx_text),
             now,
         );
+        let mut proposed = session.clone();
+        if let Some(PendingAction::Transition(next_state)) = proposed.pending_action.take() {
+            if matches!(next_state, QsoState::SendRR73 | QsoState::Send73Once) {
+                proposed.state = next_state;
+                proposed.no_fwd_count = 0;
+                proposed.no_msg_count = 0;
+            } else {
+                proposed.pending_action = Some(PendingAction::Transition(next_state));
+            }
+        }
+        let _ = try_late_bind_session_update(
+            backend.as_mut(),
+            config,
+            session,
+            proposed,
+            now,
+            format!(
+                "late-bound current tx: compound handoff to {}",
+                plan.next_station.callsign
+            ),
+        );
         true
     }
 
@@ -1098,6 +1201,132 @@ impl QsoController {
         true
     }
 
+    fn try_late_bind_takeover(
+        &mut self,
+        partner_call: String,
+        tx_freq_hz: f32,
+        initial_state: QsoState,
+        start_mode: QsoStartMode,
+        station_info: Option<StationStartInfo>,
+        now: SystemTime,
+    ) -> bool {
+        if self.current_app_mode != Mode::Ft8 {
+            return false;
+        }
+        let Some(target_slot) = self.backend.active_late_bind_target_slot() else {
+            return false;
+        };
+        if !initial_state.transmits() {
+            return false;
+        }
+        let station_info = if start_mode == QsoStartMode::Cq {
+            None
+        } else {
+            station_info
+        };
+        let mut session = ActiveSession {
+            session_id: self.next_session_id,
+            partner_call: if start_mode == QsoStartMode::Cq {
+                partner_call
+            } else {
+                station_info
+                    .as_ref()
+                    .map(|info| info.callsign.clone())
+                    .unwrap_or(partner_call)
+            },
+            state: initial_state,
+            start_mode,
+            tx_slot_family: slot_family_for_mode(self.current_app_mode, target_slot),
+            tx_freq_hz,
+            latest_partner_snr_db: station_info
+                .as_ref()
+                .map(|info| info.last_snr_db)
+                .unwrap_or(0),
+            rig_frequency_hz: self.current_rig_frequency_hz,
+            rig_band: self.current_rig_band.clone(),
+            app_mode: self.current_app_mode,
+            started_at: now,
+            deadline_at: now + Duration::from_secs(self.config.fsm.timeout_seconds),
+            next_tx_slot: None,
+            last_tx_slot: Some(target_slot),
+            in_flight_tx: None,
+            pending_action: None,
+            compound_rr73_ready_slot: None,
+            pending_compound_handoff: None,
+            no_msg_count: 0,
+            no_fwd_count: 0,
+            partner_rx_count: 0,
+            last_rx_event: station_info
+                .as_ref()
+                .and_then(|info| info.last_text.as_ref())
+                .map(|_| "start_context".to_string()),
+            last_rx_stage: None,
+            last_rx_text: station_info
+                .as_ref()
+                .and_then(|info| info.last_text.clone()),
+            last_rx_structured_json: station_info
+                .as_ref()
+                .and_then(|info| info.last_structured_json.clone()),
+            current_rx_slot: None,
+            rx_slot_consumed_stage: None,
+            transcript: VecDeque::new(),
+            sent_terminal_73: matches!(
+                initial_state,
+                QsoState::SendRR73 | QsoState::Send73 | QsoState::Send73Once
+            ),
+        };
+        let request = build_tx_request(&self.config, &session, target_slot);
+        let Ok(updated) = self.backend.update_pending(request.clone()) else {
+            return false;
+        };
+        if !updated {
+            return false;
+        }
+        self.next_session_id += 1;
+        if let Some(text) = station_info
+            .as_ref()
+            .and_then(|info| info.last_text.clone())
+        {
+            let state = session.state;
+            Self::push_transcript(
+                &mut session,
+                now,
+                "RX:",
+                state,
+                format!("start context: {text}"),
+            );
+        }
+        let state = session.state;
+        let start_line = format!(
+            "late-bind start {} with {} tx={} freq={:.0}Hz state={} current_slot={}",
+            start_mode.as_str(),
+            session.partner_call,
+            session.tx_slot_family.as_str(),
+            session.tx_freq_hz,
+            session.state.as_str(),
+            format_timestamp(target_slot),
+        );
+        Self::push_transcript(&mut session, now, "SYS:", state, start_line);
+        session.in_flight_tx = Some(InFlightTx {
+            target_slot,
+            state: request.state,
+            message_text: request.message_text.clone(),
+            compound_handoff: None,
+        });
+        Self::log_fsm(
+            &session,
+            "late_bind_start",
+            QsoState::Idle,
+            session.state,
+            "start".to_string(),
+            station_info.and_then(|info| info.last_text),
+            Some(request.message_text),
+            now,
+        );
+        self.session = Some(session);
+        true
+    }
+
     fn handle_start(
         &mut self,
         partner_call: String,
@@ -1108,7 +1337,24 @@ impl QsoController {
         station_info: Option<StationStartInfo>,
         now: SystemTime,
     ) {
-        if self.session.is_some() || self.backend.is_active() {
+        if self.session.is_some() {
+            warn!(
+                partner_call,
+                "qso start rejected because a session or tx is already active"
+            );
+            return;
+        }
+        if self.backend.is_active() {
+            if self.try_late_bind_takeover(
+                partner_call.clone(),
+                tx_freq_hz,
+                initial_state,
+                start_mode,
+                station_info.clone(),
+                now,
+            ) {
+                return;
+            }
             warn!(
                 partner_call,
                 "qso start rejected because a session or tx is already active"
@@ -1592,6 +1838,12 @@ struct InFlightTx {
 }
 
 #[derive(Debug, Clone)]
+struct LateBindShared {
+    pending_request: TxRequest,
+    committed: bool,
+}
+
+#[derive(Debug, Clone)]
 struct PendingCompoundHandoff {
     finished_call: String,
     next_station: StationStartInfo,
@@ -1626,6 +1878,11 @@ pub(crate) enum TxEvent {
         state: QsoState,
         message_text: String,
     },
+    Committed {
+        session_id: u64,
+        state: QsoState,
+        message_text: String,
+    },
     Completed {
         session_id: u64,
         state: QsoState,
@@ -1649,6 +1906,7 @@ impl TxEvent {
     fn session_id(&self) -> u64 {
         match self {
             Self::Started { session_id, .. }
+            | Self::Committed { session_id, .. }
             | Self::Completed { session_id, .. }
             | Self::Aborted { session_id, .. }
             | Self::Error { session_id, .. } => *session_id,
@@ -1658,6 +1916,7 @@ impl TxEvent {
     fn kind(&self) -> &'static str {
         match self {
             Self::Started { .. } => "tx_started",
+            Self::Committed { .. } => "tx_late_bind_commit",
             Self::Completed { .. } => "tx_completed",
             Self::Aborted { .. } => "tx_aborted",
             Self::Error { .. } => "tx_error",
@@ -1667,6 +1926,7 @@ impl TxEvent {
     fn message(&self) -> String {
         match self {
             Self::Started { message_text, .. }
+            | Self::Committed { message_text, .. }
             | Self::Completed { message_text, .. }
             | Self::Aborted { message_text, .. }
             | Self::Error { message_text, .. } => message_text.clone(),
@@ -1676,9 +1936,15 @@ impl TxEvent {
 
 pub(crate) trait TxBackend: Send {
     fn start(&mut self, request: TxRequest) -> Result<(), String>;
+    fn update_pending(&mut self, _request: TxRequest) -> Result<bool, String> {
+        Ok(false)
+    }
     fn abort(&mut self);
     fn poll_event(&mut self) -> Option<TxEvent>;
     fn is_active(&self) -> bool;
+    fn active_late_bind_target_slot(&self) -> Option<SystemTime> {
+        None
+    }
 }
 
 pub struct RigTxBackend {
@@ -1688,6 +1954,7 @@ pub struct RigTxBackend {
     active: bool,
     cancel: Option<Arc<AtomicBool>>,
     event_rx: Option<mpsc::Receiver<TxEvent>>,
+    late_bind: Option<(SystemTime, Arc<Mutex<LateBindShared>>)>,
 }
 
 impl RigTxBackend {
@@ -1703,6 +1970,7 @@ impl RigTxBackend {
             active: false,
             cancel: None,
             event_rx: None,
+            late_bind: None,
         }
     }
 }
@@ -1738,6 +2006,18 @@ impl TxBackend for RigTxBackend {
         let cancel_thread = Arc::clone(&cancel);
         let output_device = self.output_device.clone();
         let tx_busy = Arc::clone(&self.tx_busy);
+        let target_slot = request.target_slot;
+        let late_bind = request
+            .app_mode
+            .spec()
+            .late_bind_safe_prefix_samples()
+            .map(|_| {
+                Arc::new(Mutex::new(LateBindShared {
+                    pending_request: request.clone(),
+                    committed: false,
+                }))
+            });
+        let late_bind_thread = late_bind.clone();
         thread::spawn(move || {
             run_tx_thread(
                 rig,
@@ -1745,6 +2025,7 @@ impl TxBackend for RigTxBackend {
                 request,
                 synthesized.audio.sample_rate_hz,
                 synthesized.audio.samples,
+                late_bind_thread,
                 cancel_thread,
                 tx_busy,
                 event_tx,
@@ -1753,7 +2034,25 @@ impl TxBackend for RigTxBackend {
         self.active = true;
         self.cancel = Some(cancel);
         self.event_rx = Some(event_rx);
+        self.late_bind = late_bind.map(|shared| (target_slot, shared));
         Ok(())
+    }
+
+    fn update_pending(&mut self, request: TxRequest) -> Result<bool, String> {
+        let Some((target_slot, shared)) = &self.late_bind else {
+            return Ok(false);
+        };
+        if *target_slot != request.target_slot {
+            return Ok(false);
+        }
+        let mut guard = shared
+            .lock()
+            .map_err(|_| "late bind state poisoned".to_string())?;
+        if guard.committed {
+            return Ok(false);
+        }
+        guard.pending_request = request;
+        Ok(true)
     }
 
     fn abort(&mut self) {
@@ -1764,6 +2063,7 @@ impl TxBackend for RigTxBackend {
         self.active = false;
         self.cancel = None;
         self.event_rx = None;
+        self.late_bind = None;
     }
 
     fn poll_event(&mut self) -> Option<TxEvent> {
@@ -1775,12 +2075,23 @@ impl TxBackend for RigTxBackend {
             self.active = false;
             self.cancel = None;
             self.event_rx = None;
+            self.late_bind = None;
         }
         event
     }
 
     fn is_active(&self) -> bool {
         self.active
+    }
+
+    fn active_late_bind_target_slot(&self) -> Option<SystemTime> {
+        let (target_slot, shared) = self.late_bind.as_ref()?;
+        let guard = shared.lock().ok()?;
+        if guard.committed {
+            None
+        } else {
+            Some(*target_slot)
+        }
     }
 }
 
@@ -2023,6 +2334,67 @@ fn render_tx_message(config: &AppConfig, session: &ActiveSession) -> String {
             format!("{} {} 73", session.partner_call, config.station.our_call)
         }
     }
+}
+
+fn update_in_flight_from_request(session: &ActiveSession, request: &TxRequest) -> InFlightTx {
+    InFlightTx {
+        target_slot: request.target_slot,
+        state: request.state,
+        message_text: request.message_text.clone(),
+        compound_handoff: session
+            .pending_compound_handoff
+            .clone()
+            .filter(|_| matches!(request.state, QsoState::SendRR73 | QsoState::Send73Once)),
+    }
+}
+
+fn try_late_bind_session_update(
+    backend: &mut dyn TxBackend,
+    config: &AppConfig,
+    session: &mut ActiveSession,
+    mut proposed: ActiveSession,
+    now: SystemTime,
+    detail: String,
+) -> bool {
+    if proposed.app_mode != Mode::Ft8 {
+        return false;
+    }
+    let Some(target_slot) = session.in_flight_tx.as_ref().map(|tx| tx.target_slot) else {
+        return false;
+    };
+    let request = build_tx_request(config, &proposed, target_slot);
+    let Ok(updated) = backend.update_pending(request.clone()) else {
+        return false;
+    };
+    if !updated {
+        return false;
+    }
+    if matches!(
+        request.state,
+        QsoState::SendRR73 | QsoState::Send73 | QsoState::Send73Once
+    ) {
+        proposed.sent_terminal_73 = true;
+    }
+    proposed.last_tx_slot = Some(target_slot);
+    proposed.next_tx_slot = None;
+    let proposed_state = proposed.state;
+    QsoController::push_transcript(&mut proposed, now, "SYS:", proposed_state, detail);
+    QsoController::log_fsm(
+        &proposed,
+        "tx_late_bind_updated",
+        proposed.state,
+        proposed.state,
+        proposed
+            .last_rx_event
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        None,
+        Some(request.message_text.clone()),
+        now,
+    );
+    proposed.in_flight_tx = Some(update_in_flight_from_request(&proposed, &request));
+    *session = proposed;
+    true
 }
 
 fn clamp_report_db(value: i32) -> i16 {
@@ -2279,6 +2651,7 @@ fn run_tx_thread(
     request: TxRequest,
     sample_rate_hz: u32,
     samples: Vec<f32>,
+    late_bind: Option<Arc<Mutex<LateBindShared>>>,
     cancel: Arc<AtomicBool>,
     tx_busy: Arc<AtomicBool>,
     event_tx: mpsc::Sender<TxEvent>,
@@ -2286,6 +2659,22 @@ fn run_tx_thread(
     let _busy_guard = TxBusyGuard::new(tx_busy);
     let symbol_start = tx_symbol_start_for_slot(request.target_slot, request.app_mode);
     let key_target = tx_key_time_for_slot(request.target_slot, request.app_mode);
+    let prepared_writer = match prepare_mono_playback_writer(
+        &output_device,
+        sample_rate_hz,
+        request.playback_channels,
+    ) {
+        Ok(playback) => playback,
+        Err(error) => {
+            let _ = event_tx.send(TxEvent::Error {
+                session_id: request.session_id,
+                state: request.state,
+                message_text: request.message_text,
+                message: format!("prepare playback failed: {error}"),
+            });
+            return;
+        }
+    };
     if wait_until(key_target, &cancel) {
         let _ = event_tx.send(TxEvent::Aborted {
             session_id: request.session_id,
@@ -2306,25 +2695,6 @@ fn run_tx_thread(
         return;
     }
 
-    let prepared_playback = match prepare_mono_playback(
-        &output_device,
-        sample_rate_hz,
-        request.playback_channels,
-        &samples,
-    ) {
-        Ok(playback) => playback,
-        Err(error) => {
-            force_rx(&rig);
-            let _ = event_tx.send(TxEvent::Error {
-                session_id: request.session_id,
-                state: request.state,
-                message_text: request.message_text,
-                message: format!("prepare playback failed: {error}"),
-            });
-            return;
-        }
-    };
-
     if wait_until(symbol_start, &cancel) {
         force_rx(&rig);
         let _ = event_tx.send(TxEvent::Aborted {
@@ -2342,34 +2712,123 @@ fn run_tx_thread(
         message_text: request.message_text.clone(),
     });
 
-    match prepared_playback.play_until(Some(cancel.as_ref())) {
+    let mut completed_request = request.clone();
+    let playback_result = if let Some(shared) = late_bind {
+        let Some(prefix_len) = request.app_mode.spec().late_bind_safe_prefix_samples() else {
+            unreachable!("late-bind present without ft8 prefix");
+        };
+        let prefix_len = prefix_len.min(samples.len());
+        let freeze_at =
+            symbol_start + Duration::from_secs_f32(prefix_len as f32 / sample_rate_hz as f32);
+        prepared_writer
+            .write_mono_samples_until(&samples[..prefix_len], Some(cancel.as_ref()))
+            .and_then(|_| {
+                if wait_until(freeze_at, &cancel) {
+                    return Err(rigctl::audio::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled_before_commit",
+                    )));
+                }
+                let (final_request, suffix) =
+                    commit_late_bound_request(&shared, request.clone(), prefix_len, &samples)
+                        .map_err(std::io::Error::other)
+                        .map_err(rigctl::audio::Error::Io)?;
+                completed_request = final_request.clone();
+                let _ = event_tx.send(TxEvent::Committed {
+                    session_id: final_request.session_id,
+                    state: final_request.state,
+                    message_text: final_request.message_text.clone(),
+                });
+                prepared_writer.write_mono_samples_until(&suffix, Some(cancel.as_ref()))
+            })
+            .and_then(|_| prepared_writer.finish(Some(cancel.as_ref())))
+    } else {
+        match prepare_mono_playback(
+            &output_device,
+            sample_rate_hz,
+            request.playback_channels,
+            &samples,
+        ) {
+            Ok(playback) => playback.play_until(Some(cancel.as_ref())),
+            Err(error) => Err(error),
+        }
+    };
+
+    match playback_result {
         Ok(()) if cancel.load(Ordering::Relaxed) => {
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Aborted {
-                session_id: request.session_id,
-                state: request.state,
-                message_text: request.message_text,
-                reason: format!("cancelled_in_{}", request.state.as_str()),
+                session_id: completed_request.session_id,
+                state: completed_request.state,
+                message_text: completed_request.message_text,
+                reason: format!("cancelled_in_{}", completed_request.state.as_str()),
             });
         }
         Ok(()) => {
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Completed {
-                session_id: request.session_id,
-                state: request.state,
-                message_text: request.message_text,
+                session_id: completed_request.session_id,
+                state: completed_request.state,
+                message_text: completed_request.message_text,
             });
         }
         Err(error) => {
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Error {
-                session_id: request.session_id,
-                state: request.state,
-                message_text: request.message_text,
+                session_id: completed_request.session_id,
+                state: completed_request.state,
+                message_text: completed_request.message_text,
                 message: error.to_string(),
             });
         }
     }
+}
+
+fn commit_late_bound_request(
+    shared: &Arc<Mutex<LateBindShared>>,
+    launch_request: TxRequest,
+    prefix_len: usize,
+    launch_samples: &[f32],
+) -> Result<(TxRequest, Vec<f32>), String> {
+    let final_request = {
+        let mut guard = shared
+            .lock()
+            .map_err(|_| "late bind state poisoned".to_string())?;
+        guard.committed = true;
+        guard.pending_request.clone()
+    };
+    let final_samples =
+        synthesize_request_samples(&final_request).map_err(|error| error.to_string())?;
+    if final_samples.len() != launch_samples.len() {
+        return Err("late-bound waveform length changed".to_string());
+    }
+    if prefix_len > final_samples.len() || prefix_len > launch_samples.len() {
+        return Err("late-bound prefix exceeds waveform length".to_string());
+    }
+    if !samples_match(&launch_samples[..prefix_len], &final_samples[..prefix_len]) {
+        return Err(format!(
+            "late-bound prefix diverged: {} -> {}",
+            launch_request.message_text, final_request.message_text
+        ));
+    }
+    Ok((final_request, final_samples[prefix_len..].to_vec()))
+}
+
+fn synthesize_request_samples(request: &TxRequest) -> Result<Vec<f32>, ft8_decoder::EncodeError> {
+    let synthesized = synthesize_tx_message(
+        &request.message,
+        &WaveformOptions {
+            mode: request.app_mode,
+            base_freq_hz: request.tx_freq_hz,
+            amplitude: request.drive_level,
+            ..WaveformOptions::for_mode(request.app_mode)
+        },
+    )?;
+    Ok(synthesized.audio.samples)
+}
+
+fn samples_match(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)| (a - b).abs() <= 1.0e-6)
 }
 
 struct TxBusyGuard {
@@ -2649,6 +3108,9 @@ mod tests {
         active: bool,
         events: VecDeque<TxEvent>,
         launches: Vec<String>,
+        updates: Vec<String>,
+        active_slot: Option<SystemTime>,
+        committed: bool,
     }
 
     struct ManualTxBackend {
@@ -2665,13 +3127,25 @@ mod tests {
         fn start(&mut self, request: TxRequest) -> Result<(), String> {
             let mut state = self.state.lock().expect("manual tx state");
             state.active = true;
+            state.committed = false;
+            state.active_slot = Some(request.target_slot);
             state.launches.push(request.message_text);
             Ok(())
+        }
+
+        fn update_pending(&mut self, request: TxRequest) -> Result<bool, String> {
+            let mut state = self.state.lock().expect("manual tx state");
+            if !state.active || state.committed || state.active_slot != Some(request.target_slot) {
+                return Ok(false);
+            }
+            state.updates.push(request.message_text);
+            Ok(true)
         }
 
         fn abort(&mut self) {
             let mut state = self.state.lock().expect("manual tx state");
             state.active = false;
+            state.active_slot = None;
         }
 
         fn poll_event(&mut self) -> Option<TxEvent> {
@@ -2682,12 +3156,25 @@ mod tests {
                 Some(TxEvent::Completed { .. } | TxEvent::Aborted { .. } | TxEvent::Error { .. })
             ) {
                 state.active = false;
+                state.active_slot = None;
+            }
+            if matches!(event, Some(TxEvent::Committed { .. })) {
+                state.committed = true;
             }
             event
         }
 
         fn is_active(&self) -> bool {
             self.state.lock().expect("manual tx state").active
+        }
+
+        fn active_late_bind_target_slot(&self) -> Option<SystemTime> {
+            let state = self.state.lock().expect("manual tx state");
+            if state.active && !state.committed {
+                state.active_slot
+            } else {
+                None
+            }
         }
     }
 
@@ -3457,9 +3944,9 @@ mod tests {
         let refreshed_text = controller
             .session
             .as_ref()
-            .and_then(|session| session.pending_compound_handoff.as_ref())
-            .map(|handoff| handoff.tx_text.clone())
-            .expect("pending handoff text");
+            .and_then(|session| session.in_flight_tx.as_ref())
+            .map(|tx| tx.message_text.clone())
+            .expect("in-flight text");
         assert_eq!(refreshed_text, "K1ABC RR73; K2ABC <N1VF> -03");
 
         backend_state
@@ -3469,7 +3956,7 @@ mod tests {
             .push_back(TxEvent::Completed {
                 session_id: 1,
                 state: QsoState::SendRR73,
-                message_text: launched_text,
+                message_text: refreshed_text,
             });
         controller.tick(launch_time + Duration::from_secs(2));
 
@@ -3480,6 +3967,233 @@ mod tests {
         let outcomes = controller.drain_outcomes();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].exit_reason, "compound_handoff_sent");
+    }
+
+    #[test]
+    fn committed_compound_handoff_still_completes_after_post_commit_refresh() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            start_command("K1ABC", 1225.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        controller.session.as_mut().expect("session").state = QsoState::SendSig;
+        controller.on_full_decode(
+            rx_slot_start,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::Ack)],
+            rx_slot_start + Duration::from_secs(15),
+        );
+        assert!(controller.maybe_arm_compound_handoff(
+            rx_slot_start,
+            CompoundHandoffPlan {
+                next_station: StationStartInfo {
+                    callsign: "K2ABC".to_string(),
+                    last_heard_at: rx_slot_start,
+                    last_heard_slot_family: SlotFamily::Odd,
+                    last_snr_db: -11,
+                    last_text: Some("N1VF K2ABC FN20".to_string()),
+                    last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                },
+            },
+            true,
+            rx_slot_start + Duration::from_secs(15),
+        ));
+
+        let launch_time = tx_key_time_for_slot(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Mode::Ft8,
+        );
+        controller.tick(launch_time);
+        backend_state
+            .lock()
+            .expect("manual tx state")
+            .events
+            .push_back(TxEvent::Committed {
+                session_id: 1,
+                state: QsoState::SendRR73,
+                message_text: "K1ABC RR73; K2ABC <N1VF> -11".to_string(),
+            });
+        controller.tick(launch_time + Duration::from_millis(100));
+
+        assert!(controller.refresh_reserved_compound_next_station(
+            StationStartInfo {
+                callsign: "K2ABC".to_string(),
+                last_heard_at: rx_slot_start,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -3,
+                last_text: Some("N1VF K2ABC FN20".to_string()),
+                last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+            },
+            launch_time + Duration::from_secs(1),
+        ));
+
+        backend_state
+            .lock()
+            .expect("manual tx state")
+            .events
+            .push_back(TxEvent::Completed {
+                session_id: 1,
+                state: QsoState::SendRR73,
+                message_text: "K1ABC RR73; K2ABC <N1VF> -11".to_string(),
+            });
+        controller.tick(launch_time + Duration::from_secs(2));
+
+        let snapshot = controller.snapshot(launch_time + Duration::from_secs(2));
+        assert!(snapshot.active);
+        assert_eq!(snapshot.partner_call.as_deref(), Some("K2ABC"));
+        assert_eq!(snapshot.state, "send_sig");
+        let outcomes = controller.drain_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].exit_reason, "compound_handoff_sent");
+    }
+
+    #[test]
+    fn committed_ft8_send_sig_can_late_bind_to_rr73() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = now + Duration::from_secs(15);
+        controller.handle_command(
+            start_command("K1ABC", 1225.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        controller.session.as_mut().expect("session").state = QsoState::SendSig;
+        let target_slot = controller
+            .session
+            .as_ref()
+            .and_then(|session| session.next_tx_slot)
+            .expect("next tx slot");
+        controller.tick(tx_key_time_for_slot(target_slot, Mode::Ft8));
+
+        controller.on_decode_stage(
+            rx_slot_start,
+            DecodeStage::Full,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::Ack)],
+            target_slot + Duration::from_millis(900),
+        );
+
+        let state = controller.session.as_ref().expect("session");
+        assert_eq!(state.state, QsoState::SendRR73);
+        assert!(state.pending_action.is_none());
+        assert_eq!(
+            state
+                .in_flight_tx
+                .as_ref()
+                .map(|tx| tx.message_text.as_str()),
+            Some("K1ABC N1VF RR73")
+        );
+        let backend = backend_state.lock().expect("manual tx state");
+        assert_eq!(backend.updates, vec!["K1ABC N1VF RR73".to_string()]);
+    }
+
+    #[test]
+    fn committed_ft8_without_message_change_does_not_log_late_bind_commit() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("K1ABC", 1225.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        let target_slot = controller
+            .session
+            .as_ref()
+            .and_then(|session| session.next_tx_slot)
+            .expect("next tx slot");
+        controller.tick(tx_key_time_for_slot(target_slot, Mode::Ft8));
+
+        backend_state
+            .lock()
+            .expect("manual tx state")
+            .events
+            .push_back(TxEvent::Committed {
+                session_id: 1,
+                state: QsoState::SendGrid,
+                message_text: "K1ABC N1VF CM97".to_string(),
+            });
+        controller.tick(tx_key_time_for_slot(target_slot, Mode::Ft8) + Duration::from_millis(10));
+
+        let transcript = controller
+            .session
+            .as_ref()
+            .expect("session")
+            .transcript
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !transcript
+                .iter()
+                .any(|line| line.contains("tx late-bind committed:")),
+            "unexpected transcript lines: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn committed_ft8_cq_can_be_taken_over_by_direct_call_in_same_slot() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(31);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "CQ".to_string(),
+                tx_freq_hz: 1250.0,
+                initial_state: QsoState::SendCq,
+                start_mode: QsoStartMode::Cq,
+                tx_slot_family_override: Some(SlotFamily::Even),
+            },
+            None,
+            now,
+        );
+        let target_slot = controller
+            .session
+            .as_ref()
+            .and_then(|session| session.next_tx_slot)
+            .expect("next tx slot");
+        controller.tick(tx_key_time_for_slot(target_slot, Mode::Ft8));
+        assert!(controller.preempt_for_priority_direct(target_slot + Duration::from_secs(1)));
+
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "W6ILO".to_string(),
+                tx_freq_hz: 1250.0,
+                initial_state: QsoState::SendGrid,
+                start_mode: QsoStartMode::Direct,
+                tx_slot_family_override: None,
+            },
+            Some(station_start_info("W6ILO", now, SlotFamily::Odd)),
+            target_slot + Duration::from_secs(1),
+        );
+
+        let session = controller.session.as_ref().expect("session");
+        assert_eq!(session.partner_call, "W6ILO");
+        assert_eq!(session.last_tx_slot, Some(target_slot));
+        assert_eq!(
+            session
+                .in_flight_tx
+                .as_ref()
+                .map(|tx| tx.message_text.as_str()),
+            Some("W6ILO N1VF CM97")
+        );
+        let backend = backend_state.lock().expect("manual tx state");
+        assert_eq!(backend.updates, vec!["W6ILO N1VF CM97".to_string()]);
     }
 
     #[test]

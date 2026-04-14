@@ -1478,6 +1478,45 @@ mod tests {
     }
 
     #[test]
+    fn ft8_raw_waveforms_share_safe_late_bind_prefix_only() {
+        let first = encode_standard_message_for_mode(
+            Mode::Ft8,
+            "K1ABC",
+            "W1XYZ",
+            false,
+            &GridReport::Grid("FN31".to_string()),
+        )
+        .expect("encode first");
+        let second = encode_standard_message_for_mode(
+            Mode::Ft8,
+            "N1VF",
+            "JA1ABC",
+            false,
+            &GridReport::Signal(-12),
+        )
+        .expect("encode second");
+        let first_audio =
+            synthesize_rectangular_waveform(&first, &WaveformOptions::for_mode(Mode::Ft8))
+                .expect("first waveform");
+        let second_audio =
+            synthesize_rectangular_waveform(&second, &WaveformOptions::for_mode(Mode::Ft8))
+                .expect("second waveform");
+        let safe_prefix = Mode::Ft8
+            .spec()
+            .late_bind_safe_prefix_samples()
+            .expect("ft8 late bind prefix");
+
+        assert_eq!(
+            &first_audio.samples[..safe_prefix],
+            &second_audio.samples[..safe_prefix]
+        );
+        assert_ne!(
+            &first_audio.samples[safe_prefix..],
+            &second_audio.samples[safe_prefix..]
+        );
+    }
+
+    #[test]
     fn ft2_standard_message_matches_reference_frame_bits() {
         let frame = encode_standard_message_for_mode(
             Mode::Ft2,
