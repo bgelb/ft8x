@@ -5,7 +5,7 @@ use ft8_decoder::{
     TxMessage, WaveformOptions, synthesize_tx_message,
 };
 use rigctl::K3s;
-use rigctl::audio::{AudioDevice, prepare_mono_playback, prepare_mono_playback_writer};
+use rigctl::audio::{AudioDevice, PreparedMonoPlaybackWriter, prepare_mono_playback_writer};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2706,56 +2706,17 @@ fn run_tx_thread(
         return;
     }
 
-    let _ = event_tx.send(TxEvent::Started {
-        session_id: request.session_id,
-        state: request.state,
-        message_text: request.message_text.clone(),
-    });
-
-    let mut completed_request = request.clone();
-    let playback_result = if let Some(shared) = late_bind {
-        let Some(prefix_len) = request.app_mode.spec().late_bind_safe_prefix_samples() else {
-            unreachable!("late-bind present without ft8 prefix");
-        };
-        let prefix_len = prefix_len.min(samples.len());
-        let freeze_at =
-            symbol_start + Duration::from_secs_f32(prefix_len as f32 / sample_rate_hz as f32);
-        prepared_writer
-            .write_mono_samples_until(&samples[..prefix_len], Some(cancel.as_ref()))
-            .and_then(|_| {
-                if wait_until(freeze_at, &cancel) {
-                    return Err(rigctl::audio::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "cancelled_before_commit",
-                    )));
-                }
-                let (final_request, suffix) =
-                    commit_late_bound_request(&shared, request.clone(), prefix_len, &samples)
-                        .map_err(std::io::Error::other)
-                        .map_err(rigctl::audio::Error::Io)?;
-                completed_request = final_request.clone();
-                let _ = event_tx.send(TxEvent::Committed {
-                    session_id: final_request.session_id,
-                    state: final_request.state,
-                    message_text: final_request.message_text.clone(),
-                });
-                prepared_writer.write_mono_samples_until(&suffix, Some(cancel.as_ref()))
-            })
-            .and_then(|_| prepared_writer.finish(Some(cancel.as_ref())))
-    } else {
-        match prepare_mono_playback(
-            &output_device,
-            sample_rate_hz,
-            request.playback_channels,
-            &samples,
-        ) {
-            Ok(playback) => playback.play_until(Some(cancel.as_ref())),
-            Err(error) => Err(error),
-        }
-    };
-
-    match playback_result {
-        Ok(()) if cancel.load(Ordering::Relaxed) => {
+    match run_tx_playback_phase(
+        prepared_writer,
+        &request,
+        sample_rate_hz,
+        symbol_start,
+        &samples,
+        late_bind,
+        &cancel,
+        &event_tx,
+    ) {
+        Ok(completed_request) if cancel.load(Ordering::Relaxed) => {
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Aborted {
                 session_id: completed_request.session_id,
@@ -2764,7 +2725,7 @@ fn run_tx_thread(
                 reason: format!("cancelled_in_{}", completed_request.state.as_str()),
             });
         }
-        Ok(()) => {
+        Ok(completed_request) => {
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Completed {
                 session_id: completed_request.session_id,
@@ -2772,7 +2733,7 @@ fn run_tx_thread(
                 message_text: completed_request.message_text,
             });
         }
-        Err(error) => {
+        Err((completed_request, error)) => {
             force_rx(&rig);
             let _ = event_tx.send(TxEvent::Error {
                 session_id: completed_request.session_id,
@@ -2781,6 +2742,117 @@ fn run_tx_thread(
                 message: error.to_string(),
             });
         }
+    }
+}
+
+fn run_tx_playback_phase<W: TxPlaybackWriter>(
+    writer: W,
+    request: &TxRequest,
+    sample_rate_hz: u32,
+    symbol_start: SystemTime,
+    samples: &[f32],
+    late_bind: Option<Arc<Mutex<LateBindShared>>>,
+    cancel: &Arc<AtomicBool>,
+    event_tx: &mpsc::Sender<TxEvent>,
+) -> std::result::Result<TxRequest, (TxRequest, rigctl::audio::Error)> {
+    let _ = event_tx.send(TxEvent::Started {
+        session_id: request.session_id,
+        state: request.state,
+        message_text: request.message_text.clone(),
+    });
+
+    let (completed_request, playback_result) = play_tx_audio(
+        writer,
+        request,
+        sample_rate_hz,
+        symbol_start,
+        samples,
+        late_bind,
+        cancel,
+        event_tx,
+    );
+
+    match playback_result {
+        Ok(()) if cancel.load(Ordering::Relaxed) => {
+            Ok(completed_request)
+        }
+        Ok(()) => {
+            Ok(completed_request)
+        }
+        Err(error) => {
+            Err((completed_request, error))
+        }
+    }
+}
+
+fn play_tx_audio<W: TxPlaybackWriter>(
+    writer: W,
+    request: &TxRequest,
+    sample_rate_hz: u32,
+    symbol_start: SystemTime,
+    samples: &[f32],
+    late_bind: Option<Arc<Mutex<LateBindShared>>>,
+    cancel: &Arc<AtomicBool>,
+    event_tx: &mpsc::Sender<TxEvent>,
+) -> (TxRequest, rigctl::audio::Result<()>) {
+    let mut completed_request = request.clone();
+    let playback_result = if let Some(shared) = late_bind {
+        let Some(prefix_len) = request.app_mode.spec().late_bind_safe_prefix_samples() else {
+            unreachable!("late-bind present without ft8 prefix");
+        };
+        let prefix_len = prefix_len.min(samples.len());
+        let freeze_at =
+            symbol_start + Duration::from_secs_f32(prefix_len as f32 / sample_rate_hz as f32);
+        writer
+            .write_mono_samples_until(&samples[..prefix_len], Some(cancel.as_ref()))
+            .and_then(|_| {
+                if wait_until(freeze_at, cancel) {
+                    return Err(rigctl::audio::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled_before_commit",
+                    )));
+                }
+                let (final_request, suffix) =
+                    commit_late_bound_request(&shared, request.clone(), prefix_len, samples)
+                        .map_err(std::io::Error::other)
+                        .map_err(rigctl::audio::Error::Io)?;
+                completed_request = final_request.clone();
+                let _ = event_tx.send(TxEvent::Committed {
+                    session_id: final_request.session_id,
+                    state: final_request.state,
+                    message_text: final_request.message_text.clone(),
+                });
+                writer.write_mono_samples_until(&suffix, Some(cancel.as_ref()))
+            })
+            .and_then(|_| writer.finish(Some(cancel.as_ref())))
+    } else {
+        writer
+            .write_mono_samples_until(samples, Some(cancel.as_ref()))
+            .and_then(|_| writer.finish(Some(cancel.as_ref())))
+    };
+    (completed_request, playback_result)
+}
+
+trait TxPlaybackWriter {
+    fn write_mono_samples_until(
+        &self,
+        samples: &[f32],
+        cancel: Option<&AtomicBool>,
+    ) -> rigctl::audio::Result<()>;
+    fn finish(self, cancel: Option<&AtomicBool>) -> rigctl::audio::Result<()>;
+}
+
+impl TxPlaybackWriter for PreparedMonoPlaybackWriter {
+    fn write_mono_samples_until(
+        &self,
+        samples: &[f32],
+        cancel: Option<&AtomicBool>,
+    ) -> rigctl::audio::Result<()> {
+        PreparedMonoPlaybackWriter::write_mono_samples_until(self, samples, cancel)
+    }
+
+    fn finish(self, cancel: Option<&AtomicBool>) -> rigctl::audio::Result<()> {
+        PreparedMonoPlaybackWriter::finish(self, cancel)
     }
 }
 
@@ -3120,6 +3192,31 @@ mod tests {
     impl ManualTxBackend {
         fn new(state: Arc<Mutex<ManualTxState>>) -> Self {
             Self { state }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakePlaybackWriter {
+        writes: Arc<Mutex<Vec<usize>>>,
+        finished: Arc<AtomicBool>,
+    }
+
+    impl TxPlaybackWriter for FakePlaybackWriter {
+        fn write_mono_samples_until(
+            &self,
+            samples: &[f32],
+            _cancel: Option<&AtomicBool>,
+        ) -> rigctl::audio::Result<()> {
+            self.writes
+                .lock()
+                .expect("fake playback writes")
+                .push(samples.len());
+            Ok(())
+        }
+
+        fn finish(self, _cancel: Option<&AtomicBool>) -> rigctl::audio::Result<()> {
+            self.finished.store(true, Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -4141,6 +4238,63 @@ mod tests {
                 .any(|line| line.contains("tx late-bind committed:")),
             "unexpected transcript lines: {transcript:?}"
         );
+    }
+
+    #[test]
+    fn ft4_non_late_bind_tx_playback_phase_starts_and_returns_completion() {
+        let writer = FakePlaybackWriter::default();
+        let samples = vec![0.25f32; 256];
+        let request = TxRequest {
+            session_id: 1,
+            target_slot: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            state: QsoState::SendGrid,
+            message: TxMessage::Directed {
+                my_call: "N1VF".to_string(),
+                peer_call: "K1ABC".to_string(),
+                payload: TxDirectedPayload::Grid("CM97".to_string()),
+            },
+            message_text: "K1ABC N1VF CM97".to_string(),
+            tx_freq_hz: 1000.0,
+            drive_level: 0.12,
+            playback_channels: 2,
+            app_mode: Mode::Ft4,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = mpsc::channel();
+
+        let result = run_tx_playback_phase(
+            writer.clone(),
+            &request,
+            12_000,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            &samples,
+            None,
+            &cancel,
+            &event_tx,
+        );
+
+        let completed_request = result.expect("playback phase should succeed");
+        let started = event_rx.try_recv().expect("started event");
+
+        match started {
+            TxEvent::Started {
+                session_id,
+                state,
+                message_text,
+            } => {
+                assert_eq!(session_id, request.session_id);
+                assert_eq!(state, request.state);
+                assert_eq!(message_text, request.message_text);
+            }
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        assert_eq!(
+            *writer.writes.lock().expect("fake playback writes"),
+            vec![samples.len()]
+        );
+        assert!(writer.finished.load(Ordering::Relaxed));
+        assert_eq!(completed_request.message_text, request.message_text);
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
