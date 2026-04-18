@@ -21,8 +21,9 @@ use qso::{
 };
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream, play_tone};
 use rigctl::{
-    Band, K3s, K3sConfig, Mode as RigMode, TxMeterMode, detect_k3s_audio_device,
-    detect_k3s_audio_output_device,
+    Band, Mode as RigMode, Rig, RigConnectionConfig, RigKind, RigPowerRequest, RigPowerState,
+    RigSnapshot as CommonRigSnapshot, TxMeterMode, detect_audio_device_for_rig,
+    detect_audio_output_device_for_rig, resolve_rig_kind,
 };
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
@@ -123,11 +124,15 @@ struct DisplayState {
 
 #[derive(Debug, Clone)]
 struct RigSnapshot {
+    kind: RigKind,
     frequency_hz: u64,
     mode: RigMode,
     band: Band,
-    configured_power_w: Option<f32>,
+    power: RigPowerState,
     bar_graph: Option<u8>,
+    telemetry_rx_s_meter: Option<f32>,
+    telemetry_tx_forward_power_w: Option<f32>,
+    telemetry_tx_swr: Option<f32>,
     transmitting: Option<bool>,
 }
 
@@ -138,7 +143,7 @@ struct CompositeDecodeRow {
 }
 
 type SharedWebSnapshot = Arc<Mutex<WebSnapshot>>;
-type SharedRig = Arc<Mutex<Option<K3s>>>;
+type SharedRig = Arc<Mutex<Option<Rig>>>;
 
 #[derive(Clone)]
 struct WebAppState {
@@ -214,7 +219,7 @@ impl QueueControlPlane {
 enum RigCommand {
     Configure {
         band: Band,
-        power_w: f32,
+        power: Option<RigPowerRequest>,
         app_mode: DecoderMode,
     },
     Tune10s,
@@ -296,12 +301,21 @@ struct BandMapEntry {
 struct WebSnapshot {
     time_utc: String,
     our_call: String,
+    rig_kind: Option<String>,
     rig_frequency_hz: Option<u64>,
     rig_mode: String,
     rig_band: String,
     app_mode: String,
     rig_power_w: Option<f32>,
+    rig_power_label: Option<String>,
+    rig_power_current_id: Option<String>,
+    rig_power_settings: Vec<WebRigPowerSetting>,
+    rig_power_settable: bool,
+    rig_power_is_discrete: bool,
     rig_bargraph: Option<u8>,
+    rig_rx_s_meter: Option<f32>,
+    rig_tx_forward_power_w: Option<f32>,
+    rig_tx_swr: Option<f32>,
     rig_is_tx: Option<bool>,
     rig_tune_active: bool,
     decode_status: String,
@@ -438,8 +452,16 @@ struct WebDirectCallLog {
 #[derive(Debug, Deserialize)]
 struct RigConfigRequest {
     band: String,
-    power_w: f32,
+    power_w: Option<f32>,
+    power_setting_id: Option<String>,
     app_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebRigPowerSetting {
+    id: String,
+    label: String,
+    nominal_watts: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2801,13 +2823,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
         select.appendChild(option);
       }
     }
-    function initRigPowerOptions() {
+    function initRigPowerOptions(data) {
       const select = document.getElementById('rig-power');
-      if (select.options.length) return;
-      for (const power of POWER_OPTIONS) {
+      const isDiscrete = !!data?.rig_power_is_discrete;
+      const desired = isDiscrete
+        ? (data?.rig_power_settings || []).map((setting) => ({ value: setting.id, label: setting.label }))
+        : POWER_OPTIONS.map((power) => ({ value: power, label: `${power} W` }));
+      const existing = [...select.options].map((option) => ({ value: option.value, label: option.textContent }));
+      if (JSON.stringify(existing) === JSON.stringify(desired)) {
+        return;
+      }
+      select.replaceChildren();
+      for (const entry of desired) {
         const option = document.createElement('option');
-        option.value = power;
-        option.textContent = `${power} W`;
+        option.value = entry.value;
+        option.textContent = entry.label;
         select.appendChild(option);
       }
     }
@@ -2966,13 +2996,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function applyRigSettings() {
       const band = document.getElementById('rig-band').value;
       const appMode = document.getElementById('rig-app-mode').value;
-      const power = Number(document.getElementById('rig-power').value);
-      pendingRigConfig = { band, app_mode: appMode, power_w: power };
-      await postJson('/api/rig/config', {
-        band,
-        app_mode: appMode,
-        power_w: power,
-      });
+      const powerInput = document.getElementById('rig-power');
+      if (lastSnapshot?.rig_power_is_discrete) {
+        const powerSettingId = powerInput.value || null;
+        const powerLabel = powerInput.selectedOptions[0]?.textContent || powerSettingId || '-';
+        pendingRigConfig = { band, app_mode: appMode, power_setting_id: powerSettingId, power_label: powerLabel };
+        await postJson('/api/rig/config', {
+          band,
+          app_mode: appMode,
+          power_setting_id: powerSettingId,
+        });
+      } else {
+        const power = Number(powerInput.value);
+        pendingRigConfig = { band, app_mode: appMode, power_w: power, power_label: `${power.toFixed(0)} W` };
+        await postJson('/api/rig/config', {
+          band,
+          app_mode: appMode,
+          power_w: power,
+        });
+      }
       scheduleRefresh(10);
     }
     async function tuneRigForTenSeconds() {
@@ -3068,7 +3110,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function renderRigControls(data) {
       initRigBandOptions();
       initRigModeOptions();
-      initRigPowerOptions();
+      initRigPowerOptions(data);
       const bandInput = document.getElementById('rig-band');
       const modeInput = document.getElementById('rig-app-mode');
       const powerInput = document.getElementById('rig-power');
@@ -3082,16 +3124,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
         pendingRigConfig &&
         data.rig_band === pendingRigConfig.band &&
         data.app_mode === pendingRigConfig.app_mode &&
-        data.rig_power_w != null &&
-        Math.abs(data.rig_power_w - pendingRigConfig.power_w) < 0.05
+        (
+          (data.rig_power_is_discrete &&
+            pendingRigConfig.power_setting_id != null &&
+            data.rig_power_current_id === pendingRigConfig.power_setting_id) ||
+          (!data.rig_power_is_discrete &&
+            data.rig_power_w != null &&
+            pendingRigConfig.power_w != null &&
+            Math.abs(data.rig_power_w - pendingRigConfig.power_w) < 0.05)
+        )
       ) {
         pendingRigConfig = null;
       }
       const effectiveBand = pendingRigConfig?.band ?? data.rig_band;
       const effectiveMode = pendingRigConfig?.app_mode ?? data.app_mode;
-      const effectivePower =
-        pendingRigConfig?.power_w ??
-        (data.rig_power_w == null ? null : Math.round(data.rig_power_w).toString());
+      const effectivePower = data.rig_power_is_discrete
+        ? (pendingRigConfig?.power_setting_id ?? data.rig_power_current_id ?? null)
+        : (pendingRigConfig?.power_w ?? (data.rig_power_w == null ? null : Math.round(data.rig_power_w).toString()));
       if (rigAvailable && effectiveBand) {
         bandInput.value = effectiveBand;
       }
@@ -3103,7 +3152,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       bandInput.disabled = !rigAvailable || txBusy || qsoActive;
       modeInput.disabled = !rigAvailable || txBusy || qsoActive;
-      powerInput.disabled = !rigAvailable || txBusy;
+      powerInput.disabled = !rigAvailable || txBusy || (data.rig_power_is_discrete && !data.rig_power_settable);
       tune.disabled = !rigAvailable || tuneActive || qsoActive || txBusy;
       if (!rigAvailable) {
         hint.textContent = 'Rig control unavailable.';
@@ -3114,9 +3163,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       } else if (qsoActive) {
         hint.textContent = 'Power can be changed mid-QSO while not transmitting. Band and mode changes wait until the QSO is idle.';
       } else if (pendingRigConfig) {
-        hint.textContent = `Applying ${pendingRigConfig.band} ${pendingRigConfig.app_mode} at ${pendingRigConfig.power_w.toFixed(0)} W...`;
+        hint.textContent = `Applying ${pendingRigConfig.band} ${pendingRigConfig.app_mode}${pendingRigConfig.power_label ? ` at ${pendingRigConfig.power_label}` : ''}...`;
+      } else if (data.rig_power_is_discrete && !data.rig_power_settable) {
+        hint.textContent = `Rig is ${bandInput.value || data.rig_band} ${modeInput.value || data.app_mode}; power is ${data.rig_power_label || '-'} and is not CAT-settable. Tune sends a 1000 Hz tone for 10 seconds.`;
       } else {
-        hint.textContent = `Rig is ${bandInput.value || data.rig_band} ${modeInput.value || data.app_mode} at ${powerInput.value || '-'} W. Tune sends a 1000 Hz tone for 10 seconds.`;
+        hint.textContent = `Rig is ${bandInput.value || data.rig_band} ${modeInput.value || data.app_mode} at ${data.rig_power_label || powerInput.value || '-'}. Tune sends a 1000 Hz tone for 10 seconds.`;
       }
     }
     function renderWaterfall(rows) {
@@ -3579,9 +3630,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
         document.getElementById('time').textContent = data.time_utc || '-';
       const freq = data.rig_frequency_hz == null ? 'unavailable' : `${(data.rig_frequency_hz / 1e6).toFixed(4)} MHz`;
       const rigDir = data.rig_is_tx == null ? '?' : (data.rig_is_tx ? 'TX' : 'RX');
-      const rigPower = data.rig_power_w == null ? '-' : `${data.rig_power_w.toFixed(1)}W`;
+      const rigPower = data.rig_power_label || (data.rig_power_w == null ? '-' : `${data.rig_power_w.toFixed(1)}W`);
       const rigBg = data.rig_bargraph == null ? '-' : data.rig_bargraph;
-      document.getElementById('rig').textContent = `${freq} ${data.rig_mode}/${data.app_mode} ${data.rig_band} ${rigDir} P=${rigPower} BG=${rigBg}`;
+      const rigSmeter = data.rig_rx_s_meter == null ? '-' : data.rig_rx_s_meter.toFixed(1);
+      const rigFwd = data.rig_tx_forward_power_w == null ? '-' : `${data.rig_tx_forward_power_w.toFixed(1)}W`;
+      const rigSwr = data.rig_tx_swr == null ? '-' : data.rig_tx_swr.toFixed(1);
+      const rigKind = data.rig_kind || '?';
+      document.getElementById('rig').textContent = `${freq} ${rigKind} ${data.rig_mode}/${data.app_mode} ${data.rig_band} ${rigDir} P=${rigPower} BG=${rigBg} S=${rigSmeter} FWD=${rigFwd} SWR=${rigSwr}`;
       document.getElementById('audio').textContent =
         `t=${data.audio_stats.latest_sample ?? '-'} ch=${data.audio_stats.selected_channel} L=${data.audio_stats.left_dbfs.toFixed(1)} R=${data.audio_stats.right_dbfs.toFixed(1)} all=${data.audio_stats.overall_dbfs.toFixed(1)} rec=${data.audio_stats.recoveries}`;
       document.getElementById('status').textContent = data.decode_status || '-';
@@ -4356,15 +4411,59 @@ async fn api_rig_config_handler(
             );
         }
     };
-    if !(0.1..=110.0).contains(&request.power_w) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiStatus {
-                ok: false,
-                message: "power must be between 0.1 and 110.0 W".to_string(),
-            }),
-        );
-    }
+    let power = if snapshot.rig_power_is_discrete {
+        if let Some(power_w) = request.power_w {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiStatus {
+                    ok: false,
+                    message: format!(
+                        "continuous watts are not valid for this rig ({power_w:.1} requested)"
+                    ),
+                }),
+            );
+        }
+        if let Some(setting_id) = request.power_setting_id.clone() {
+            if !snapshot.rig_power_settable {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ApiStatus {
+                        ok: false,
+                        message: "power setting is not CAT-settable on this rig".to_string(),
+                    }),
+                );
+            }
+            if !snapshot
+                .rig_power_settings
+                .iter()
+                .any(|setting| setting.id == setting_id)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiStatus {
+                        ok: false,
+                        message: "unknown power setting".to_string(),
+                    }),
+                );
+            }
+            Some(RigPowerRequest::SettingId(setting_id))
+        } else {
+            None
+        }
+    } else if let Some(power_w) = request.power_w {
+        if !(0.1..=110.0).contains(&power_w) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiStatus {
+                    ok: false,
+                    message: "power must be between 0.1 and 110.0 W".to_string(),
+                }),
+            );
+        }
+        Some(RigPowerRequest::ContinuousWatts(power_w))
+    } else {
+        None
+    };
     if snapshot.qso.active && snapshot.rig_band != band.to_string() {
         return (
             StatusCode::CONFLICT,
@@ -4385,7 +4484,7 @@ async fn api_rig_config_handler(
     }
     state.rig_control.enqueue(RigCommand::Configure {
         band,
-        power_w: request.power_w,
+        power,
         app_mode,
     });
     (
@@ -4788,20 +4887,82 @@ fn push_unique_info(values: &mut Vec<String>, value: String) {
     }
 }
 
+fn resolve_app_rig_kind(config: &AppConfig) -> Result<RigKind, AppError> {
+    resolve_rig_kind(
+        config
+            .rig
+            .as_ref()
+            .and_then(|rig| rig.kind.as_deref())
+            .map(str::parse)
+            .transpose()
+            .map_err(|error: String| {
+                AppError::Rig(rigctl::Error::Unsupported { operation: error })
+            })?,
+    )
+    .map_err(AppError::Rig)
+}
+
+fn connect_app_rig(config: &AppConfig, kind: RigKind) -> Result<Rig, AppError> {
+    Rig::connect(RigConnectionConfig {
+        kind,
+        port_path: config.rig.as_ref().and_then(|rig| rig.port_path.clone()),
+        timeout: rigctl::DEFAULT_TIMEOUT,
+    })
+    .map_err(AppError::Rig)
+}
+
+fn configured_input_device_override(config: &AppConfig) -> Option<&str> {
+    config
+        .rig
+        .as_ref()
+        .and_then(|rig| rig.input_device.as_deref())
+}
+
+fn configured_output_device_override(config: &AppConfig) -> Option<&str> {
+    config
+        .rig
+        .as_ref()
+        .and_then(|rig| rig.output_device.as_deref())
+        .or(config.tx.output_device.as_deref())
+}
+
+fn configured_power_request(config: &AppConfig, kind: RigKind) -> Option<RigPowerRequest> {
+    match kind {
+        RigKind::K3s => config
+            .rig
+            .as_ref()
+            .and_then(|rig| rig.power_w)
+            .or(config.tx.power_w)
+            .map(RigPowerRequest::ContinuousWatts),
+        RigKind::Mchf => config
+            .rig
+            .as_ref()
+            .and_then(|rig| rig.power_setting.clone())
+            .map(RigPowerRequest::SettingId),
+    }
+}
+
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let config = AppConfig::load(&cli.config)?;
     init_tracing(&config)?;
-    let audio = detect_k3s_audio_device(cli.device.as_deref())?;
+    let rig_kind = resolve_app_rig_kind(&config)?;
+    let audio = detect_audio_device_for_rig(
+        rig_kind,
+        cli.device
+            .as_deref()
+            .or(configured_input_device_override(&config)),
+    )?;
     let capture = SampleStream::start(audio.clone(), AudioStreamConfig::default())?;
-    let rig: SharedRig = Arc::new(Mutex::new(K3s::connect(K3sConfig::default()).ok()));
-    if let Some(power_w) = config.tx.power_w {
+    let rig: SharedRig = Arc::new(Mutex::new(Some(connect_app_rig(&config, rig_kind)?)));
+    if let Some(power) = configured_power_request(&config, rig_kind) {
         if let Some(rig_inner) = rig.lock().expect("rig mutex poisoned").as_mut() {
-            let _ = rig_inner.set_configured_power_w(power_w);
+            let _ = rig_inner.apply_power_request(&power);
         }
     }
     let tx_busy = Arc::new(AtomicBool::new(false));
     let tune_active = Arc::new(AtomicBool::new(false));
-    let output_device = detect_k3s_audio_output_device(config.tx.output_device.as_deref());
+    let output_device =
+        detect_audio_output_device_for_rig(rig_kind, configured_output_device_override(&config));
     let tx_backend: Box<dyn qso::TxBackend> = match &output_device {
         Ok(device) => Box::new(RigTxBackend::new(
             Arc::clone(&rig),
@@ -5044,10 +5205,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             match command {
                 RigCommand::Configure {
                     band,
-                    power_w,
+                    power,
                     app_mode,
                 } => {
-                    if let Err(error) = apply_rig_config(&rig, band, power_w, app_mode) {
+                    if let Err(error) = apply_rig_config(&rig, band, power, app_mode) {
                         display.decode_status = format!("Rig config failed: {error}");
                     } else {
                         let previous_band = display.rig.as_ref().map(|rig| rig.band.to_string());
@@ -5552,6 +5713,7 @@ fn refresh_web_snapshot(
     };
     guard.our_call = our_call.to_string();
     guard.rig_frequency_hz = display.rig.as_ref().map(|state| state.frequency_hz);
+    guard.rig_kind = display.rig.as_ref().map(|state| state.kind.to_string());
     guard.rig_mode = display
         .rig
         .as_ref()
@@ -5563,11 +5725,40 @@ fn refresh_web_snapshot(
         .map(|state| state.band.to_string())
         .unwrap_or_else(|| "unavailable".to_string());
     guard.app_mode = display.app_mode.as_str().to_uppercase();
-    guard.rig_power_w = display
+    let (
+        rig_power_w,
+        rig_power_label,
+        rig_power_current_id,
+        rig_power_settings,
+        rig_power_settable,
+        rig_power_is_discrete,
+    ) = display.rig.as_ref().map(rig_power_web_fields).unwrap_or((
+        None,
+        None,
+        None,
+        Vec::new(),
+        false,
+        false,
+    ));
+    guard.rig_power_w = rig_power_w;
+    guard.rig_power_label = rig_power_label;
+    guard.rig_power_current_id = rig_power_current_id;
+    guard.rig_power_settings = rig_power_settings;
+    guard.rig_power_settable = rig_power_settable;
+    guard.rig_power_is_discrete = rig_power_is_discrete;
+    guard.rig_bargraph = display.rig.as_ref().and_then(|state| state.bar_graph);
+    guard.rig_rx_s_meter = display
         .rig
         .as_ref()
-        .and_then(|state| state.configured_power_w);
-    guard.rig_bargraph = display.rig.as_ref().and_then(|state| state.bar_graph);
+        .and_then(|state| state.telemetry_rx_s_meter);
+    guard.rig_tx_forward_power_w = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.telemetry_tx_forward_power_w);
+    guard.rig_tx_swr = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.telemetry_tx_swr);
     guard.rig_is_tx = display.rig.as_ref().and_then(|state| state.transmitting);
     guard.rig_tune_active = tune_active;
     guard.decode_status = display.decode_status.clone();
@@ -5647,8 +5838,15 @@ fn refresh_web_snapshot(
 }
 
 fn run_oneshot(cli: Cli) -> Result<(), AppError> {
+    let config = AppConfig::load(&cli.config)?;
     let app_mode = DecoderMode::Ft8;
-    let audio = detect_k3s_audio_device(cli.device.as_deref())?;
+    let rig_kind = resolve_app_rig_kind(&config)?;
+    let audio = detect_audio_device_for_rig(
+        rig_kind,
+        cli.device
+            .as_deref()
+            .or(configured_input_device_override(&config)),
+    )?;
     let capture = SampleStream::start(audio.clone(), AudioStreamConfig::default())?;
     let target_slot = next_slot_boundary_for_mode(app_mode, SystemTime::now());
 
@@ -5692,21 +5890,80 @@ fn run_oneshot(cli: Cli) -> Result<(), AppError> {
     Ok(())
 }
 
-fn read_rig_snapshot(rig: &mut Option<K3s>) -> Option<RigSnapshot> {
+fn read_rig_snapshot(rig: &mut Option<Rig>) -> Option<RigSnapshot> {
     let rig = rig.as_mut()?;
+    let CommonRigSnapshot {
+        kind,
+        frequency_hz,
+        mode,
+        band,
+        transmitting,
+        telemetry,
+        power,
+    } = rig.read_snapshot().ok()?;
     Some(RigSnapshot {
-        frequency_hz: rig.get_frequency_hz().ok()?,
-        mode: rig.get_mode().ok()?,
-        band: rig.get_band().ok()?,
-        configured_power_w: rig.get_configured_power_w().ok(),
-        bar_graph: rig.get_bar_graph().ok().map(|reading| reading.level),
-        transmitting: rig.is_transmitting().ok(),
+        kind,
+        frequency_hz,
+        mode,
+        band,
+        power,
+        bar_graph: telemetry.bar_graph,
+        telemetry_rx_s_meter: telemetry.rx_s_meter,
+        telemetry_tx_forward_power_w: telemetry.tx_forward_power_w,
+        telemetry_tx_swr: telemetry.tx_swr,
+        transmitting: Some(transmitting),
     })
 }
 
 fn read_rig_snapshot_shared(rig: &SharedRig) -> Option<RigSnapshot> {
     let mut guard = rig.lock().expect("rig mutex poisoned");
     read_rig_snapshot(&mut guard)
+}
+
+fn rig_power_web_fields(
+    state: &RigSnapshot,
+) -> (
+    Option<f32>,
+    Option<String>,
+    Option<String>,
+    Vec<WebRigPowerSetting>,
+    bool,
+    bool,
+) {
+    match &state.power {
+        RigPowerState::Continuous { current_watts, .. } => (
+            *current_watts,
+            current_watts.map(|watts| format!("{watts:.1} W")),
+            None,
+            Vec::new(),
+            true,
+            false,
+        ),
+        RigPowerState::Discrete {
+            current_id,
+            current_label,
+            settings,
+            can_set,
+        } => (
+            settings
+                .iter()
+                .find(|setting| current_id.as_deref() == Some(setting.id.as_str()))
+                .and_then(|setting| setting.nominal_watts),
+            current_label.clone(),
+            current_id.clone(),
+            settings
+                .iter()
+                .cloned()
+                .map(|setting| WebRigPowerSetting {
+                    id: setting.id,
+                    label: setting.label,
+                    nominal_watts: setting.nominal_watts,
+                })
+                .collect(),
+            *can_set,
+            true,
+        ),
+    }
 }
 
 fn calling_frequency_hz(band: Band, app_mode: DecoderMode) -> u64 {
@@ -5742,7 +5999,7 @@ fn calling_frequency_hz(band: Band, app_mode: DecoderMode) -> u64 {
 fn apply_rig_config(
     rig: &SharedRig,
     band: Band,
-    power_w: f32,
+    power: Option<RigPowerRequest>,
     app_mode: DecoderMode,
 ) -> Result<(), AppError> {
     let mut guard = rig.lock().expect("rig mutex poisoned");
@@ -5752,13 +6009,14 @@ fn apply_rig_config(
             "rig unavailable",
         ))
     })?;
-    rig.set_band(band)?;
     let frequency_hz = calling_frequency_hz(band, app_mode);
     if frequency_hz > 0 {
         rig.set_frequency_hz(frequency_hz)?;
     }
     rig.set_mode(RigMode::Data)?;
-    rig.set_configured_power_w(power_w)?;
+    if let Some(power) = power.as_ref() {
+        rig.apply_power_request(power)?;
+    }
     Ok(())
 }
 
@@ -5798,9 +6056,14 @@ fn run_tune_thread(
         let rig = guard
             .as_mut()
             .ok_or_else(|| "rig unavailable".to_string())?;
-        let original_meter_mode = rig.get_tx_meter_mode().unwrap_or(TxMeterMode::Rf);
-        rig.set_tx_meter_mode(TxMeterMode::Rf)
-            .map_err(|error| error.to_string())?;
+        let original_meter_mode = if let Rig::K3s(k3) = rig {
+            let original = k3.get_tx_meter_mode().unwrap_or(TxMeterMode::Rf);
+            k3.set_tx_meter_mode(TxMeterMode::Rf)
+                .map_err(|error| error.to_string())?;
+            Some(original)
+        } else {
+            None
+        };
         rig.enter_tx().map_err(|error| error.to_string())?;
         original_meter_mode
     };
@@ -5820,8 +6083,12 @@ fn run_tune_thread(
             .as_mut()
             .ok_or_else(|| "rig unavailable".to_string())?;
         rig.enter_rx().map_err(|error| error.to_string())?;
-        rig.set_tx_meter_mode(original_meter_mode)
-            .map_err(|error| error.to_string())
+        if let (Rig::K3s(k3), Some(original_meter_mode)) = (rig, original_meter_mode) {
+            k3.set_tx_meter_mode(original_meter_mode)
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        }
     };
 
     playback_result
@@ -6035,6 +6302,11 @@ fn render(display: &DisplayState) {
         .as_ref()
         .map(|state| state.mode.to_string())
         .unwrap_or_else(|| "unavailable".to_string());
+    let rig_kind = display
+        .rig
+        .as_ref()
+        .map(|state| state.kind.to_string())
+        .unwrap_or_else(|| "?".to_string());
     let rig_band = display
         .rig
         .as_ref()
@@ -6049,8 +6321,14 @@ fn render(display: &DisplayState) {
     let rig_power = display
         .rig
         .as_ref()
-        .and_then(|state| state.configured_power_w)
-        .map(|watts| format!("{watts:.1}W"))
+        .map(|state| match &state.power {
+            RigPowerState::Continuous { current_watts, .. } => current_watts
+                .map(|watts| format!("{watts:.1}W"))
+                .unwrap_or_else(|| "-".to_string()),
+            RigPowerState::Discrete { current_label, .. } => {
+                current_label.clone().unwrap_or_else(|| "-".to_string())
+            }
+        })
         .unwrap_or_else(|| "-".to_string());
     let rig_bargraph = display
         .rig
@@ -6084,14 +6362,27 @@ fn render(display: &DisplayState) {
     );
     let _ = writeln!(
         output,
-        "Rig      {}  {}  {}  {}  {}  P={}  BG={}",
+        "Rig      {}  {}  {}  {}  {}  {}  P={}  BG={}{}{}",
         rig_frequency,
+        rig_kind,
         rig_mode,
         display.app_mode.as_str().to_uppercase(),
         rig_band,
         rig_direction,
         rig_power,
-        rig_bargraph
+        rig_bargraph,
+        display
+            .rig
+            .as_ref()
+            .and_then(|state| state.telemetry_rx_s_meter)
+            .map(|value| format!("  S={value:.1}"))
+            .unwrap_or_default(),
+        display
+            .rig
+            .as_ref()
+            .and_then(|state| state.telemetry_tx_swr)
+            .map(|value| format!("  SWR={value:.1}"))
+            .unwrap_or_default()
     );
     let _ = writeln!(
         output,
@@ -8088,8 +8379,8 @@ fn build_bandmap_grid(
 mod tests {
     use super::*;
     use crate::config::{
-        FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds, StationConfig,
-        TxConfig,
+        FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds, RigConfig,
+        StationConfig, TxConfig,
     };
     use crate::qso::{SlotFamily, TxBackend};
 
@@ -8099,6 +8390,7 @@ mod tests {
                 our_call: "N1VF".to_string(),
                 our_grid: "CM97".to_string(),
             },
+            rig: None,
             tx: TxConfig {
                 base_freq_hz: 1000.0,
                 drive_level: 0.28,
@@ -8153,6 +8445,32 @@ mod tests {
                 app_log_path: "logs/test-ft8rx.log".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn configured_power_request_uses_continuous_k3s_power() {
+        let config = sample_app_config();
+        assert_eq!(
+            configured_power_request(&config, RigKind::K3s),
+            Some(RigPowerRequest::ContinuousWatts(20.0))
+        );
+    }
+
+    #[test]
+    fn configured_power_request_uses_discrete_mchf_setting() {
+        let mut config = sample_app_config();
+        config.rig = Some(RigConfig {
+            kind: Some("mchf".to_string()),
+            port_path: None,
+            input_device: None,
+            output_device: None,
+            power_setting: Some("2w".to_string()),
+            power_w: None,
+        });
+        assert_eq!(
+            configured_power_request(&config, RigKind::Mchf),
+            Some(RigPowerRequest::SettingId("2w".to_string()))
+        );
     }
 
     fn standard_call(callsign: &str) -> StructuredCallField {

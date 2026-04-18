@@ -4,7 +4,7 @@ use ft8_decoder::{
     DecodeStage, Mode, ReplyWord, StructuredInfoValue, StructuredMessage, TxDirectedPayload,
     TxMessage, WaveformOptions, synthesize_tx_message,
 };
-use rigctl::K3s;
+use rigctl::Rig;
 use rigctl::audio::{AudioDevice, PreparedMonoPlaybackWriter, prepare_mono_playback_writer};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -1948,7 +1948,7 @@ pub(crate) trait TxBackend: Send {
 }
 
 pub struct RigTxBackend {
-    rig: Arc<Mutex<Option<K3s>>>,
+    rig: Arc<Mutex<Option<Rig>>>,
     output_device: AudioDevice,
     tx_busy: Arc<AtomicBool>,
     active: bool,
@@ -1959,7 +1959,7 @@ pub struct RigTxBackend {
 
 impl RigTxBackend {
     pub fn new(
-        rig: Arc<Mutex<Option<K3s>>>,
+        rig: Arc<Mutex<Option<Rig>>>,
         output_device: AudioDevice,
         tx_busy: Arc<AtomicBool>,
     ) -> Self {
@@ -2646,7 +2646,7 @@ fn to_us_priority(event: ToUsEvent, state: QsoState) -> u8 {
 }
 
 fn run_tx_thread(
-    rig: Arc<Mutex<Option<K3s>>>,
+    rig: Arc<Mutex<Option<Rig>>>,
     output_device: AudioDevice,
     request: TxRequest,
     sample_rate_hz: u32,
@@ -2773,15 +2773,9 @@ fn run_tx_playback_phase<W: TxPlaybackWriter>(
     );
 
     match playback_result {
-        Ok(()) if cancel.load(Ordering::Relaxed) => {
-            Ok(completed_request)
-        }
-        Ok(()) => {
-            Ok(completed_request)
-        }
-        Err(error) => {
-            Err((completed_request, error))
-        }
+        Ok(()) if cancel.load(Ordering::Relaxed) => Ok(completed_request),
+        Ok(()) => Ok(completed_request),
+        Err(error) => Err((completed_request, error)),
     }
 }
 
@@ -2934,15 +2928,15 @@ fn wait_until(target: SystemTime, cancel: &AtomicBool) -> bool {
     }
 }
 
-fn force_rx(rig: &Arc<Mutex<Option<K3s>>>) {
+fn force_rx(rig: &Arc<Mutex<Option<Rig>>>) {
     if let Err(error) = with_rig(rig, |rig| rig.enter_rx()) {
         error!(message = %error, "force_rx_failed");
     }
 }
 
 fn with_rig<T>(
-    rig: &Arc<Mutex<Option<K3s>>>,
-    f: impl FnOnce(&mut K3s) -> Result<T, rigctl::Error>,
+    rig: &Arc<Mutex<Option<Rig>>>,
+    f: impl FnOnce(&mut Rig) -> Result<T, rigctl::Error>,
 ) -> Result<T, String> {
     let mut guard = rig.lock().expect("rig mutex poisoned");
     let rig = guard
@@ -3281,6 +3275,7 @@ mod tests {
                 our_call: "N1VF".to_string(),
                 our_grid: "CM97".to_string(),
             },
+            rig: None,
             tx: TxConfig {
                 base_freq_hz: 1000.0,
                 drive_level: 0.12,
@@ -4102,10 +4097,8 @@ mod tests {
             rx_slot_start + Duration::from_secs(15),
         ));
 
-        let launch_time = tx_key_time_for_slot(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
-            Mode::Ft8,
-        );
+        let launch_time =
+            tx_key_time_for_slot(SystemTime::UNIX_EPOCH + Duration::from_secs(60), Mode::Ft8);
         controller.tick(launch_time);
         backend_state
             .lock()

@@ -1,3 +1,5 @@
+mod mchf;
+
 pub mod audio {
     pub use audiolib::{
         AudioDevice, AudioStreamConfig, CaptureStats, Error, PreparedMonoPlayback,
@@ -6,6 +8,11 @@ pub mod audio {
         prepare_mono_playback, prepare_mono_playback_writer,
     };
 }
+
+pub use mchf::{
+    DEFAULT_MCHF_AUDIO_HINTS, DEFAULT_MCHF_PORT, MCHF_BAUD_RATE, Mchf, MchfConfig,
+    decode_ft817_frequency_hz, decode_ft817_mode, encode_ft817_frequency_hz, encode_ft817_mode,
+};
 
 use serialport::{ClearBuffer, SerialPort};
 use std::fmt;
@@ -34,9 +41,51 @@ pub enum Error {
     UnexpectedResponse { command: String, response: String },
     #[error("invalid frequency {0} Hz")]
     InvalidFrequency(u64),
+    #[error("unsupported operation: {operation}")]
+    Unsupported { operation: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RigKind {
+    K3s,
+    Mchf,
+}
+
+impl RigKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::K3s => "k3s",
+            Self::Mchf => "mchf",
+        }
+    }
+
+    pub fn audio_hints(self) -> &'static [&'static str] {
+        match self {
+            Self::K3s => DEFAULT_K3S_AUDIO_HINTS,
+            Self::Mchf => DEFAULT_MCHF_AUDIO_HINTS,
+        }
+    }
+}
+
+impl fmt::Display for RigKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RigKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "k3s" | "k3" => Ok(Self::K3s),
+            "mchf" => Ok(Self::Mchf),
+            other => Err(format!("unsupported rig kind: {other}")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -161,6 +210,23 @@ impl Band {
             9 => Self::M10,
             10 => Self::M6,
             16..=24 => Self::Xvtr(number - 15),
+            _ => return None,
+        })
+    }
+
+    pub fn from_frequency_hz(frequency_hz: u64) -> Option<Self> {
+        Some(match frequency_hz {
+            1_800_000..=2_000_000 => Self::M160,
+            3_500_000..=4_000_000 => Self::M80,
+            5_000_000..=5_600_000 => Self::M60,
+            7_000_000..=7_300_000 => Self::M40,
+            10_000_000..=10_200_000 => Self::M30,
+            14_000_000..=14_400_000 => Self::M20,
+            18_000_000..=18_300_000 => Self::M17,
+            21_000_000..=21_500_000 => Self::M15,
+            24_800_000..=25_000_000 => Self::M12,
+            28_000_000..=29_800_000 => Self::M10,
+            50_000_000..=54_000_000 => Self::M6,
             _ => return None,
         })
     }
@@ -304,6 +370,103 @@ pub struct RigState {
     pub band: Band,
     pub antenna: Antenna,
     pub signal: SignalLevel,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RigPowerSetting {
+    pub id: String,
+    pub label: String,
+    pub nominal_watts: Option<f32>,
+}
+
+impl RigPowerSetting {
+    pub fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        nominal_watts: Option<f32>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            nominal_watts,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RigPowerState {
+    Continuous {
+        current_watts: Option<f32>,
+        min_watts: f32,
+        max_watts: f32,
+    },
+    Discrete {
+        current_id: Option<String>,
+        current_label: Option<String>,
+        settings: Vec<RigPowerSetting>,
+        can_set: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RigTelemetry {
+    pub rx_s_meter: Option<f32>,
+    pub tx_forward_power_w: Option<f32>,
+    pub tx_swr: Option<f32>,
+    pub tx_alc: Option<f32>,
+    pub bar_graph: Option<u8>,
+}
+
+impl Default for RigTelemetry {
+    fn default() -> Self {
+        Self {
+            rx_s_meter: None,
+            tx_forward_power_w: None,
+            tx_swr: None,
+            tx_alc: None,
+            bar_graph: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RigSnapshot {
+    pub kind: RigKind,
+    pub frequency_hz: u64,
+    pub mode: Mode,
+    pub band: Band,
+    pub transmitting: bool,
+    pub telemetry: RigTelemetry,
+    pub power: RigPowerState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RigPowerRequest {
+    ContinuousWatts(f32),
+    SettingId(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct DetectedRig {
+    pub kind: RigKind,
+    pub port_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct RigConnectionConfig {
+    pub kind: RigKind,
+    pub port_path: Option<PathBuf>,
+    pub timeout: Duration,
+}
+
+impl RigConnectionConfig {
+    pub fn default_for(kind: RigKind) -> Self {
+        Self {
+            kind,
+            port_path: None,
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -561,25 +724,242 @@ impl K3s {
     }
 }
 
-pub fn detect_k3s_audio_device(override_spec: Option<&str>) -> audio::Result<audio::AudioDevice> {
-    if let Some(spec) = override_spec {
-        return Ok(audio::AudioDevice {
-            name: spec.to_string(),
-            spec: spec.to_string(),
-            description: None,
-        });
+pub enum Rig {
+    K3s(K3s),
+    Mchf(Mchf),
+}
+
+impl Rig {
+    pub fn connect(config: RigConnectionConfig) -> Result<Self> {
+        let port_path = config
+            .port_path
+            .unwrap_or_else(|| default_port_for_kind(config.kind));
+        match config.kind {
+            RigKind::K3s => Ok(Self::K3s(K3s::connect(K3sConfig {
+                port_path,
+                timeout: config.timeout,
+                ..K3sConfig::default()
+            })?)),
+            RigKind::Mchf => Ok(Self::Mchf(Mchf::connect(MchfConfig {
+                port_path,
+                timeout: config.timeout,
+                ..MchfConfig::default()
+            })?)),
+        }
     }
 
-    let devices = audio::list_input_devices()?;
+    pub fn kind(&self) -> RigKind {
+        match self {
+            Self::K3s(_) => RigKind::K3s,
+            Self::Mchf(_) => RigKind::Mchf,
+        }
+    }
+
+    pub fn get_frequency_hz(&mut self) -> Result<u64> {
+        match self {
+            Self::K3s(rig) => rig.get_frequency_hz(),
+            Self::Mchf(rig) => rig.get_frequency_hz(),
+        }
+    }
+
+    pub fn set_frequency_hz(&mut self, frequency_hz: u64) -> Result<()> {
+        match self {
+            Self::K3s(rig) => rig.set_frequency_hz(frequency_hz),
+            Self::Mchf(rig) => rig.set_frequency_hz(frequency_hz),
+        }
+    }
+
+    pub fn get_mode(&mut self) -> Result<Mode> {
+        match self {
+            Self::K3s(rig) => rig.get_mode(),
+            Self::Mchf(rig) => rig.get_mode(),
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) -> Result<()> {
+        match self {
+            Self::K3s(rig) => rig.set_mode(mode),
+            Self::Mchf(rig) => rig.set_mode(mode),
+        }
+    }
+
+    pub fn get_band(&mut self) -> Result<Band> {
+        match self {
+            Self::K3s(rig) => rig.get_band(),
+            Self::Mchf(rig) => rig.get_band(),
+        }
+    }
+
+    pub fn is_transmitting(&mut self) -> Result<bool> {
+        match self {
+            Self::K3s(rig) => rig.is_transmitting(),
+            Self::Mchf(rig) => rig.is_transmitting(),
+        }
+    }
+
+    pub fn enter_tx(&mut self) -> Result<()> {
+        match self {
+            Self::K3s(rig) => rig.enter_tx(),
+            Self::Mchf(rig) => rig.enter_tx(),
+        }
+    }
+
+    pub fn enter_rx(&mut self) -> Result<()> {
+        match self {
+            Self::K3s(rig) => rig.enter_rx(),
+            Self::Mchf(rig) => rig.enter_rx(),
+        }
+    }
+
+    pub fn power_state(&mut self) -> Result<RigPowerState> {
+        match self {
+            Self::K3s(rig) => Ok(RigPowerState::Continuous {
+                current_watts: rig.get_configured_power_w().ok(),
+                min_watts: 0.1,
+                max_watts: 110.0,
+            }),
+            Self::Mchf(rig) => rig.power_state(),
+        }
+    }
+
+    pub fn apply_power_request(&mut self, request: &RigPowerRequest) -> Result<()> {
+        match (self, request) {
+            (Self::K3s(rig), RigPowerRequest::ContinuousWatts(watts)) => {
+                rig.set_configured_power_w(*watts)
+            }
+            (Self::Mchf(rig), RigPowerRequest::SettingId(setting_id)) => {
+                rig.set_power_setting(setting_id)
+            }
+            (Self::K3s(_), RigPowerRequest::SettingId(_)) => Err(Error::Unsupported {
+                operation: "discrete power setting on K3S".to_string(),
+            }),
+            (Self::Mchf(_), RigPowerRequest::ContinuousWatts(_)) => Err(Error::Unsupported {
+                operation: "continuous watt power request on mcHF".to_string(),
+            }),
+        }
+    }
+
+    pub fn read_snapshot(&mut self) -> Result<RigSnapshot> {
+        let frequency_hz = self.get_frequency_hz()?;
+        let mode = self.get_mode()?;
+        let band = self.get_band().or_else(|_| {
+            Band::from_frequency_hz(frequency_hz).ok_or(Error::UnexpectedResponse {
+                command: "band_from_frequency".to_string(),
+                response: format!("unsupported frequency {frequency_hz}"),
+            })
+        })?;
+        let transmitting = self.is_transmitting()?;
+        let telemetry = match self {
+            Self::K3s(rig) => RigTelemetry {
+                rx_s_meter: None,
+                tx_forward_power_w: rig.get_tx_output_power_w().ok(),
+                tx_swr: rig.get_last_tx_swr().ok(),
+                tx_alc: None,
+                bar_graph: rig.get_bar_graph().ok().map(|reading| reading.level),
+            },
+            Self::Mchf(rig) => rig.read_telemetry()?,
+        };
+        let power = self.power_state()?;
+        Ok(RigSnapshot {
+            kind: self.kind(),
+            frequency_hz,
+            mode,
+            band,
+            transmitting,
+            telemetry,
+            power,
+        })
+    }
+}
+
+pub fn detect_attached_rigs() -> Vec<DetectedRig> {
+    let mut detected = Vec::new();
+    let serial_dir = Path::new("/dev/serial/by-id");
+    let Ok(entries) = std::fs::read_dir(serial_dir) else {
+        return detected;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        let kind = if lower.contains("mchf") {
+            Some(RigKind::Mchf)
+        } else if lower.contains("ft232")
+            || lower.contains("elecraft")
+            || lower.contains("ak04x2po")
+        {
+            Some(RigKind::K3s)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            detected.push(DetectedRig {
+                kind,
+                port_path: path,
+            });
+        }
+    }
+    detected.sort_by(|left, right| left.port_path.cmp(&right.port_path));
+    detected
+}
+
+pub fn default_port_for_kind(kind: RigKind) -> PathBuf {
+    match kind {
+        RigKind::K3s => {
+            if Path::new(DEFAULT_K3S_PORT).exists() {
+                PathBuf::from(DEFAULT_K3S_PORT)
+            } else {
+                PathBuf::from("/dev/ttyUSB0")
+            }
+        }
+        RigKind::Mchf => {
+            if Path::new(DEFAULT_MCHF_PORT).exists() {
+                PathBuf::from(DEFAULT_MCHF_PORT)
+            } else {
+                PathBuf::from("/dev/ttyACM0")
+            }
+        }
+    }
+}
+
+pub fn resolve_rig_kind(explicit_kind: Option<RigKind>) -> Result<RigKind> {
+    if let Some(kind) = explicit_kind {
+        return Ok(kind);
+    }
+    resolve_rig_kind_from_detected(detect_attached_rigs().iter().map(|entry| entry.kind))
+}
+
+fn resolve_rig_kind_from_detected(
+    detected_kinds: impl IntoIterator<Item = RigKind>,
+) -> Result<RigKind> {
+    let mut kinds = detected_kinds.into_iter().collect::<Vec<_>>();
+    kinds.sort_by_key(|kind| kind.as_str().to_string());
+    kinds.dedup();
+    match kinds.as_slice() {
+        [kind] => Ok(*kind),
+        [] => Err(Error::Unsupported {
+            operation: "no supported rigs detected".to_string(),
+        }),
+        _ => Err(Error::Unsupported {
+            operation: "multiple supported rigs detected; configure rig.kind explicitly"
+                .to_string(),
+        }),
+    }
+}
+
+fn detect_audio_device_with_predicate(
+    devices: Vec<audio::AudioDevice>,
+    missing_message: &str,
+    mut predicate: impl FnMut(&audio::AudioDevice, &str) -> bool,
+) -> audio::Result<audio::AudioDevice> {
     let mut best = None;
     for device in devices {
         let desc = device.description.as_deref().unwrap_or_default();
-        let looks_like_codec = device.spec.contains("CARD=CODEC")
-            || device.name.contains("USB Audio CODEC")
-            || desc.contains("USB Audio CODEC");
-        let looks_like_device0 = device.spec.contains("DEV=0");
+        let looks_like_match = predicate(&device, desc);
         let looks_like_pcm = device.spec.starts_with("plughw:") || device.spec.starts_with("hw:");
-        if looks_like_codec && looks_like_device0 && looks_like_pcm {
+        if looks_like_match && looks_like_pcm {
             if device.spec.starts_with("plughw:") {
                 return Ok(device);
             }
@@ -587,10 +967,47 @@ pub fn detect_k3s_audio_device(override_spec: Option<&str>) -> audio::Result<aud
         }
     }
 
-    best.ok_or_else(|| audio::Error::CaptureInit("K3S audio capture device not found".to_string()))
+    best.ok_or_else(|| audio::Error::CaptureInit(missing_message.to_string()))
 }
 
-pub fn detect_k3s_audio_output_device(
+pub fn detect_audio_device_for_rig(
+    kind: RigKind,
+    override_spec: Option<&str>,
+) -> audio::Result<audio::AudioDevice> {
+    if let Some(spec) = override_spec {
+        return Ok(audio::AudioDevice {
+            name: spec.to_string(),
+            spec: spec.to_string(),
+            description: None,
+        });
+    }
+    detect_audio_device_with_predicate(
+        audio::list_input_devices()?,
+        match kind {
+            RigKind::K3s => "K3S audio capture device not found",
+            RigKind::Mchf => "mcHF audio capture device not found",
+        },
+        |device, desc| match kind {
+            RigKind::K3s => {
+                let looks_like_codec = device.spec.contains("CARD=CODEC")
+                    || device.name.contains("USB Audio CODEC")
+                    || desc.contains("USB Audio CODEC");
+                looks_like_codec && device.spec.contains("DEV=0")
+            }
+            RigKind::Mchf => {
+                let looks_like_mchf = device.spec.contains("CARD=mchf")
+                    || device.name.contains("USB Interface mchf")
+                    || desc.contains("USB Interface mchf")
+                    || device.name.contains("mchf")
+                    || desc.contains("mchf");
+                looks_like_mchf && device.spec.contains("DEV=0")
+            }
+        },
+    )
+}
+
+pub fn detect_audio_output_device_for_rig(
+    kind: RigKind,
     override_spec: Option<&str>,
 ) -> audio::Result<audio::AudioDevice> {
     if let Some(spec) = override_spec {
@@ -601,24 +1018,39 @@ pub fn detect_k3s_audio_output_device(
         });
     }
 
-    let devices = audio::list_output_devices()?;
-    let mut best = None;
-    for device in devices {
-        let desc = device.description.as_deref().unwrap_or_default();
-        let looks_like_codec = device.spec.contains("CARD=CODEC")
-            || device.name.contains("USB Audio CODEC")
-            || desc.contains("USB Audio CODEC");
-        let looks_like_device0 = device.spec.contains("DEV=0");
-        let looks_like_pcm = device.spec.starts_with("plughw:") || device.spec.starts_with("hw:");
-        if looks_like_codec && looks_like_device0 && looks_like_pcm {
-            if device.spec.starts_with("plughw:") {
-                return Ok(device);
+    detect_audio_device_with_predicate(
+        audio::list_output_devices()?,
+        match kind {
+            RigKind::K3s => "K3S audio playback device not found",
+            RigKind::Mchf => "mcHF audio playback device not found",
+        },
+        |device, desc| match kind {
+            RigKind::K3s => {
+                let looks_like_codec = device.spec.contains("CARD=CODEC")
+                    || device.name.contains("USB Audio CODEC")
+                    || desc.contains("USB Audio CODEC");
+                looks_like_codec && device.spec.contains("DEV=0")
             }
-            best = Some(device);
-        }
-    }
+            RigKind::Mchf => {
+                let looks_like_mchf = device.spec.contains("CARD=mchf")
+                    || device.name.contains("USB Interface mchf")
+                    || desc.contains("USB Interface mchf")
+                    || device.name.contains("mchf")
+                    || desc.contains("mchf");
+                looks_like_mchf && device.spec.contains("DEV=0")
+            }
+        },
+    )
+}
 
-    best.ok_or_else(|| audio::Error::CaptureInit("K3S audio playback device not found".to_string()))
+pub fn detect_k3s_audio_device(override_spec: Option<&str>) -> audio::Result<audio::AudioDevice> {
+    detect_audio_device_for_rig(RigKind::K3s, override_spec)
+}
+
+pub fn detect_k3s_audio_output_device(
+    override_spec: Option<&str>,
+) -> audio::Result<audio::AudioDevice> {
+    detect_audio_output_device_for_rig(RigKind::K3s, override_spec)
 }
 
 fn parse_prefixed_u64(prefix: &str, response: &str) -> Result<u64> {
@@ -762,5 +1194,34 @@ mod tests {
         assert_eq!(parse_prefixed_u8("TQ", "TQ0;").unwrap(), 0);
         assert_eq!(parse_prefixed_u16("SW", "SW015;").unwrap(), 15);
         assert_eq!(parse_prefixed_u16("PO", "PO050;").unwrap(), 50);
+    }
+
+    #[test]
+    fn derives_band_from_frequency() {
+        assert_eq!(Band::from_frequency_hz(14_074_000), Some(Band::M20));
+        assert_eq!(Band::from_frequency_hz(7_047_500), Some(Band::M40));
+        assert_eq!(Band::from_frequency_hz(999_999), None);
+    }
+
+    #[test]
+    fn parses_rig_kind() {
+        assert_eq!("k3s".parse::<RigKind>().unwrap(), RigKind::K3s);
+        assert_eq!("mchf".parse::<RigKind>().unwrap(), RigKind::Mchf);
+    }
+
+    #[test]
+    fn resolve_rig_kind_from_detected_fails_closed_when_ambiguous() {
+        assert!(matches!(
+            resolve_rig_kind_from_detected([RigKind::K3s, RigKind::Mchf]),
+            Err(Error::Unsupported { .. })
+        ));
+        assert!(matches!(
+            resolve_rig_kind_from_detected(std::iter::empty()),
+            Err(Error::Unsupported { .. })
+        ));
+        assert_eq!(
+            resolve_rig_kind_from_detected([RigKind::Mchf]).unwrap(),
+            RigKind::Mchf
+        );
     }
 }

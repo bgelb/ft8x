@@ -1,15 +1,15 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use rigctl::{Antenna, Band, K3s, K3sConfig, Mode};
+use rigctl::{Antenna, Band, Mode, Rig, RigConnectionConfig, RigKind, resolve_rig_kind};
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Minimal K3S rig control CLI")]
+#[command(author, version, about = "Minimal rig control CLI")]
 struct Cli {
     #[arg(long)]
+    rig: Option<RigKind>,
+    #[arg(long)]
     port: Option<PathBuf>,
-    #[arg(long, default_value_t = rigctl::K3S_BAUD_RATE)]
-    baud: u32,
     #[arg(long, default_value_t = 500)]
     timeout_ms: u64,
     #[command(subcommand)]
@@ -70,47 +70,54 @@ impl std::str::FromStr for AntennaArg {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let mut config = K3sConfig::default();
-    config.baud_rate = cli.baud;
-    config.timeout = Duration::from_millis(cli.timeout_ms);
-    if let Some(port) = cli.port {
-        config.port_path = port;
-    }
-
-    let mut rig = K3s::connect(config)?;
+    let kind = resolve_rig_kind(cli.rig)?;
+    let mut rig = Rig::connect(RigConnectionConfig {
+        kind,
+        port_path: cli.port,
+        timeout: Duration::from_millis(cli.timeout_ms),
+    })?;
 
     match cli.command {
         Command::Get { field } => match field {
             GetField::All => {
-                let state = rig.read_state()?;
+                let state = rig.read_snapshot()?;
+                println!("kind={}", state.kind);
                 println!("frequency_hz={}", state.frequency_hz);
                 println!("mode={}", state.mode);
                 println!("band={}", state.band);
-                println!("antenna={}", state.antenna);
-                println!("signal_coarse={}", state.signal.coarse);
-                if let Some(high_res) = state.signal.high_res {
-                    println!("signal_high_res={high_res}");
-                }
-                if let Some(bar_graph) = state.signal.bar_graph {
+                println!("transmitting={}", state.transmitting);
+                if let Some(bar_graph) = state.telemetry.bar_graph {
                     println!("signal_bar_graph={bar_graph}");
                 }
-                println!("receiving={}", state.signal.receiving);
+                if let Some(rx_s) = state.telemetry.rx_s_meter {
+                    println!("rx_s_meter={rx_s:.1}");
+                }
+                if let Some(fwd) = state.telemetry.tx_forward_power_w {
+                    println!("tx_forward_power_w={fwd:.1}");
+                }
+                if let Some(swr) = state.telemetry.tx_swr {
+                    println!("tx_swr={swr:.1}");
+                }
+                if let Rig::K3s(k3) = &mut rig {
+                    println!("antenna={}", k3.get_antenna()?);
+                }
             }
             GetField::Frequency => println!("{}", rig.get_frequency_hz()?),
             GetField::Mode => println!("{}", rig.get_mode()?),
             GetField::Band => println!("{}", rig.get_band()?),
             GetField::Signal => {
-                let signal = rig.get_signal_level()?;
-                println!("coarse={}", signal.coarse);
-                if let Some(high_res) = signal.high_res {
-                    println!("high_res={high_res}");
+                let signal = rig.read_snapshot()?.telemetry;
+                if let Some(rx_s) = signal.rx_s_meter {
+                    println!("rx_s_meter={rx_s:.1}");
                 }
                 if let Some(bar_graph) = signal.bar_graph {
                     println!("bar_graph={bar_graph}");
                 }
-                println!("receiving={}", signal.receiving);
             }
-            GetField::Antenna => println!("{}", rig.get_antenna()?),
+            GetField::Antenna => match &mut rig {
+                Rig::K3s(k3) => println!("{}", k3.get_antenna()?),
+                Rig::Mchf(_) => return Err("antenna query is not supported on mcHF".into()),
+            },
         },
         Command::Set { field } => match field {
             SetField::Frequency { hz } => {
@@ -123,13 +130,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             SetField::Band { band } => {
                 let band: Band = band.parse()?;
-                rig.set_band(band)?;
+                let frequency = match band {
+                    Band::M160 => 1_840_000,
+                    Band::M80 => 3_573_000,
+                    Band::M60 => 5_357_000,
+                    Band::M40 => 7_074_000,
+                    Band::M30 => 10_136_000,
+                    Band::M20 => 14_074_000,
+                    Band::M17 => 18_100_000,
+                    Band::M15 => 21_074_000,
+                    Band::M12 => 24_915_000,
+                    Band::M10 => 28_074_000,
+                    Band::M6 => 50_313_000,
+                    Band::Xvtr(_) => return Err("xvtr band set is not supported here".into()),
+                };
+                rig.set_frequency_hz(frequency)?;
                 println!("{}", rig.get_band()?);
             }
-            SetField::Antenna { antenna } => {
-                rig.set_antenna(antenna.0)?;
-                println!("{}", rig.get_antenna()?);
-            }
+            SetField::Antenna { antenna } => match &mut rig {
+                Rig::K3s(k3) => {
+                    k3.set_antenna(antenna.0)?;
+                    println!("{}", k3.get_antenna()?);
+                }
+                Rig::Mchf(_) => return Err("antenna selection is not supported on mcHF".into()),
+            },
         },
     }
 
