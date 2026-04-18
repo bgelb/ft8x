@@ -4482,6 +4482,15 @@ async fn api_rig_config_handler(
             }),
         );
     }
+    info!(
+        requested_band = %band,
+        requested_app_mode = %app_mode.as_str().to_uppercase(),
+        requested_power = ?power,
+        current_rig_kind = ?snapshot.rig_kind,
+        current_band = %snapshot.rig_band,
+        current_frequency_hz = ?snapshot.rig_frequency_hz,
+        "rig_config_request_queued"
+    );
     state.rig_control.enqueue(RigCommand::Configure {
         band,
         power,
@@ -6009,13 +6018,53 @@ fn apply_rig_config(
             "rig unavailable",
         ))
     })?;
+    let before_snapshot = rig.read_snapshot().ok();
     let frequency_hz = calling_frequency_hz(band, app_mode);
+    info!(
+        rig_kind = %rig.kind(),
+        target_band = %band,
+        target_frequency_hz = frequency_hz,
+        target_app_mode = %app_mode.as_str().to_uppercase(),
+        requested_power = ?power,
+        before_frequency_hz = before_snapshot.as_ref().map(|snapshot| snapshot.frequency_hz),
+        before_band = before_snapshot.as_ref().map(|snapshot| snapshot.band.to_string()),
+        before_mode = before_snapshot.as_ref().map(|snapshot| snapshot.mode.to_string()),
+        "rig_config_apply_begin"
+    );
     if frequency_hz > 0 {
         rig.set_frequency_hz(frequency_hz)?;
     }
     rig.set_mode(RigMode::Data)?;
     if let Some(power) = power.as_ref() {
         rig.apply_power_request(power)?;
+    }
+    match rig.read_snapshot() {
+        Ok(after_snapshot) => {
+            info!(
+                rig_kind = %after_snapshot.kind,
+                target_band = %band,
+                target_frequency_hz = frequency_hz,
+                after_frequency_hz = after_snapshot.frequency_hz,
+                after_band = %after_snapshot.band,
+                after_mode = %after_snapshot.mode,
+                "rig_config_apply_complete"
+            );
+            if frequency_hz > 0
+                && (after_snapshot.frequency_hz != frequency_hz || after_snapshot.band != band)
+            {
+                warn!(
+                    rig_kind = %after_snapshot.kind,
+                    target_band = %band,
+                    target_frequency_hz = frequency_hz,
+                    reported_band = %after_snapshot.band,
+                    reported_frequency_hz = after_snapshot.frequency_hz,
+                    "rig_config_apply_mismatch"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(message = %error, "rig_config_apply_readback_failed");
+        }
     }
     Ok(())
 }
