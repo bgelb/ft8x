@@ -3000,12 +3000,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (lastSnapshot?.rig_power_is_discrete) {
         const powerSettingId = powerInput.value || null;
         const powerLabel = powerInput.selectedOptions[0]?.textContent || powerSettingId || '-';
-        pendingRigConfig = { band, app_mode: appMode, power_setting_id: powerSettingId, power_label: powerLabel };
-        await postJson('/api/rig/config', {
-          band,
-          app_mode: appMode,
-          power_setting_id: powerSettingId,
-        });
+        const body = { band, app_mode: appMode };
+        pendingRigConfig = { band, app_mode: appMode, power_label: powerLabel };
+        if (lastSnapshot?.rig_power_settable) {
+          body.power_setting_id = powerSettingId;
+          pendingRigConfig.power_setting_id = powerSettingId;
+        }
+        await postJson('/api/rig/config', body);
       } else {
         const power = Number(powerInput.value);
         pendingRigConfig = { band, app_mode: appMode, power_w: power, power_label: `${power.toFixed(0)} W` };
@@ -4432,28 +4433,38 @@ async fn api_rig_config_handler(
         }
         if let Some(setting_id) = request.power_setting_id.clone() {
             if !snapshot.rig_power_settable {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(ApiStatus {
-                        ok: false,
-                        message: "power setting is not CAT-settable on this rig".to_string(),
-                    }),
-                );
+                if snapshot.rig_power_current_id.as_deref() == Some(setting_id.as_str()) {
+                    None
+                } else {
+                    warn!(
+                        requested_power_setting_id = %setting_id,
+                        current_power_setting_id = ?snapshot.rig_power_current_id,
+                        "rig_config_rejected_power_not_settable"
+                    );
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(ApiStatus {
+                            ok: false,
+                            message: "power setting is not CAT-settable on this rig".to_string(),
+                        }),
+                    );
+                }
+            } else {
+                if !snapshot
+                    .rig_power_settings
+                    .iter()
+                    .any(|setting| setting.id == setting_id)
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiStatus {
+                            ok: false,
+                            message: "unknown power setting".to_string(),
+                        }),
+                    );
+                }
+                Some(RigPowerRequest::SettingId(setting_id))
             }
-            if !snapshot
-                .rig_power_settings
-                .iter()
-                .any(|setting| setting.id == setting_id)
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ApiStatus {
-                        ok: false,
-                        message: "unknown power setting".to_string(),
-                    }),
-                );
-            }
-            Some(RigPowerRequest::SettingId(setting_id))
         } else {
             None
         }
