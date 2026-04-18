@@ -1987,6 +1987,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       text-overflow: ellipsis;
       min-width: 0;
     }
+    #rig {
+      white-space: pre-line;
+    }
     .status-grid > div {
       min-width: 0;
     }
@@ -3637,7 +3640,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const rigFwd = data.rig_tx_forward_power_w == null ? '-' : `${data.rig_tx_forward_power_w.toFixed(1)}W`;
       const rigSwr = data.rig_tx_swr == null ? '-' : data.rig_tx_swr.toFixed(1);
       const rigKind = data.rig_kind || '?';
-      document.getElementById('rig').textContent = `${freq} ${rigKind} ${data.rig_mode}/${data.app_mode} ${data.rig_band} ${rigDir} P=${rigPower} BG=${rigBg} S=${rigSmeter} FWD=${rigFwd} SWR=${rigSwr}`;
+      const rigTelemetry = [];
+      if (rigKind !== 'mchf') rigTelemetry.push(`BG=${rigBg}`);
+      if (data.rig_rx_s_meter != null) rigTelemetry.push(`S=${rigSmeter}`);
+      if (data.rig_tx_forward_power_w != null) rigTelemetry.push(`FWD=${rigFwd}`);
+      if (data.rig_tx_swr != null) rigTelemetry.push(`SWR=${rigSwr}`);
+      const rigCore = `${freq} ${rigKind} ${data.rig_mode}/${data.app_mode} ${data.rig_band} ${rigDir} P=${rigPower}`;
+      document.getElementById('rig').textContent = rigTelemetry.length
+        ? `${rigCore}\n${rigTelemetry.join('  ')}`
+        : rigCore;
       document.getElementById('audio').textContent =
         `t=${data.audio_stats.latest_sample ?? '-'} ch=${data.audio_stats.selected_channel} L=${data.audio_stats.left_dbfs.toFixed(1)} R=${data.audio_stats.right_dbfs.toFixed(1)} all=${data.audio_stats.overall_dbfs.toFixed(1)} rec=${data.audio_stats.recoveries}`;
       document.getElementById('status').textContent = data.decode_status || '-';
@@ -6397,12 +6408,46 @@ fn render(display: &DisplayState) {
             }
         })
         .unwrap_or_else(|| "-".to_string());
-    let rig_bargraph = display
+    let rig_is_mchf = display
         .rig
         .as_ref()
-        .and_then(|state| state.bar_graph)
-        .map(|level| level.to_string())
-        .unwrap_or_else(|| "-".to_string());
+        .is_some_and(|state| state.kind == RigKind::Mchf);
+    let mut rig_telemetry = Vec::new();
+    if !rig_is_mchf {
+        let rig_bargraph = display
+            .rig
+            .as_ref()
+            .and_then(|state| state.bar_graph)
+            .map(|level| level.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        rig_telemetry.push(format!("BG={rig_bargraph}"));
+    }
+    if let Some(value) = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.telemetry_rx_s_meter)
+    {
+        rig_telemetry.push(format!("S={value:.1}"));
+    }
+    if let Some(value) = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.telemetry_tx_forward_power_w)
+    {
+        rig_telemetry.push(format!("FWD={value:.1}W"));
+    }
+    if let Some(value) = display
+        .rig
+        .as_ref()
+        .and_then(|state| state.telemetry_tx_swr)
+    {
+        rig_telemetry.push(format!("SWR={value:.1}"));
+    }
+    let rig_telemetry = if rig_telemetry.is_empty() {
+        "-".to_string()
+    } else {
+        rig_telemetry.join("  ")
+    };
     let display_decodes = preferred_stage_decodes(display);
     let dt_stats = summarize_dt(display_decodes);
     let composite_rows = composite_rows(display);
@@ -6429,28 +6474,16 @@ fn render(display: &DisplayState) {
     );
     let _ = writeln!(
         output,
-        "Rig      {}  {}  {}  {}  {}  {}  P={}  BG={}{}{}",
+        "Rig      {}  {}  {}  {}  {}  {}  P={}",
         rig_frequency,
         rig_kind,
         rig_mode,
         display.app_mode.as_str().to_uppercase(),
         rig_band,
         rig_direction,
-        rig_power,
-        rig_bargraph,
-        display
-            .rig
-            .as_ref()
-            .and_then(|state| state.telemetry_rx_s_meter)
-            .map(|value| format!("  S={value:.1}"))
-            .unwrap_or_default(),
-        display
-            .rig
-            .as_ref()
-            .and_then(|state| state.telemetry_tx_swr)
-            .map(|value| format!("  SWR={value:.1}"))
-            .unwrap_or_default()
+        rig_power
     );
+    let _ = writeln!(output, "RigTel   {}", rig_telemetry);
     let _ = writeln!(
         output,
         "Audio    {} ({})",
