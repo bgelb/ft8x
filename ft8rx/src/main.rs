@@ -4362,6 +4362,13 @@ async fn api_rig_config_handler(
     State(state): State<WebAppState>,
     Json(request): Json<RigConfigRequest>,
 ) -> (StatusCode, Json<ApiStatus>) {
+    info!(
+        requested_band = %request.band,
+        requested_app_mode = %request.app_mode,
+        requested_power_w = ?request.power_w,
+        requested_power_setting_id = ?request.power_setting_id,
+        "api_rig_config_received"
+    );
     let snapshot = state
         .snapshot
         .lock()
