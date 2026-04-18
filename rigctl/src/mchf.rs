@@ -19,8 +19,8 @@ const FT817_PTT_OFF: u8 = 0x88;
 const FT817_READ_TX_STATE: u8 = 0xbd;
 const FT817_READ_RX_STATE: u8 = 0xe7;
 const FT817_PTT_STATE: u8 = 0xf7;
+const FT817_EEPROM_POWER_FLAGS_ADDR: u16 = 0x79;
 const UHSDR_CONFIG_ADDR_PREFIX: u16 = 0x8000;
-const UHSDR_EEPROM_TX_POWER_LEVEL: u16 = 12;
 const UHSDR_EEPROM_PTT_RTS_ENABLE: u16 = 409;
 const UHSDR_EEPROM_DIGI_MODE_CONF: u16 = 389;
 
@@ -141,9 +141,8 @@ impl Mchf {
     }
 
     pub fn power_state(&mut self) -> Result<RigPowerState> {
-        let current = self.read_config_u16(UHSDR_EEPROM_TX_POWER_LEVEL).ok();
-        let current_idx = current.map(|value| value as u8);
-        let current_setting = current_idx.and_then(mchf_power_setting_by_index);
+        let current = self.read_ft817_eeprom_byte(FT817_EEPROM_POWER_FLAGS_ADDR)?;
+        let current_setting = mchf_power_setting_by_ft817_flags(current);
         Ok(RigPowerState::Discrete {
             current_id: current_setting
                 .as_ref()
@@ -183,6 +182,20 @@ impl Mchf {
             2,
         )?;
         Ok(u16::from_le_bytes([rsp[0], rsp[1]]))
+    }
+
+    pub fn read_ft817_eeprom_byte(&mut self, address: u16) -> Result<u8> {
+        let rsp = self.query(
+            [
+                (address >> 8) as u8,
+                (address & 0xff) as u8,
+                0,
+                0,
+                FT817_EEPROM_READ,
+            ],
+            2,
+        )?;
+        Ok(rsp[0])
     }
 
     pub fn write_eeprom_u16(&mut self, address: u16, value: u16) -> Result<()> {
@@ -252,17 +265,16 @@ fn hex_cmd(frame: [u8; 5]) -> String {
 
 pub fn mchf_power_settings() -> Vec<RigPowerSetting> {
     vec![
-        RigPowerSetting::new("full", "Full", None),
-        RigPowerSetting::new("5w", "5 W", Some(5.0)),
+        RigPowerSetting::new("high", "Full/5 W", None),
         RigPowerSetting::new("2w", "2 W", Some(2.0)),
         RigPowerSetting::new("1w", "1 W", Some(1.0)),
         RigPowerSetting::new("0.5w", "0.5 W", Some(0.5)),
     ]
 }
 
-pub fn mchf_power_setting_by_index(index: u8) -> Option<RigPowerSetting> {
-    Some(match index {
-        0 => RigPowerSetting::new("full", "Full", None),
+pub fn mchf_power_setting_by_ft817_flags(flags: u8) -> Option<RigPowerSetting> {
+    Some(match flags & 0x03 {
+        0 => RigPowerSetting::new("high", "Full/5 W", None),
         1 => RigPowerSetting::new("2w", "2 W", Some(2.0)),
         2 => RigPowerSetting::new("1w", "1 W", Some(1.0)),
         3 => RigPowerSetting::new("0.5w", "0.5 W", Some(0.5)),
@@ -352,9 +364,16 @@ mod tests {
     #[test]
     fn mchf_power_step_mapping() {
         assert_eq!(
-            mchf_power_setting_by_index(1).unwrap().nominal_watts,
+            mchf_power_setting_by_ft817_flags(1).unwrap().nominal_watts,
             Some(2.0)
         );
-        assert_eq!(mchf_power_setting_by_index(0).unwrap().label, "Full");
+        assert_eq!(
+            mchf_power_setting_by_ft817_flags(0).unwrap().label,
+            "Full/5 W"
+        );
+        assert_eq!(
+            mchf_power_setting_by_ft817_flags(0x81).unwrap().label,
+            "2 W"
+        );
     }
 }

@@ -3127,8 +3127,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
         data.app_mode === pendingRigConfig.app_mode &&
         (
           (data.rig_power_is_discrete &&
-            pendingRigConfig.power_setting_id != null &&
-            data.rig_power_current_id === pendingRigConfig.power_setting_id) ||
+            (pendingRigConfig.power_setting_id == null ||
+              data.rig_power_current_id === pendingRigConfig.power_setting_id)) ||
           (!data.rig_power_is_discrete &&
             data.rig_power_w != null &&
             pendingRigConfig.power_w != null &&
