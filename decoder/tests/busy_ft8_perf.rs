@@ -3,7 +3,7 @@ use std::time::Instant;
 use ft8_decoder::{
     AudioBuffer, DecodeOptions, DecodeProfile, DecodeStage, DecoderSession, DecoderState, Mode,
     WaveformOptions, encode_standard_message_for_mode, parse_standard_info,
-    synthesize_rectangular_waveform,
+    synthesize_rectangular_waveform, write_wav,
 };
 
 const DEFAULT_MAX_EARLY47_MS: u128 = 4_000;
@@ -12,6 +12,12 @@ const DEFAULT_MAX_EARLY47_MS: u128 = 4_000;
 #[ignore = "synthetic performance workload; run explicitly with --ignored --nocapture"]
 fn busy_ft8_early47_and_full_timing() {
     let audio = synthesize_busy_ft8_slot(96);
+    if let Ok(path) = std::env::var("BUSY_FT8_WRITE_WAV") {
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).expect("create busy FT8 WAV directory");
+        }
+        write_wav(path, &audio).expect("write busy FT8 WAV");
+    }
     let options = DecodeOptions {
         profile: DecodeProfile::Deepest,
         min_freq_hz: 200.0,

@@ -187,8 +187,9 @@ fn subtraction_residual_band_power_with_workspace(
 ) -> f32 {
     let spec = plan.spec;
     filtered_subtraction_envelope_with_workspace(audio, reference, start_sample, plan, workspace);
-    workspace.residual.fill(Complex32::new(0.0, 0.0));
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
+        workspace.residual[..window.reference_start].fill(Complex32::new(0.0, 0.0));
+        workspace.residual[window.reference_start + window.len..].fill(Complex32::new(0.0, 0.0));
         let residual_window =
             &mut workspace.residual[window.reference_start..window.reference_start + window.len];
         let envelope_window =
@@ -207,6 +208,8 @@ fn subtraction_residual_band_power_with_workspace(
             let corrected = envelope_value * reference_value;
             *residual_slot = Complex32::new(sample - 2.0 * corrected.re, 0.0);
         }
+    } else {
+        workspace.residual.fill(Complex32::new(0.0, 0.0));
     }
     plan.forward
         .process_with_scratch(&mut workspace.residual, &mut workspace.scratch);
@@ -228,8 +231,9 @@ fn filtered_subtraction_envelope_with_workspace(
     plan: &SubtractionPlan,
     workspace: &mut SubtractionWorkspace,
 ) {
-    workspace.envelope.fill(Complex32::new(0.0, 0.0));
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
+        workspace.envelope[..window.reference_start].fill(Complex32::new(0.0, 0.0));
+        workspace.envelope[window.reference_start + window.len..].fill(Complex32::new(0.0, 0.0));
         let envelope_window =
             &mut workspace.envelope[window.reference_start..window.reference_start + window.len];
         let reference_window =
@@ -241,6 +245,8 @@ fn filtered_subtraction_envelope_with_workspace(
         {
             *slot = reference_value.conj() * audio_sample;
         }
+    } else {
+        workspace.envelope.fill(Complex32::new(0.0, 0.0));
     }
 
     plan.forward

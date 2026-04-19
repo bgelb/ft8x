@@ -224,7 +224,9 @@ fn compute_ft8_bitmetric_passes(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) 
             for k in (1..=groups_per_half).step_by(nsym) {
                 let ks = half_symbol_start + k;
                 let start_bit = (k - 1) * FTX_BITS_PER_SYMBOL + half * half_bits;
-                let mut metrics = vec![0.0f32; nt];
+                let mut metric_storage =
+                    [0.0f32; 1 << (FTX_BITS_PER_SYMBOL * BITMETRIC_MAX_COMBINED_SYMBOLS)];
+                let metrics = &mut metric_storage[..nt];
                 for (i, metric) in metrics.iter_mut().enumerate() {
                     let tone0 = bitmetric_metric_tone(i, nsym, 0);
                     *metric = full_tones[ks][tone0].norm();
@@ -305,7 +307,8 @@ fn compute_ft4_bitmetric_passes(spec: &ModeSpec, full_tones: &[[Complex32; 8]]) 
         for ks in (0..=spec.geometry.message_symbols.saturating_sub(nsym)).step_by(nsym) {
             let start_bit = ks * 2;
             let decision_max_bit = 2 * nsym - 1;
-            let mut metrics = vec![0.0f32; nt];
+            let mut metric_storage = [0.0f32; 1 << 8];
+            let metrics = &mut metric_storage[..nt];
             for (value, metric) in metrics.iter_mut().enumerate() {
                 let mut sum = Complex32::new(0.0, 0.0);
                 for symbol_offset in 0..nsym {
