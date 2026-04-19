@@ -3,6 +3,14 @@
     "our_call": "N1VF",
     "our_grid": "CM97"
   },
+  "rig": {
+    "kind": "mchf",
+    "port_path": null,
+    "input_device": null,
+    "output_device": null,
+    "power_setting": null,
+    "power_w": null
+  },
   "tx": {
     "base_freq_hz": 1000.0,
     "drive_level": 0.28,

@@ -1,11 +1,13 @@
 use serde::Deserialize;
 use std::path::Path;
+use std::path::PathBuf;
 
 use crate::AppError;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub station: StationConfig,
+    pub rig: Option<RigConfig>,
     pub tx: TxConfig,
     pub queue: QueueConfig,
     pub fsm: FsmConfig,
@@ -27,6 +29,16 @@ pub struct TxConfig {
     pub power_w: Option<f32>,
     pub tx_freq_min_hz: f32,
     pub tx_freq_max_hz: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RigConfig {
+    pub kind: Option<String>,
+    pub port_path: Option<PathBuf>,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub power_setting: Option<String>,
+    pub power_w: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
