@@ -462,6 +462,7 @@ struct SubtractionPlan {
     spec: &'static ModeSpec,
     forward: Arc<dyn Fft<f32>>,
     inverse: Arc<dyn Fft<f32>>,
+    residual_forward: Arc<dyn RealToComplex<f32>>,
     filter_spectrum: Vec<Complex32>,
     edge_correction: Vec<f32>,
 }

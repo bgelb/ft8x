@@ -188,8 +188,8 @@ fn subtraction_residual_band_power_with_workspace(
     let spec = plan.spec;
     filtered_subtraction_envelope_with_workspace(audio, reference, start_sample, plan, workspace);
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
-        workspace.residual[..window.reference_start].fill(Complex32::new(0.0, 0.0));
-        workspace.residual[window.reference_start + window.len..].fill(Complex32::new(0.0, 0.0));
+        workspace.residual[..window.reference_start].fill(0.0);
+        workspace.residual[window.reference_start + window.len..].fill(0.0);
         let residual_window =
             &mut workspace.residual[window.reference_start..window.reference_start + window.len];
         let envelope_window =
@@ -206,19 +206,24 @@ fn subtraction_residual_band_power_with_workspace(
             )
         {
             let corrected = envelope_value * reference_value;
-            *residual_slot = Complex32::new(sample - 2.0 * corrected.re, 0.0);
+            *residual_slot = sample - 2.0 * corrected.re;
         }
     } else {
-        workspace.residual.fill(Complex32::new(0.0, 0.0));
+        workspace.residual.fill(0.0);
     }
-    plan.forward
-        .process_with_scratch(&mut workspace.residual, &mut workspace.scratch);
+    plan.residual_forward
+        .process_with_scratch(
+            &mut workspace.residual,
+            &mut workspace.residual_spectrum,
+            &mut workspace.residual_scratch,
+        )
+        .expect("subtraction residual FFT");
     let df = spec.geometry.sample_rate_hz as f32 / long_input_samples(spec) as f32;
     let start_bin = (spec.band_low_hz(freq_hz) / df).trunc().max(0.0) as usize;
     let end_bin = (spec.band_high_hz(freq_hz) / df)
         .trunc()
         .min((long_input_samples(spec) / 2) as f32) as usize;
-    workspace.residual[start_bin..=end_bin]
+    workspace.residual_spectrum[start_bin..=end_bin]
         .iter()
         .map(|value| value.re * value.re + value.im * value.im)
         .sum()
@@ -302,7 +307,9 @@ fn apply_subtraction_from_envelope(
 
 pub(super) struct SubtractionWorkspace {
     envelope: Vec<Complex32>,
-    residual: Vec<Complex32>,
+    residual: Vec<f32>,
+    residual_spectrum: Vec<Complex32>,
+    residual_scratch: Vec<Complex32>,
     scratch: Vec<Complex32>,
 }
 
@@ -315,7 +322,9 @@ impl SubtractionWorkspace {
             .max(plan.inverse.get_inplace_scratch_len());
         Self {
             envelope: vec![Complex32::new(0.0, 0.0); len],
-            residual: vec![Complex32::new(0.0, 0.0); len],
+            residual: plan.residual_forward.make_input_vec(),
+            residual_spectrum: plan.residual_forward.make_output_vec(),
+            residual_scratch: plan.residual_forward.make_scratch_vec(),
             scratch: vec![Complex32::new(0.0, 0.0); scratch_len],
         }
     }
@@ -341,9 +350,11 @@ impl SubtractionPlan {
 
     fn new(spec: &'static ModeSpec) -> Self {
         let mut planner = FftPlanner::<f32>::new();
+        let mut real_planner = RealFftPlanner::<f32>::new();
         let long_input_samples = long_input_samples(spec);
         let forward = planner.plan_fft_forward(long_input_samples);
         let inverse = planner.plan_fft_inverse(long_input_samples);
+        let residual_forward = real_planner.plan_fft_forward(long_input_samples);
         let subtract_filter_samples = spec.subtraction.filter_samples;
         let subtract_filter_half = subtract_filter_samples / 2;
 
@@ -373,6 +384,7 @@ impl SubtractionPlan {
         Self {
             forward,
             inverse,
+            residual_forward,
             filter_spectrum: kernel,
             edge_correction,
             spec,
