@@ -87,6 +87,7 @@ pub const FT4_WAVEFORM: WaveformSpec = WaveformSpec {
 
 pub const FT4_SEARCH: SearchSpec = SearchSpec {
     long_input_samples: FT4_LONG_INPUT_SAMPLES,
+    full_decode_samples: FT4_LONG_INPUT_SAMPLES,
     long_fft_samples: FT4_LONG_FFT_SAMPLES,
     downsample_factor: 18,
     sync_fft_symbol_window: 4,

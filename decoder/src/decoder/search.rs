@@ -598,6 +598,14 @@ pub(super) fn zero_tail(audio: &AudioBuffer, keep_samples: usize) -> AudioBuffer
     copy
 }
 
+pub(super) fn truncate_tail(audio: &AudioBuffer, keep_samples: usize) -> AudioBuffer {
+    let mut copy = audio.clone();
+    if keep_samples < copy.samples.len() {
+        copy.samples.truncate(keep_samples);
+    }
+    copy
+}
+
 pub(super) fn collect_candidates_legacy(
     audio: &AudioBuffer,
     options: &DecodeOptions,

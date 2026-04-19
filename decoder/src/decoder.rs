@@ -214,7 +214,7 @@ impl DecodeStage {
         match self {
             Self::Early41 => spec.early41_samples(),
             Self::Early47 => spec.early47_samples(),
-            Self::Full => long_input_samples(spec),
+            Self::Full => spec.full_decode_samples(),
         }
     }
 }
@@ -1395,7 +1395,7 @@ mod tests {
 
         let full = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
-            samples: vec![0.0; long_input_samples(spec)],
+            samples: vec![0.0; spec.full_decode_samples()],
         };
         let updates = session
             .decode_available(&full, &options)
@@ -1413,6 +1413,7 @@ mod tests {
     fn stage_debug_trace_reports_early47_as_residual_prep() {
         let options = DecodeOptions::default();
         let spec = options.mode.spec();
+        assert!(spec.full_decode_samples() < long_input_samples(spec));
         let audio = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
             samples: vec![0.0; long_input_samples(spec)],
@@ -1423,6 +1424,12 @@ mod tests {
         assert_eq!(report.stages[0].stage, DecodeStage::Early41);
         assert_eq!(report.stages[1].stage, DecodeStage::Early47);
         assert_eq!(report.stages[2].stage, DecodeStage::Full);
+        assert!(
+            (report.final_report.duration_seconds
+                - spec.full_decode_samples() as f32 / FT8_SAMPLE_RATE as f32)
+                .abs()
+                < 1e-6
+        );
 
         let early47 = &report.stages[1];
         assert!(early47.search_passes.is_empty());
@@ -1441,7 +1448,7 @@ mod tests {
         let mut session = DecoderSession::new();
         let full = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
-            samples: vec![0.0; long_input_samples(spec)],
+            samples: vec![0.0; spec.full_decode_samples()],
         };
         let updates = session
             .decode_available(&full, &options)

@@ -437,6 +437,23 @@ impl LongSpectrumPlan {
 }
 
 impl BasebandPlan {
+    pub(super) fn for_mode(mode: Mode) -> &'static Self {
+        match mode {
+            Mode::Ft8 => {
+                static PLAN: OnceLock<BasebandPlan> = OnceLock::new();
+                PLAN.get_or_init(|| BasebandPlan::new(mode.spec()))
+            }
+            Mode::Ft4 => {
+                static PLAN: OnceLock<BasebandPlan> = OnceLock::new();
+                PLAN.get_or_init(|| BasebandPlan::new(mode.spec()))
+            }
+            Mode::Ft2 => {
+                static PLAN: OnceLock<BasebandPlan> = OnceLock::new();
+                PLAN.get_or_init(|| BasebandPlan::new(mode.spec()))
+            }
+        }
+    }
+
     pub(super) fn new(spec: &ModeSpec) -> Self {
         let mut planner = FftPlanner::<f32>::new();
         Self {
@@ -451,16 +468,6 @@ impl BasebandWorkspace {
             scratch: vec![Complex32::new(0.0, 0.0); plan.inverse.get_inplace_scratch_len()],
         }
     }
-}
-
-pub(super) fn downsample_candidate(
-    long_spectrum: &LongSpectrum,
-    baseband_plan: &BasebandPlan,
-    spec: &ModeSpec,
-    freq_hz: f32,
-) -> Option<Vec<Complex32>> {
-    let mut workspace = BasebandWorkspace::new(baseband_plan);
-    downsample_candidate_with_workspace(long_spectrum, baseband_plan, spec, freq_hz, &mut workspace)
 }
 
 pub(super) fn downsample_candidate_with_workspace(

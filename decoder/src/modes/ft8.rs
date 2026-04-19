@@ -100,6 +100,7 @@ pub const FT8_WAVEFORM: WaveformSpec = WaveformSpec {
 
 pub const FT8_SEARCH: SearchSpec = SearchSpec {
     long_input_samples: 15 * FT8_SAMPLE_RATE as usize,
+    full_decode_samples: 50 * FT8_EARLY_BLOCK_SAMPLES,
     // Legacy 100-symbol analysis window; at 12 kHz this gives 0.0625 Hz FFT bins.
     long_fft_samples: FT8_LONG_FFT_SAMPLES,
     downsample_factor: 60,

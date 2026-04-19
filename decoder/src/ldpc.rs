@@ -329,10 +329,14 @@ impl ParityMatrix {
         }
 
         let mut initial_bits = [0u8; 174];
-        for (column, llr) in llrs.iter().copied().enumerate() {
-            initial_bits[column] = known_bits
-                .and_then(|bits| bits[column])
-                .unwrap_or_else(|| u8::from(llr >= 0.0));
+        if let Some(known_bits) = known_bits {
+            for (column, llr) in llrs.iter().copied().enumerate() {
+                initial_bits[column] = known_bits[column].unwrap_or_else(|| u8::from(llr >= 0.0));
+            }
+        } else {
+            for (column, llr) in llrs.iter().copied().enumerate() {
+                initial_bits[column] = u8::from(llr >= 0.0);
+            }
         }
         if self.parity_ok(&initial_bits)
             && crc::crc_matches(&initial_bits[..77], &initial_bits[77..91])
@@ -345,12 +349,18 @@ impl ParityMatrix {
         let mut ncnt = 0isize;
         let mut nclast = 0usize;
         for iteration in 0..=MAX_ITERS {
-            for column in 0..174 {
-                zn[column] = if known_bits.and_then(|bits| bits[column]).is_some() {
-                    llrs[column]
-                } else {
-                    llrs[column] + tov[column][0] + tov[column][1] + tov[column][2]
-                };
+            if let Some(known_bits) = known_bits {
+                for column in 0..174 {
+                    zn[column] = if known_bits[column].is_some() {
+                        llrs[column]
+                    } else {
+                        llrs[column] + tov[column][0] + tov[column][1] + tov[column][2]
+                    };
+                }
+            } else {
+                for column in 0..174 {
+                    zn[column] = llrs[column] + tov[column][0] + tov[column][1] + tov[column][2];
+                }
             }
             if maxosd > 0 {
                 for (acc, value) in zsum.iter_mut().zip(zn.iter().copied()) {
@@ -441,10 +451,14 @@ impl ParityMatrix {
         }
 
         let mut initial_bits = [0u8; 174];
-        for (column, llr) in llrs.iter().copied().enumerate() {
-            initial_bits[column] = known_bits
-                .and_then(|bits| bits[column])
-                .unwrap_or_else(|| u8::from(llr >= 0.0));
+        if let Some(known_bits) = known_bits {
+            for (column, llr) in llrs.iter().copied().enumerate() {
+                initial_bits[column] = known_bits[column].unwrap_or_else(|| u8::from(llr >= 0.0));
+            }
+        } else {
+            for (column, llr) in llrs.iter().copied().enumerate() {
+                initial_bits[column] = u8::from(llr >= 0.0);
+            }
         }
         if self.parity_ok(&initial_bits)
             && crc::crc_matches(&initial_bits[..77], &initial_bits[77..91])
@@ -457,12 +471,18 @@ impl ParityMatrix {
         let mut ncnt = 0isize;
         let mut nclast = 0usize;
         for iteration in 0..=MAX_ITERS {
-            for column in 0..174 {
-                zn[column] = if known_bits.and_then(|bits| bits[column]).is_some() {
-                    llrs[column]
-                } else {
-                    llrs[column] + tov[column][0] + tov[column][1] + tov[column][2]
-                };
+            if let Some(known_bits) = known_bits {
+                for column in 0..174 {
+                    zn[column] = if known_bits[column].is_some() {
+                        llrs[column]
+                    } else {
+                        llrs[column] + tov[column][0] + tov[column][1] + tov[column][2]
+                    };
+                }
+            } else {
+                for column in 0..174 {
+                    zn[column] = llrs[column] + tov[column][0] + tov[column][1] + tov[column][2];
+                }
             }
             if maxosd > 0 {
                 for (acc, value) in zsum.iter_mut().zip(zn.iter().copied()) {
@@ -860,6 +880,7 @@ impl ParityMatrix {
         const PARITY: usize = N - K;
         const MRB_SEARCH_EXTRA: usize = 20;
 
+        let has_known_bits = known_bits.is_some();
         let no_known = [None; N];
         let known_bits = known_bits.unwrap_or(&no_known);
 
@@ -901,24 +922,20 @@ impl ParityMatrix {
         for (slot, &index) in permuted_indices.iter().enumerate() {
             hard[slot] = known_bits[index].unwrap_or_else(|| u8::from(llrs[index] >= 0.0));
             reliabilities[slot] = llrs[index].abs();
-            apmask[slot] = known_bits[index].is_some();
+            apmask[slot] = has_known_bits && known_bits[index].is_some();
         }
 
-        let mut best_codeword = [0u8; N];
-        encode_mrb_array(&hard[..K], &genmrb, &mut best_codeword);
+        let mut hard_codeword = [0u8; N];
+        encode_mrb_array(&hard[..K], &genmrb, &mut hard_codeword);
+        let mut best_codeword = hard_codeword;
         let mut best_distance = weighted_distance_array(&best_codeword, &hard, &reliabilities);
 
         for first in (0..K).rev() {
             if apmask[first] {
                 continue;
             }
-            let mut message = [0u8; K];
-            message.copy_from_slice(&hard[..K]);
-            message[first] ^= 1;
-            let mut codeword = [0u8; N];
-            encode_mrb_array(&message, &genmrb, &mut codeword);
             let mut parity_tail = [0u8; PARITY];
-            xor_tail_array(&codeword, &hard, &mut parity_tail);
+            xor_tail_with_row_flips(&hard_codeword, &hard, &[&genmrb[first]], &mut parity_tail);
             let nd1kpt = parity_tail
                 .iter()
                 .take(OSD_NT)
@@ -926,10 +943,15 @@ impl ParityMatrix {
                 .sum::<usize>()
                 + 1;
             if nd1kpt <= ntheta {
-                let distance = weighted_distance_array(&codeword, &hard, &reliabilities);
+                let distance = weighted_distance_with_row_flips(
+                    &hard_codeword,
+                    &hard,
+                    &reliabilities,
+                    &[&genmrb[first]],
+                );
                 if distance < best_distance {
                     best_distance = distance;
-                    best_codeword = codeword;
+                    best_codeword = codeword_with_row_flips(&hard_codeword, &[&genmrb[first]]);
                 }
             }
 
@@ -951,19 +973,26 @@ impl ParityMatrix {
                     continue;
                 }
 
-                let mut message2 = message;
-                message2[second] ^= 1;
-                let mut codeword2 = [0u8; N];
-                encode_mrb_array(&message2, &genmrb, &mut codeword2);
-                let distance = weighted_distance_array(&codeword2, &hard, &reliabilities);
+                let distance = weighted_distance_with_row_flips(
+                    &hard_codeword,
+                    &hard,
+                    &reliabilities,
+                    &[&genmrb[first], &genmrb[second]],
+                );
                 if distance < best_distance {
                     best_distance = distance;
-                    best_codeword = codeword2;
+                    best_codeword =
+                        codeword_with_row_flips(&hard_codeword, &[&genmrb[first], &genmrb[second]]);
                 }
 
                 if max_order >= 3 {
                     let mut parity_tail2 = [0u8; PARITY];
-                    xor_tail_array(&codeword2, &hard, &mut parity_tail2);
+                    xor_tail_with_row_flips(
+                        &hard_codeword,
+                        &hard,
+                        &[&genmrb[first], &genmrb[second]],
+                        &mut parity_tail2,
+                    );
                     for third in (0..second).rev() {
                         if apmask[third] {
                             continue;
@@ -979,14 +1008,18 @@ impl ParityMatrix {
                             continue;
                         }
 
-                        let mut message3 = message2;
-                        message3[third] ^= 1;
-                        let mut codeword3 = [0u8; N];
-                        encode_mrb_array(&message3, &genmrb, &mut codeword3);
-                        let distance = weighted_distance_array(&codeword3, &hard, &reliabilities);
+                        let distance = weighted_distance_with_row_flips(
+                            &hard_codeword,
+                            &hard,
+                            &reliabilities,
+                            &[&genmrb[first], &genmrb[second], &genmrb[third]],
+                        );
                         if distance < best_distance {
                             best_distance = distance;
-                            best_codeword = codeword3;
+                            best_codeword = codeword_with_row_flips(
+                                &hard_codeword,
+                                &[&genmrb[first], &genmrb[second], &genmrb[third]],
+                            );
                         }
                     }
                 }
@@ -1136,6 +1169,20 @@ fn encode_mrb_array<const K: usize, const N: usize>(
     }
 }
 
+fn xor_codeword_row<const N: usize>(codeword: &mut [u8; N], row: &[u8; N]) {
+    for index in 0..N {
+        codeword[index] ^= row[index];
+    }
+}
+
+fn codeword_with_row_flips<const N: usize>(base: &[u8; N], rows: &[&[u8; N]]) -> [u8; N] {
+    let mut codeword = *base;
+    for row in rows {
+        xor_codeword_row(&mut codeword, row);
+    }
+    codeword
+}
+
 fn weighted_distance(codeword: &[u8], hard: &[u8], reliabilities: &[f32]) -> f32 {
     codeword
         .iter()
@@ -1159,6 +1206,25 @@ fn weighted_distance_array<const N: usize>(
     distance
 }
 
+fn weighted_distance_with_row_flips<const N: usize>(
+    base: &[u8; N],
+    hard: &[u8; N],
+    reliabilities: &[f32; N],
+    rows: &[&[u8; N]],
+) -> f32 {
+    let mut distance = 0.0f32;
+    for index in 0..N {
+        let mut bit = base[index];
+        for row in rows {
+            bit ^= row[index];
+        }
+        if bit != hard[index] {
+            distance += reliabilities[index];
+        }
+    }
+    distance
+}
+
 fn xor_tail(codeword: &[u8], hard: &[u8], start: usize) -> Vec<u8> {
     codeword[start..]
         .iter()
@@ -1167,13 +1233,19 @@ fn xor_tail(codeword: &[u8], hard: &[u8], start: usize) -> Vec<u8> {
         .collect()
 }
 
-fn xor_tail_array<const N: usize, const K: usize>(
-    codeword: &[u8; N],
+fn xor_tail_with_row_flips<const N: usize, const K: usize>(
+    base: &[u8; N],
     hard: &[u8; N],
+    rows: &[&[u8; N]],
     tail: &mut [u8; K],
 ) {
     for index in 0..K {
-        tail[index] = codeword[N - K + index] ^ hard[N - K + index];
+        let source_index = N - K + index;
+        let mut bit = base[source_index];
+        for row in rows {
+            bit ^= row[source_index];
+        }
+        tail[index] = bit ^ hard[source_index];
     }
 }
 

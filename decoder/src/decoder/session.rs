@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use rayon::prelude::*;
+
 use super::*;
 use crate::message::{Payload, ReplyWord, StructuredMessage};
 
@@ -130,6 +132,7 @@ impl DecoderSession {
             ));
         }
 
+        let mut report_audio = None;
         let search = match stage {
             DecodeStage::Early41 => {
                 let early_audio = zero_tail(audio, early_41_samples(spec));
@@ -152,17 +155,24 @@ impl DecoderSession {
                 self.early47 = Some(search.clone());
                 search
             }
-            DecodeStage::Full => run_full_search(
-                audio,
-                options,
-                self.early41.as_ref(),
-                self.early47.as_ref(),
-                self.early47_residual.as_ref(),
-                state,
-            ),
+            DecodeStage::Full => {
+                let full_audio = truncate_tail(audio, spec.full_decode_samples());
+                let search = run_full_search(
+                    &full_audio,
+                    options,
+                    self.early41.as_ref(),
+                    self.early47.as_ref(),
+                    self.early47_residual.as_ref(),
+                    state,
+                );
+                report_audio = Some(full_audio);
+                search
+            }
         };
 
-        let report = build_decode_report_with_resolver(audio, options, search.clone(), state);
+        let report_source = report_audio.as_ref().unwrap_or(audio);
+        let report =
+            build_decode_report_with_resolver(report_source, options, search.clone(), state);
         let state = build_decoder_state(state, &search);
         let (new_decodes, updated_decodes) = diff_decodes(&self.last_decodes, &report.decodes);
         self.last_decodes = report
@@ -207,7 +217,10 @@ impl DecoderSession {
             )));
         }
 
-        let input_signature = compute_residual_signature(audio);
+        let full_audio =
+            (stage == DecodeStage::Full).then(|| truncate_tail(audio, spec.full_decode_samples()));
+        let stage_audio = full_audio.as_ref().unwrap_or(audio);
+        let input_signature = compute_residual_signature(stage_audio);
         let mut residual_prep_subtractions = Vec::new();
         let mut search_passes = Vec::new();
         let search = match stage {
@@ -242,7 +255,7 @@ impl DecoderSession {
             }
             DecodeStage::Full => {
                 let (trace, subtractions) = debug_full_search(
-                    audio,
+                    stage_audio,
                     options,
                     self.early41.as_ref(),
                     self.early47.as_ref(),
@@ -255,7 +268,7 @@ impl DecoderSession {
             }
         };
 
-        let report = build_decode_report_with_resolver(audio, options, search.clone(), state);
+        let report = build_decode_report_with_resolver(stage_audio, options, search.clone(), state);
         let next_state = build_decoder_state(state, &search);
         let (new_decodes, updated_decodes) = diff_decodes(&self.last_decodes, &report.decodes);
         self.last_decodes = report
@@ -570,6 +583,9 @@ pub(super) fn build_decode_report_with_resolver(
     let ft8_snr_context = (options.mode == Mode::Ft8)
         .then(|| build_ft8_reported_snr_context(audio, options))
         .flatten();
+    let mut ft8_snr_workspace = ft8_snr_context
+        .as_ref()
+        .map(|context| BasebandWorkspace::new(context.baseband_plan));
 
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
@@ -582,10 +598,13 @@ pub(super) fn build_decode_report_with_resolver(
             continue;
         }
         let reported_snr_db = match success.mode {
-            Mode::Ft8 => ft8_snr_context
-                .as_ref()
-                .and_then(|context| ft8_reported_snr_db(context, &success))
-                .unwrap_or(success.snr_db),
+            Mode::Ft8 => match (ft8_snr_context.as_ref(), ft8_snr_workspace.as_mut()) {
+                (Some(context), Some(workspace)) => {
+                    ft8_reported_snr_db_with_workspace(context, &success, workspace)
+                        .unwrap_or(success.snr_db)
+                }
+                _ => success.snr_db,
+            },
             Mode::Ft4 | Mode::Ft2 => success.snr_db,
         };
         let decode = DecodedMessage {
@@ -715,8 +734,8 @@ fn debug_run_decode_search_inner(
     let has_residual_override = residual_override.is_some();
     let mut residual_audio = residual_override.unwrap_or_else(|| audio.clone());
     let spec = options.mode.spec();
-    let baseband_plan = BasebandPlan::new(spec);
-    let mut baseband_workspace = BasebandWorkspace::new(&baseband_plan);
+    let baseband_plan = BasebandPlan::for_mode(options.mode);
+    let mut baseband_workspace = BasebandWorkspace::new(baseband_plan);
     let subtraction_plan = SubtractionPlan::for_mode(options.mode);
     let parity = ParityMatrix::global();
     let mut top_candidates = Vec::new();
@@ -765,6 +784,41 @@ fn debug_run_decode_search_inner(
             None
         };
         let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
+        let mut parallel_results = if options.mode == Mode::Ft8 && !capture_trace {
+            Some(
+                candidates
+                    .par_iter()
+                    .map_init(
+                        || BasebandWorkspace::new(baseband_plan),
+                        |baseband_workspace, candidate| {
+                            let mut local_counters = DecodeCounters::default();
+                            let successes_for_candidate = try_candidate(
+                                search_grid,
+                                cached_long_spectrum
+                                    .as_ref()
+                                    .expect("FT8 pass spectrum should be available"),
+                                baseband_plan,
+                                baseband_workspace,
+                                candidate,
+                                spec,
+                                options,
+                                pass,
+                                parity,
+                                allow_ap,
+                                &[],
+                                &HashResolver::default(),
+                                &HashSet::new(),
+                                &mut local_counters,
+                            );
+                            (successes_for_candidate, local_counters)
+                        },
+                    )
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+        } else {
+            None
+        };
         let mut cached_resolver = HashResolver::default();
         let mut cached_seen_messages = HashSet::new();
         let mut seen_cache_dirty = true;
@@ -776,29 +830,35 @@ fn debug_run_decode_search_inner(
                 .as_ref()
                 .or_else(|| cached_long_spectrum.as_ref())
                 .expect("decode pass spectrum should be available");
-            let mut local_counters = DecodeCounters::default();
-            let ft4_ap_known_bits = Vec::new();
-            if seen_cache_dirty {
-                (cached_resolver, cached_seen_messages) =
-                    current_seen_message_texts(base_resolver, &successes, &pass_successes);
-                seen_cache_dirty = false;
-            }
-            let successes_for_candidate = try_candidate(
-                search_grid,
-                &long_spectrum,
-                &baseband_plan,
-                &mut baseband_workspace,
-                candidate,
-                spec,
-                options,
-                pass,
-                parity,
-                allow_ap,
-                &ft4_ap_known_bits,
-                &cached_resolver,
-                &cached_seen_messages,
-                &mut local_counters,
-            );
+            let (successes_for_candidate, local_counters) =
+                if let Some(results) = parallel_results.as_mut() {
+                    results.next().expect("parallel candidate result")
+                } else {
+                    let mut local_counters = DecodeCounters::default();
+                    let ft4_ap_known_bits = Vec::new();
+                    if seen_cache_dirty {
+                        (cached_resolver, cached_seen_messages) =
+                            current_seen_message_texts(base_resolver, &successes, &pass_successes);
+                        seen_cache_dirty = false;
+                    }
+                    let successes_for_candidate = try_candidate(
+                        search_grid,
+                        long_spectrum,
+                        baseband_plan,
+                        &mut baseband_workspace,
+                        candidate,
+                        spec,
+                        options,
+                        pass,
+                        parity,
+                        allow_ap,
+                        &ft4_ap_known_bits,
+                        &cached_resolver,
+                        &cached_seen_messages,
+                        &mut local_counters,
+                    );
+                    (successes_for_candidate, local_counters)
+                };
             counters.ldpc_codewords += local_counters.ldpc_codewords;
             counters.parsed_payloads += local_counters.parsed_payloads;
             let raw_successes: Vec<String> = if capture_trace {
