@@ -79,6 +79,8 @@ struct Cli {
     save_raw_wav: Option<PathBuf>,
     #[arg(long)]
     device: Option<String>,
+    #[arg(long, default_value = "medium", value_name = "quick|medium|deepest")]
+    decode_profile: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +95,8 @@ enum AppError {
     Wav(#[from] hound::Error),
     #[error("decoder error: {0}")]
     Decoder(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("system clock error")]
@@ -4980,8 +4984,15 @@ fn configured_power_request(config: &AppConfig, kind: RigKind) -> Option<RigPowe
     }
 }
 
+fn parse_decode_profile(value: &str) -> Result<DecodeProfile, AppError> {
+    value
+        .parse::<DecodeProfile>()
+        .map_err(AppError::InvalidArgument)
+}
+
 fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let config = AppConfig::load(&cli.config)?;
+    let decode_profile = parse_decode_profile(&cli.decode_profile)?;
     init_tracing(&config)?;
     let rig_kind = resolve_app_rig_kind(&config)?;
     let audio = detect_audio_device_for_rig(
@@ -5062,6 +5073,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 job.mode,
                 job.stage,
                 job.slot_start,
+                decode_profile,
                 job.raw_path.as_deref(),
             );
             let wall_ms = SystemTime::now()
@@ -5877,6 +5889,7 @@ fn refresh_web_snapshot(
 
 fn run_oneshot(cli: Cli) -> Result<(), AppError> {
     let config = AppConfig::load(&cli.config)?;
+    let decode_profile = parse_decode_profile(&cli.decode_profile)?;
     let app_mode = DecoderMode::Ft8;
     let rig_kind = resolve_app_rig_kind(&config)?;
     let audio = detect_audio_device_for_rig(
@@ -5917,6 +5930,7 @@ fn run_oneshot(cli: Cli) -> Result<(), AppError> {
         target_slot,
         app_mode,
         cli.save_raw_wav.as_deref().or(cli.save_wav.as_deref()),
+        decode_profile,
     )?;
     println!("decodes={}", summary.final_decodes.len());
     for decode in summary.final_decodes {
@@ -6218,6 +6232,7 @@ fn decode_slot_from_capture(
     slot_start: SystemTime,
     mode: DecoderMode,
     save_raw_wav: Option<&Path>,
+    profile: DecodeProfile,
 ) -> Result<DecodeSummary, AppError> {
     let samples = extract_slot_capture(capture, slot_start, mode)?;
     let raw_path = save_raw_wav
@@ -6230,6 +6245,7 @@ fn decode_slot_from_capture(
         save_raw_wav.is_some(),
         slot_start,
         mode,
+        profile,
     )
 }
 
@@ -6240,11 +6256,12 @@ fn decode_slot_from_samples_with_raw_path(
     keep_raw: bool,
     slot_start: SystemTime,
     mode: DecoderMode,
+    profile: DecodeProfile,
 ) -> Result<DecodeSummary, AppError> {
     if keep_raw {
         write_mono_wav(raw_path, sample_rate_hz, samples)?;
     }
-    let decodes = decode_slot_from_samples(samples, sample_rate_hz, slot_start, mode)?;
+    let decodes = decode_slot_from_samples(samples, sample_rate_hz, slot_start, mode, profile)?;
     if !keep_raw && raw_path.exists() {
         let _ = std::fs::remove_file(raw_path);
     }
@@ -6259,6 +6276,7 @@ fn decode_stage_from_samples(
     mode: DecoderMode,
     stage: DecodeStage,
     slot_start: SystemTime,
+    profile: DecodeProfile,
     raw_path: Option<&Path>,
 ) -> Result<StageDecodeReport, AppError> {
     if let Some(raw_path) = raw_path {
@@ -6266,7 +6284,7 @@ fn decode_stage_from_samples(
     }
     let options = DecodeOptions {
         mode,
-        profile: DecodeProfile::Deepest,
+        profile,
         min_freq_hz: 200.0,
         max_freq_hz: 3_500.0,
         ..DecodeOptions::for_mode(mode)
@@ -6295,10 +6313,11 @@ fn decode_slot_from_samples(
     sample_rate_hz: u32,
     slot_start: SystemTime,
     mode: DecoderMode,
+    profile: DecodeProfile,
 ) -> Result<DecodeSummary, AppError> {
     let options = DecodeOptions {
         mode,
-        profile: DecodeProfile::Deepest,
+        profile,
         min_freq_hz: 200.0,
         max_freq_hz: 3_500.0,
         ..DecodeOptions::for_mode(mode)
@@ -8745,6 +8764,7 @@ mod tests {
                 DecoderMode::Ft4,
                 DecodeStage::Full,
                 slot_start,
+                DecodeProfile::Medium,
                 None,
             )
         });
@@ -8775,6 +8795,7 @@ mod tests {
                 DecoderMode::Ft4,
                 DecodeStage::Full,
                 slot_start,
+                DecodeProfile::Medium,
                 None,
             )
         });
