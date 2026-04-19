@@ -396,19 +396,32 @@ fn run_early47_residual_prep_with_trace(
     if !options.disable_subtraction && !early41_successes.is_empty() {
         let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
         let refine_dt = matches!(options.profile, DecodeProfile::Deepest);
+        let mut refine_workspaces =
+            refine_dt.then(|| SubtractionRefineWorkspaces::new(subtraction_plan));
         let block_samples = spec.refine.early_block_samples;
         for (index, success) in early41_successes.iter().enumerate() {
             if success.candidate.dt_seconds < spec.subtraction.refine_cutoff_seconds {
                 // Apply early47 prep in the same hsym-sized chunks WSJT-X stages around. That keeps
                 // each block boundary usable as a future zero-copy residual checkpoint.
-                subtract_candidate_by_blocks_with_workspace(
-                    &mut partial47,
-                    success,
-                    subtraction_plan,
-                    refine_dt,
-                    block_samples,
-                    &mut subtraction_workspace,
-                );
+                if let Some(refine_workspaces) = refine_workspaces.as_mut() {
+                    subtract_candidate_by_blocks_with_refine_workspaces(
+                        &mut partial47,
+                        success,
+                        subtraction_plan,
+                        block_samples,
+                        &mut subtraction_workspace,
+                        refine_workspaces,
+                    );
+                } else {
+                    subtract_candidate_by_blocks_with_workspace(
+                        &mut partial47,
+                        success,
+                        subtraction_plan,
+                        false,
+                        block_samples,
+                        &mut subtraction_workspace,
+                    );
+                }
                 subtracted_early41[index] = true;
                 subtractions.push(success_subtraction_trace(success, &resolver));
             }

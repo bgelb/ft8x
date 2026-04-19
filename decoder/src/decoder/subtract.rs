@@ -33,6 +33,7 @@ pub(super) fn subtract_candidate_with_workspace(
         plan,
         refine_dt,
         workspace,
+        None,
         SubtractionApplication::Contiguous,
     );
 }
@@ -51,6 +52,26 @@ pub(super) fn subtract_candidate_by_blocks_with_workspace(
         plan,
         refine_dt,
         workspace,
+        None,
+        SubtractionApplication::Blocks { block_samples },
+    );
+}
+
+pub(super) fn subtract_candidate_by_blocks_with_refine_workspaces(
+    audio: &mut AudioBuffer,
+    success: &SuccessfulDecode,
+    plan: &SubtractionPlan,
+    block_samples: usize,
+    workspace: &mut SubtractionWorkspace,
+    refine_workspaces: &mut SubtractionRefineWorkspaces,
+) {
+    subtract_candidate_inner(
+        audio,
+        success,
+        plan,
+        true,
+        workspace,
+        Some(refine_workspaces),
         SubtractionApplication::Blocks { block_samples },
     );
 }
@@ -61,6 +82,7 @@ fn subtract_candidate_inner(
     plan: &SubtractionPlan,
     refine_dt: bool,
     workspace: &mut SubtractionWorkspace,
+    refine_workspaces: Option<&mut SubtractionRefineWorkspaces>,
     application: SubtractionApplication,
 ) {
     let Some(channel_symbols) =
@@ -83,17 +105,31 @@ fn subtract_candidate_inner(
         Mode::Ft8 | Mode::Ft2 => spec.start_sample_from_dt(subtraction_dt_seconds),
     };
     let (offset_samples, reuse_current_envelope) = if refine_dt {
-        let Some(offset_samples) = refined_subtraction_offset_with_workspace(
-            audio,
-            &reference,
-            success.candidate.freq_hz,
-            start_sample,
-            plan,
-            workspace,
-        ) else {
-            return;
-        };
-        (offset_samples, offset_samples == 0)
+        if let Some(refine_workspaces) = refine_workspaces {
+            let Some(offset_samples) = refined_subtraction_offset_with_parallel_workspaces(
+                audio,
+                &reference,
+                success.candidate.freq_hz,
+                start_sample,
+                plan,
+                refine_workspaces,
+            ) else {
+                return;
+            };
+            (offset_samples, false)
+        } else {
+            let Some(offset_samples) = refined_subtraction_offset_with_workspace(
+                audio,
+                &reference,
+                success.candidate.freq_hz,
+                start_sample,
+                plan,
+                workspace,
+            ) else {
+                return;
+            };
+            (offset_samples, offset_samples == 0)
+        }
     } else {
         (0, false)
     };
@@ -173,6 +209,64 @@ pub(super) fn refined_subtraction_offset_with_workspace(
     );
     // Fit a parabola through the residual power at -step / 0 / +step and keep the sub-sample
     // offset only when the quadratic minimum falls inside that probe window.
+    let b = (sqp - sqm) * QUADRATIC_FIT_HALF_WEIGHT;
+    let c = (sqp + sqm - QUADRATIC_FIT_CENTER_WEIGHT * sq0) * QUADRATIC_FIT_HALF_WEIGHT;
+    if c == 0.0 {
+        return None;
+    }
+    let dx = -b / (2.0 * c);
+    if dx.abs() > 1.0 {
+        return None;
+    }
+    Some((probe_step as f32 * dx).round() as isize)
+}
+
+fn refined_subtraction_offset_with_parallel_workspaces(
+    audio: &AudioBuffer,
+    reference: &[Complex32],
+    freq_hz: f32,
+    start_sample: isize,
+    plan: &SubtractionPlan,
+    workspaces: &mut SubtractionRefineWorkspaces,
+) -> Option<isize> {
+    let spec = plan.spec;
+    let probe_step = spec.subtraction.refine_probe_step_samples;
+    let (sqm, (sqp, sq0)) = rayon::join(
+        || {
+            subtraction_residual_band_power_with_workspace(
+                audio,
+                reference,
+                freq_hz,
+                start_sample - probe_step,
+                plan,
+                &mut workspaces.minus,
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    subtraction_residual_band_power_with_workspace(
+                        audio,
+                        reference,
+                        freq_hz,
+                        start_sample + probe_step,
+                        plan,
+                        &mut workspaces.plus,
+                    )
+                },
+                || {
+                    subtraction_residual_band_power_with_workspace(
+                        audio,
+                        reference,
+                        freq_hz,
+                        start_sample,
+                        plan,
+                        &mut workspaces.center,
+                    )
+                },
+            )
+        },
+    );
     let b = (sqp - sqm) * QUADRATIC_FIT_HALF_WEIGHT;
     let c = (sqp + sqm - QUADRATIC_FIT_CENTER_WEIGHT * sq0) * QUADRATIC_FIT_HALF_WEIGHT;
     if c == 0.0 {
@@ -450,6 +544,22 @@ pub(super) struct SubtractionWorkspace {
     residual_spectrum: Vec<Complex32>,
     residual_scratch: Vec<Complex32>,
     scratch: Vec<Complex32>,
+}
+
+pub(super) struct SubtractionRefineWorkspaces {
+    minus: SubtractionWorkspace,
+    plus: SubtractionWorkspace,
+    center: SubtractionWorkspace,
+}
+
+impl SubtractionRefineWorkspaces {
+    pub(super) fn new(plan: &SubtractionPlan) -> Self {
+        Self {
+            minus: SubtractionWorkspace::new(plan),
+            plus: SubtractionWorkspace::new(plan),
+            center: SubtractionWorkspace::new(plan),
+        }
+    }
 }
 
 impl SubtractionWorkspace {

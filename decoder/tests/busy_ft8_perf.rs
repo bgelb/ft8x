@@ -10,6 +10,7 @@ const DEFAULT_MAX_EARLY47_MS: u128 = 4_000;
 const DEFAULT_MAX_MEDIUM_LIVE_FULL_MS: u128 = 950;
 const DEFAULT_MAX_DEEPEST_LIVE_FULL_MS: u128 = 2_000;
 const FT8_EARLY47_TO_FULL_BUDGET_MS: u128 = 864;
+const FT8_EARLY47_TO_PRE_KEY_BUDGET_MS: u128 = 1_814;
 
 #[test]
 #[ignore = "synthetic performance workload; run explicitly with --ignored --nocapture"]
@@ -82,12 +83,16 @@ fn measure_busy_profile(audio: &AudioBuffer, profile: DecodeProfile) {
     let raw_full_ms = raw_full_started.elapsed().as_millis();
 
     let scheduled_full_ms = match profile {
-        DecodeProfile::Medium => full_ms,
-        DecodeProfile::Deepest | DecodeProfile::Quick => reset_full_ms,
+        DecodeProfile::Medium | DecodeProfile::Deepest => full_ms,
+        DecodeProfile::Quick => reset_full_ms,
+    };
+    let scheduled_early47_ms = match profile {
+        DecodeProfile::Medium | DecodeProfile::Deepest => early47_ms,
+        DecodeProfile::Quick => 0,
     };
 
     println!(
-        "busy_ft8 profile={} signals=96 early41={}ms decodes={} examined={} ldpc={} early47={}ms decodes={} examined={} ldpc={} full={}ms decodes={} examined={} ldpc={} live_full_no_early47={}ms decodes={} examined={} ldpc={} live_full_reset={}ms decodes={} examined={} ldpc={} raw_full={}ms decodes={} examined={} ldpc={} scheduled_full={}ms",
+        "busy_ft8 profile={} signals=96 early41={}ms decodes={} examined={} ldpc={} early47={}ms decodes={} examined={} ldpc={} full={}ms decodes={} examined={} ldpc={} live_full_no_early47={}ms decodes={} examined={} ldpc={} live_full_reset={}ms decodes={} examined={} ldpc={} raw_full={}ms decodes={} examined={} ldpc={} scheduled_early47={}ms scheduled_full={}ms",
         profile.as_str(),
         early41_ms,
         early41.report.decodes.len(),
@@ -113,6 +118,7 @@ fn measure_busy_profile(audio: &AudioBuffer, profile: DecodeProfile) {
         raw_full.report.decodes.len(),
         raw_full.report.diagnostics.examined_candidates,
         raw_full.report.diagnostics.ldpc_codewords,
+        scheduled_early47_ms,
         scheduled_full_ms,
     );
 
@@ -126,8 +132,15 @@ fn measure_busy_profile(audio: &AudioBuffer, profile: DecodeProfile) {
     );
     if profile == DecodeProfile::Medium {
         assert!(
-            early47_ms <= FT8_EARLY47_TO_FULL_BUDGET_MS,
-            "busy FT8 medium early47 residual prep misses full-ready budget: {early47_ms}ms > {FT8_EARLY47_TO_FULL_BUDGET_MS}ms"
+            scheduled_early47_ms <= FT8_EARLY47_TO_FULL_BUDGET_MS,
+            "busy FT8 medium early47 residual prep misses full-ready budget: {scheduled_early47_ms}ms > {FT8_EARLY47_TO_FULL_BUDGET_MS}ms"
+        );
+    }
+    if profile == DecodeProfile::Deepest {
+        let scheduled_to_pre_key_ms = scheduled_early47_ms + scheduled_full_ms;
+        assert!(
+            scheduled_to_pre_key_ms <= FT8_EARLY47_TO_PRE_KEY_BUDGET_MS,
+            "busy FT8 deepest live path misses pre-key budget: {scheduled_to_pre_key_ms}ms > {FT8_EARLY47_TO_PRE_KEY_BUDGET_MS}ms"
         );
     }
     let max_live_full_ms = max_live_full_ms_for_profile(profile);
