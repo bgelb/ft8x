@@ -531,6 +531,9 @@ fn debug_run_decode_search_inner(
             None
         };
         let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
+        let mut cached_resolver = HashResolver::default();
+        let mut cached_seen_messages = HashSet::new();
+        let mut seen_cache_dirty = true;
         for candidate in &candidates {
             if options.mode == Mode::Ft4 && ft4_long_spectrum.is_none() {
                 ft4_long_spectrum = Some(build_long_spectrum(&residual_audio, spec));
@@ -541,8 +544,11 @@ fn debug_run_decode_search_inner(
                 .expect("decode pass spectrum should be available");
             let mut local_counters = DecodeCounters::default();
             let ft4_ap_known_bits = Vec::new();
-            let (resolver, seen_messages) =
-                current_seen_message_texts(base_resolver, &successes, &pass_successes);
+            if seen_cache_dirty {
+                (cached_resolver, cached_seen_messages) =
+                    current_seen_message_texts(base_resolver, &successes, &pass_successes);
+                seen_cache_dirty = false;
+            }
             let successes_for_candidate = try_candidate(
                 search_grid,
                 &long_spectrum,
@@ -555,8 +561,8 @@ fn debug_run_decode_search_inner(
                 parity,
                 allow_ap,
                 &ft4_ap_known_bits,
-                &resolver,
-                &seen_messages,
+                &cached_resolver,
+                &cached_seen_messages,
                 &mut local_counters,
             );
             counters.ldpc_codewords += local_counters.ldpc_codewords;
@@ -564,7 +570,7 @@ fn debug_run_decode_search_inner(
             let raw_successes: Vec<String> = if capture_trace {
                 successes_for_candidate
                     .iter()
-                    .map(|success| rendered_success_key(success, &resolver))
+                    .map(|success| rendered_success_key(success, &cached_resolver))
                     .collect()
             } else {
                 Vec::new()
@@ -610,9 +616,9 @@ fn debug_run_decode_search_inner(
                     ft4_long_spectrum = None;
                 }
                 if capture_trace {
-                    accepted_successes.push(rendered_success_key(&success, &resolver));
+                    accepted_successes.push(rendered_success_key(&success, &cached_resolver));
                     accepted_subtractions.push(SearchAcceptedTrace {
-                        text: success.payload.to_message(&resolver).to_text(),
+                        text: success.payload.to_message(&cached_resolver).to_text(),
                         dt_seconds: success.candidate.dt_seconds,
                         freq_hz: success.candidate.freq_hz,
                         codeword_bits: success
@@ -623,6 +629,7 @@ fn debug_run_decode_search_inner(
                     });
                 }
                 pass_successes.push(success);
+                seen_cache_dirty = true;
             }
             if capture_trace {
                 candidate_traces.push(SearchCandidateTrace {
