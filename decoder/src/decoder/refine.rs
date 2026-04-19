@@ -7,10 +7,23 @@ pub(super) fn refine_candidate(
     coarse_start_seconds: f32,
     coarse_freq_hz: f32,
 ) -> Option<RefinedCandidate> {
+    let mut baseband_workspace = BasebandWorkspace::new(baseband_plan);
     let initial_baseband = if spec.mode == Mode::Ft4 {
-        downsample_candidate_ft4_search(long_spectrum, baseband_plan, spec, coarse_freq_hz)?
+        downsample_candidate_ft4_search_with_workspace(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            coarse_freq_hz,
+            &mut baseband_workspace,
+        )?
     } else {
-        downsample_candidate(long_spectrum, baseband_plan, spec, coarse_freq_hz)?
+        downsample_candidate_with_workspace(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            coarse_freq_hz,
+            &mut baseband_workspace,
+        )?
     };
     let mut refined_basebands = Vec::new();
     refine_candidate_with_cache(
@@ -19,6 +32,7 @@ pub(super) fn refine_candidate(
         spec,
         &initial_baseband,
         &mut refined_basebands,
+        &mut baseband_workspace,
         coarse_start_seconds,
         coarse_freq_hz,
     )
@@ -30,6 +44,7 @@ pub(super) fn refine_candidate_with_cache(
     spec: &ModeSpec,
     initial_baseband: &[Complex32],
     refined_basebands: &mut Vec<(i32, Vec<Complex32>)>,
+    baseband_workspace: &mut BasebandWorkspace,
     coarse_start_seconds: f32,
     coarse_freq_hz: f32,
 ) -> Option<RefinedCandidate> {
@@ -40,6 +55,7 @@ pub(super) fn refine_candidate_with_cache(
             spec,
             initial_baseband,
             refined_basebands,
+            baseband_workspace,
             coarse_freq_hz,
         );
     }
@@ -71,6 +87,7 @@ pub(super) fn refine_candidate_with_cache(
         baseband_plan,
         spec,
         refined_basebands,
+        baseband_workspace,
         best_freq_hz,
     )?;
     let mut refined_ibest = ibest;
@@ -112,6 +129,7 @@ fn refine_candidate_ft4_with_cache(
     spec: &ModeSpec,
     initial_baseband: &[Complex32],
     refined_basebands: &mut Vec<(i32, Vec<Complex32>)>,
+    baseband_workspace: &mut BasebandWorkspace,
     coarse_freq_hz: f32,
 ) -> Option<RefinedCandidate> {
     refine_candidate_ft4_variants_with_cache(
@@ -120,6 +138,7 @@ fn refine_candidate_ft4_with_cache(
         spec,
         initial_baseband,
         refined_basebands,
+        baseband_workspace,
         coarse_freq_hz,
     )
     .into_iter()
@@ -141,6 +160,7 @@ pub(super) fn refine_candidate_ft4_variants_with_cache(
     spec: &ModeSpec,
     initial_baseband: &[Complex32],
     refined_basebands: &mut Vec<(i32, Vec<Complex32>)>,
+    baseband_workspace: &mut BasebandWorkspace,
     coarse_freq_hz: f32,
 ) -> Vec<RefinedCandidate> {
     debug_assert_eq!(spec.mode, Mode::Ft4);
@@ -230,6 +250,7 @@ pub(super) fn refine_candidate_ft4_variants_with_cache(
             baseband_plan,
             spec,
             refined_basebands,
+            baseband_workspace,
             freq_hz,
         ) else {
             continue;
@@ -271,7 +292,14 @@ pub(super) fn extract_candidate_at(
     start_seconds: f32,
     freq_hz: f32,
 ) -> Option<RefinedCandidate> {
-    let baseband = downsample_candidate(long_spectrum, baseband_plan, spec, freq_hz)?;
+    let mut baseband_workspace = BasebandWorkspace::new(baseband_plan);
+    let baseband = downsample_candidate_with_workspace(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        freq_hz,
+        &mut baseband_workspace,
+    )?;
     extract_candidate_from_baseband(&baseband, spec, start_seconds, freq_hz)
 }
 
@@ -282,7 +310,14 @@ pub(super) fn extract_candidate_at_relaxed(
     start_seconds: f32,
     freq_hz: f32,
 ) -> Option<RefinedCandidate> {
-    let baseband = downsample_candidate(long_spectrum, baseband_plan, spec, freq_hz)?;
+    let mut baseband_workspace = BasebandWorkspace::new(baseband_plan);
+    let baseband = downsample_candidate_with_workspace(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        freq_hz,
+        &mut baseband_workspace,
+    )?;
     extract_candidate_from_baseband_with_threshold(&baseband, spec, start_seconds, freq_hz, false)
 }
 
@@ -343,13 +378,20 @@ pub(super) fn cached_refined_baseband<'a>(
     baseband_plan: &BasebandPlan,
     spec: &ModeSpec,
     cache: &'a mut Vec<(i32, Vec<Complex32>)>,
+    baseband_workspace: &mut BasebandWorkspace,
     freq_hz: f32,
 ) -> Option<&'a [Complex32]> {
     let key = (freq_hz * 16.0).round() as i32;
     if let Some(index) = cache.iter().position(|(cached_key, _)| *cached_key == key) {
         return Some(cache[index].1.as_slice());
     }
-    let baseband = downsample_candidate(long_spectrum, baseband_plan, spec, freq_hz)?;
+    let baseband = downsample_candidate_with_workspace(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        freq_hz,
+        baseband_workspace,
+    )?;
     cache.push((key, baseband));
     cache.last().map(|(_, baseband)| baseband.as_slice())
 }
@@ -403,14 +445,39 @@ impl BasebandPlan {
     }
 }
 
+impl BasebandWorkspace {
+    pub(super) fn new(plan: &BasebandPlan) -> Self {
+        Self {
+            scratch: vec![Complex32::new(0.0, 0.0); plan.inverse.get_inplace_scratch_len()],
+        }
+    }
+}
+
 pub(super) fn downsample_candidate(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
     spec: &ModeSpec,
     freq_hz: f32,
 ) -> Option<Vec<Complex32>> {
+    let mut workspace = BasebandWorkspace::new(baseband_plan);
+    downsample_candidate_with_workspace(long_spectrum, baseband_plan, spec, freq_hz, &mut workspace)
+}
+
+pub(super) fn downsample_candidate_with_workspace(
+    long_spectrum: &LongSpectrum,
+    baseband_plan: &BasebandPlan,
+    spec: &ModeSpec,
+    freq_hz: f32,
+    workspace: &mut BasebandWorkspace,
+) -> Option<Vec<Complex32>> {
     if spec.mode == Mode::Ft4 {
-        return downsample_candidate_ft4(long_spectrum, baseband_plan, spec, freq_hz);
+        return downsample_candidate_ft4_with_workspace(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            freq_hz,
+            workspace,
+        );
     }
 
     let fft_bin_hz = spec.fft_bin_hz();
@@ -439,7 +506,9 @@ pub(super) fn downsample_candidate(
     let rotate = shift.min(baseband.len());
     baseband.rotate_left(rotate);
 
-    baseband_plan.inverse.process(&mut baseband);
+    baseband_plan
+        .inverse
+        .process_with_scratch(&mut baseband, &mut workspace.scratch);
     let scale = 1.0 / (spec.search.long_fft_samples as f32 * spec.baseband_samples() as f32).sqrt();
     for sample in &mut baseband {
         *sample *= scale;
@@ -447,11 +516,12 @@ pub(super) fn downsample_candidate(
     Some(baseband)
 }
 
-fn downsample_candidate_ft4(
+fn downsample_candidate_ft4_with_workspace(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
     spec: &ModeSpec,
     freq_hz: f32,
+    workspace: &mut BasebandWorkspace,
 ) -> Option<Vec<Complex32>> {
     downsample_candidate_ft4_with_normalization(
         long_spectrum,
@@ -459,14 +529,16 @@ fn downsample_candidate_ft4(
         spec,
         freq_hz,
         spec.baseband_symbol_samples() * spec.geometry.message_symbols,
+        workspace,
     )
 }
 
-pub(super) fn downsample_candidate_ft4_search(
+pub(super) fn downsample_candidate_ft4_search_with_workspace(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
     spec: &ModeSpec,
     freq_hz: f32,
+    workspace: &mut BasebandWorkspace,
 ) -> Option<Vec<Complex32>> {
     downsample_candidate_ft4_with_normalization(
         long_spectrum,
@@ -474,6 +546,7 @@ pub(super) fn downsample_candidate_ft4_search(
         spec,
         freq_hz,
         spec.baseband_samples(),
+        workspace,
     )
 }
 
@@ -483,6 +556,7 @@ fn downsample_candidate_ft4_with_normalization(
     spec: &ModeSpec,
     freq_hz: f32,
     norm_samples: usize,
+    workspace: &mut BasebandWorkspace,
 ) -> Option<Vec<Complex32>> {
     debug_assert_eq!(spec.mode, Mode::Ft4);
     let nfft2 = spec.baseband_samples();
@@ -509,7 +583,9 @@ fn downsample_candidate_ft4_with_normalization(
     for (value, &gain) in baseband.iter_mut().zip(ft4_downsample_window(spec).iter()) {
         *value *= gain * scale;
     }
-    baseband_plan.inverse.process(&mut baseband);
+    baseband_plan
+        .inverse
+        .process_with_scratch(&mut baseband, &mut workspace.scratch);
 
     let rms =
         (baseband.iter().map(|value| value.norm_sqr()).sum::<f32>() / norm_samples as f32).sqrt();

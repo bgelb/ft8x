@@ -454,6 +454,10 @@ struct BasebandPlan {
     inverse: Arc<dyn Fft<f32>>,
 }
 
+struct BasebandWorkspace {
+    scratch: Vec<Complex32>,
+}
+
 struct SubtractionPlan {
     spec: &'static ModeSpec,
     forward: Arc<dyn Fft<f32>>,
@@ -822,9 +826,14 @@ pub fn debug_ft4_variants_pcm(audio: &AudioBuffer, freq_hz: f32) -> Vec<Ft4Varia
 
     let long_spectrum = build_long_spectrum(audio, spec);
     let baseband_plan = BasebandPlan::new(spec);
-    let Some(initial_baseband) =
-        downsample_candidate_ft4_search(&long_spectrum, &baseband_plan, spec, freq_hz)
-    else {
+    let mut baseband_workspace = BasebandWorkspace::new(&baseband_plan);
+    let Some(initial_baseband) = downsample_candidate_ft4_search_with_workspace(
+        &long_spectrum,
+        &baseband_plan,
+        spec,
+        freq_hz,
+        &mut baseband_workspace,
+    ) else {
         return Vec::new();
     };
     let mut refined_basebands = Vec::new();
@@ -837,6 +846,7 @@ pub fn debug_ft4_variants_pcm(audio: &AudioBuffer, freq_hz: f32) -> Vec<Ft4Varia
         spec,
         &initial_baseband,
         &mut refined_basebands,
+        &mut baseband_workspace,
         freq_hz,
     )
     .into_iter()

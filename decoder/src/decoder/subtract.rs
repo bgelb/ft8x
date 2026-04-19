@@ -16,14 +16,16 @@ pub(super) fn subtract_candidate(
     success: &SuccessfulDecode,
     plan: &SubtractionPlan,
 ) {
-    subtract_candidate_with_dt_refinement(audio, success, plan, false);
+    let mut workspace = SubtractionWorkspace::new(plan);
+    subtract_candidate_with_workspace(audio, success, plan, false, &mut workspace);
 }
 
-pub(super) fn subtract_candidate_with_dt_refinement(
+pub(super) fn subtract_candidate_with_workspace(
     audio: &mut AudioBuffer,
     success: &SuccessfulDecode,
     plan: &SubtractionPlan,
     refine_dt: bool,
+    workspace: &mut SubtractionWorkspace,
 ) {
     let Some(channel_symbols) =
         channel_symbols_from_codeword_bits_for_mode(success.mode, &success.codeword_bits)
@@ -44,37 +46,87 @@ pub(super) fn subtract_candidate_with_dt_refinement(
         }
         Mode::Ft8 | Mode::Ft2 => spec.start_sample_from_dt(subtraction_dt_seconds),
     };
-    let offset_samples = if refine_dt {
-        let Some(offset_samples) = refined_subtraction_offset(
+    let (offset_samples, reuse_current_envelope) = if refine_dt {
+        let Some(offset_samples) = refined_subtraction_offset_with_workspace(
             audio,
             &reference,
             success.candidate.freq_hz,
             start_sample,
             plan,
+            workspace,
         ) else {
             return;
         };
-        offset_samples
+        (offset_samples, offset_samples == 0)
     } else {
-        0
+        (0, false)
     };
-    apply_subtraction(audio, &reference, start_sample + offset_samples, plan);
+    if reuse_current_envelope {
+        apply_subtraction_from_envelope(audio, &reference, start_sample, plan, workspace);
+    } else {
+        apply_subtraction_with_workspace(
+            audio,
+            &reference,
+            start_sample + offset_samples,
+            plan,
+            workspace,
+        );
+    }
 }
 
-pub(super) fn refined_subtraction_offset(
+#[cfg(test)]
+fn refined_subtraction_offset(
     audio: &AudioBuffer,
     reference: &[Complex32],
     freq_hz: f32,
     start_sample: isize,
     plan: &SubtractionPlan,
 ) -> Option<isize> {
+    let mut workspace = SubtractionWorkspace::new(plan);
+    refined_subtraction_offset_with_workspace(
+        audio,
+        reference,
+        freq_hz,
+        start_sample,
+        plan,
+        &mut workspace,
+    )
+}
+
+pub(super) fn refined_subtraction_offset_with_workspace(
+    audio: &AudioBuffer,
+    reference: &[Complex32],
+    freq_hz: f32,
+    start_sample: isize,
+    plan: &SubtractionPlan,
+    workspace: &mut SubtractionWorkspace,
+) -> Option<isize> {
     let spec = plan.spec;
     let probe_step = spec.subtraction.refine_probe_step_samples;
-    let sqm =
-        subtraction_residual_band_power(audio, reference, freq_hz, start_sample - probe_step, plan);
-    let sq0 = subtraction_residual_band_power(audio, reference, freq_hz, start_sample, plan);
-    let sqp =
-        subtraction_residual_band_power(audio, reference, freq_hz, start_sample + probe_step, plan);
+    let sqm = subtraction_residual_band_power_with_workspace(
+        audio,
+        reference,
+        freq_hz,
+        start_sample - probe_step,
+        plan,
+        workspace,
+    );
+    let sqp = subtraction_residual_band_power_with_workspace(
+        audio,
+        reference,
+        freq_hz,
+        start_sample + probe_step,
+        plan,
+        workspace,
+    );
+    let sq0 = subtraction_residual_band_power_with_workspace(
+        audio,
+        reference,
+        freq_hz,
+        start_sample,
+        plan,
+        workspace,
+    );
     // Fit a parabola through the residual power at -step / 0 / +step and keep the sub-sample
     // offset only when the quadratic minimum falls inside that probe window.
     let b = (sqp - sqm) * QUADRATIC_FIT_HALF_WEIGHT;
@@ -125,21 +177,22 @@ fn edge_correction(plan: &SubtractionPlan, frame_len: usize, offset: usize) -> f
     }
 }
 
-pub(super) fn subtraction_residual_band_power(
+fn subtraction_residual_band_power_with_workspace(
     audio: &AudioBuffer,
     reference: &[Complex32],
     freq_hz: f32,
     start_sample: isize,
     plan: &SubtractionPlan,
+    workspace: &mut SubtractionWorkspace,
 ) -> f32 {
     let spec = plan.spec;
-    let mut residual = vec![Complex32::new(0.0, 0.0); long_input_samples(spec)];
-    let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
+    filtered_subtraction_envelope_with_workspace(audio, reference, start_sample, plan, workspace);
+    workspace.residual.fill(Complex32::new(0.0, 0.0));
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
         let residual_window =
-            &mut residual[window.reference_start..window.reference_start + window.len];
+            &mut workspace.residual[window.reference_start..window.reference_start + window.len];
         let envelope_window =
-            &envelope[window.reference_start..window.reference_start + window.len];
+            &workspace.envelope[window.reference_start..window.reference_start + window.len];
         let reference_window =
             &reference[window.reference_start..window.reference_start + window.len];
         let audio_window = &audio.samples[window.signal_start..window.signal_start + window.len];
@@ -155,28 +208,30 @@ pub(super) fn subtraction_residual_band_power(
             *residual_slot = Complex32::new(sample - 2.0 * corrected.re, 0.0);
         }
     }
-    plan.forward.process(&mut residual);
+    plan.forward
+        .process_with_scratch(&mut workspace.residual, &mut workspace.scratch);
     let df = spec.geometry.sample_rate_hz as f32 / long_input_samples(spec) as f32;
     let start_bin = (spec.band_low_hz(freq_hz) / df).trunc().max(0.0) as usize;
     let end_bin = (spec.band_high_hz(freq_hz) / df)
         .trunc()
         .min((long_input_samples(spec) / 2) as f32) as usize;
-    residual[start_bin..=end_bin]
+    workspace.residual[start_bin..=end_bin]
         .iter()
         .map(|value| value.re * value.re + value.im * value.im)
         .sum()
 }
 
-pub(super) fn filtered_subtraction_envelope(
+fn filtered_subtraction_envelope_with_workspace(
     audio: &AudioBuffer,
     reference: &[Complex32],
     start_sample: isize,
     plan: &SubtractionPlan,
-) -> Vec<Complex32> {
-    let mut envelope = vec![Complex32::new(0.0, 0.0); long_input_samples(plan.spec)];
+    workspace: &mut SubtractionWorkspace,
+) {
+    workspace.envelope.fill(Complex32::new(0.0, 0.0));
     if let Some(window) = overlapping_window(start_sample, reference.len(), audio.samples.len()) {
         let envelope_window =
-            &mut envelope[window.reference_start..window.reference_start + window.len];
+            &mut workspace.envelope[window.reference_start..window.reference_start + window.len];
         let reference_window =
             &reference[window.reference_start..window.reference_start + window.len];
         let audio_window = &audio.samples[window.signal_start..window.signal_start + window.len];
@@ -188,32 +243,43 @@ pub(super) fn filtered_subtraction_envelope(
         }
     }
 
-    plan.forward.process(&mut envelope);
-    for (value, filter) in envelope.iter_mut().zip(&plan.filter_spectrum) {
+    plan.forward
+        .process_with_scratch(&mut workspace.envelope, &mut workspace.scratch);
+    for (value, filter) in workspace.envelope.iter_mut().zip(&plan.filter_spectrum) {
         *value *= *filter;
     }
-    plan.inverse.process(&mut envelope);
+    plan.inverse
+        .process_with_scratch(&mut workspace.envelope, &mut workspace.scratch);
     let scale = 1.0 / long_input_samples(plan.spec) as f32;
-    for value in &mut envelope {
+    for value in &mut workspace.envelope {
         *value *= scale;
     }
-
-    envelope
 }
 
-pub(super) fn apply_subtraction(
+fn apply_subtraction_with_workspace(
     audio: &mut AudioBuffer,
     reference: &[Complex32],
     start_sample: isize,
     plan: &SubtractionPlan,
+    workspace: &mut SubtractionWorkspace,
+) {
+    filtered_subtraction_envelope_with_workspace(audio, reference, start_sample, plan, workspace);
+    apply_subtraction_from_envelope(audio, reference, start_sample, plan, workspace);
+}
+
+fn apply_subtraction_from_envelope(
+    audio: &mut AudioBuffer,
+    reference: &[Complex32],
+    start_sample: isize,
+    plan: &SubtractionPlan,
+    workspace: &SubtractionWorkspace,
 ) {
     let frame_len = reference.len();
-    let envelope = filtered_subtraction_envelope(audio, reference, start_sample, plan);
     if let Some(window) = overlapping_window(start_sample, frame_len, audio.samples.len()) {
         let audio_window =
             &mut audio.samples[window.signal_start..window.signal_start + window.len];
         let envelope_window =
-            &envelope[window.reference_start..window.reference_start + window.len];
+            &workspace.envelope[window.reference_start..window.reference_start + window.len];
         let reference_window =
             &reference[window.reference_start..window.reference_start + window.len];
         for (local_offset, (audio_sample, (&envelope_value, &reference_value))) in audio_window
@@ -224,6 +290,27 @@ pub(super) fn apply_subtraction(
             let global_offset = window.reference_start + local_offset;
             let coeff = envelope_value * edge_correction(plan, frame_len, global_offset);
             *audio_sample -= 2.0 * (coeff * reference_value).re;
+        }
+    }
+}
+
+pub(super) struct SubtractionWorkspace {
+    envelope: Vec<Complex32>,
+    residual: Vec<Complex32>,
+    scratch: Vec<Complex32>,
+}
+
+impl SubtractionWorkspace {
+    pub(super) fn new(plan: &SubtractionPlan) -> Self {
+        let len = long_input_samples(plan.spec);
+        let scratch_len = plan
+            .forward
+            .get_inplace_scratch_len()
+            .max(plan.inverse.get_inplace_scratch_len());
+        Self {
+            envelope: vec![Complex32::new(0.0, 0.0); len],
+            residual: vec![Complex32::new(0.0, 0.0); len],
+            scratch: vec![Complex32::new(0.0, 0.0); scratch_len],
         }
     }
 }

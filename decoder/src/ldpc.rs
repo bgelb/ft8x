@@ -139,7 +139,6 @@ pub struct ParityMatrix {
     rows: Vec<Vec<usize>>,
     row_columns: Vec<Vec<usize>>,
     row_column_slots: Vec<Vec<usize>>,
-    column_rows: Vec<Vec<usize>>,
     generator_rows: Vec<Vec<u8>>,
 }
 
@@ -228,7 +227,6 @@ impl ParityMatrix {
             rows,
             row_columns,
             row_column_slots,
-            column_rows,
             generator_rows,
         }
     }
@@ -401,19 +399,7 @@ impl ParityMatrix {
                 }
             }
 
-            for column in 0..174 {
-                for (slot, &row_index) in self.column_rows[column].iter().enumerate() {
-                    let mut product = 1.0f32;
-                    for (row_slot, &other_column) in self.row_columns[row_index].iter().enumerate()
-                    {
-                        if other_column == column {
-                            continue;
-                        }
-                        product *= tanhtoc[row_index][row_slot];
-                    }
-                    tov[column][slot] = 2.0 * apply_bp_update_rule(bp_update_rule, -product);
-                }
-            }
+            self.update_variable_messages(&tanhtoc, &mut tov, bp_update_rule);
         }
 
         let osd_config = OsdConfig::from_norder(norder);
@@ -525,19 +511,7 @@ impl ParityMatrix {
                 }
             }
 
-            for column in 0..174 {
-                for (slot, &row_index) in self.column_rows[column].iter().enumerate() {
-                    let mut product = 1.0f32;
-                    for (row_slot, &other_column) in self.row_columns[row_index].iter().enumerate()
-                    {
-                        if other_column == column {
-                            continue;
-                        }
-                        product *= tanhtoc[row_index][row_slot];
-                    }
-                    tov[column][slot] = 2.0 * apply_bp_update_rule(bp_update_rule, -product);
-                }
-            }
+            self.update_variable_messages(&tanhtoc, &mut tov, bp_update_rule);
         }
 
         let ntheta = if maxosd == 0 {
@@ -642,20 +616,7 @@ impl ParityMatrix {
                 }
             }
 
-            for column in 0..174 {
-                for (slot, &row_index) in self.column_rows[column].iter().enumerate() {
-                    let mut product = 1.0f32;
-                    for (row_slot, &other_column) in self.row_columns[row_index].iter().enumerate()
-                    {
-                        if other_column == column {
-                            continue;
-                        }
-                        product *= tanhtoc[row_index][row_slot];
-                    }
-                    tov[column][slot] =
-                        2.0 * apply_bp_update_rule(BpUpdateRule::AtanhClamped, -product);
-                }
-            }
+            self.update_variable_messages(&tanhtoc, &mut tov, BpUpdateRule::AtanhClamped);
         }
 
         let osd_config = OsdConfig::from_norder(norder);
@@ -681,6 +642,27 @@ impl ParityMatrix {
         self.debug_osd(llrs, known_bits, config, 0)
             .codeword_bits
             .map(|bits| bits.bytes().map(|byte| u8::from(byte == b'1')).collect())
+    }
+
+    fn update_variable_messages(
+        &self,
+        tanhtoc: &[[f32; 7]; 83],
+        tov: &mut [[f32; 3]; 174],
+        bp_update_rule: BpUpdateRule,
+    ) {
+        for (row_index, columns) in self.row_columns.iter().enumerate() {
+            for (row_slot, &column) in columns.iter().enumerate() {
+                let mut product = 1.0f32;
+                for other_slot in 0..columns.len() {
+                    if other_slot == row_slot {
+                        continue;
+                    }
+                    product *= tanhtoc[row_index][other_slot];
+                }
+                let column_slot = self.row_column_slots[row_index][row_slot];
+                tov[column][column_slot] = 2.0 * apply_bp_update_rule(bp_update_rule, -product);
+            }
+        }
     }
 
     fn debug_osd(
@@ -875,16 +857,24 @@ impl ParityMatrix {
 
         const K: usize = 91;
         const N: usize = 174;
+        const PARITY: usize = N - K;
         const MRB_SEARCH_EXTRA: usize = 20;
 
-        let mut indices: Vec<usize> = (0..N).collect();
+        let no_known = [None; N];
+        let known_bits = known_bits.unwrap_or(&no_known);
+
+        let mut indices = [0usize; N];
+        for (index, slot) in indices.iter_mut().enumerate() {
+            *slot = index;
+        }
         indices.sort_by(|left, right| llrs[*right].abs().total_cmp(&llrs[*left].abs()));
 
-        let mut genmrb: Vec<Vec<u8>> = self
-            .generator_rows
-            .iter()
-            .map(|row| indices.iter().map(|&index| row[index]).collect())
-            .collect();
+        let mut genmrb = [[0u8; N]; K];
+        for (row_index, row) in genmrb.iter_mut().enumerate() {
+            for (column, &index) in indices.iter().enumerate() {
+                row[column] = self.generator_rows[row_index][index];
+            }
+        }
         let mut permuted_indices = indices;
 
         for pivot in 0..K {
@@ -905,34 +895,30 @@ impl ParityMatrix {
             }
         }
 
-        let hard: Vec<u8> = permuted_indices
-            .iter()
-            .map(|&index| {
-                known_bits
-                    .and_then(|bits| bits[index])
-                    .unwrap_or_else(|| u8::from(llrs[index] >= 0.0))
-            })
-            .collect();
-        let reliabilities: Vec<f32> = permuted_indices
-            .iter()
-            .map(|&index| llrs[index].abs())
-            .collect();
-        let apmask: Vec<bool> = permuted_indices
-            .iter()
-            .map(|&index| known_bits.and_then(|bits| bits[index]).is_some())
-            .collect();
+        let mut hard = [0u8; N];
+        let mut reliabilities = [0.0f32; N];
+        let mut apmask = [false; N];
+        for (slot, &index) in permuted_indices.iter().enumerate() {
+            hard[slot] = known_bits[index].unwrap_or_else(|| u8::from(llrs[index] >= 0.0));
+            reliabilities[slot] = llrs[index].abs();
+            apmask[slot] = known_bits[index].is_some();
+        }
 
-        let mut best_codeword = encode_mrb(&hard[..K], &genmrb);
-        let mut best_distance = weighted_distance(&best_codeword, &hard, &reliabilities);
+        let mut best_codeword = [0u8; N];
+        encode_mrb_array(&hard[..K], &genmrb, &mut best_codeword);
+        let mut best_distance = weighted_distance_array(&best_codeword, &hard, &reliabilities);
 
         for first in (0..K).rev() {
             if apmask[first] {
                 continue;
             }
-            let mut message = hard[..K].to_vec();
+            let mut message = [0u8; K];
+            message.copy_from_slice(&hard[..K]);
             message[first] ^= 1;
-            let codeword = encode_mrb(&message, &genmrb);
-            let parity_tail = xor_tail(&codeword, &hard, K);
+            let mut codeword = [0u8; N];
+            encode_mrb_array(&message, &genmrb, &mut codeword);
+            let mut parity_tail = [0u8; PARITY];
+            xor_tail_array(&codeword, &hard, &mut parity_tail);
             let nd1kpt = parity_tail
                 .iter()
                 .take(OSD_NT)
@@ -940,10 +926,10 @@ impl ParityMatrix {
                 .sum::<usize>()
                 + 1;
             if nd1kpt <= ntheta {
-                let distance = weighted_distance(&codeword, &hard, &reliabilities);
+                let distance = weighted_distance_array(&codeword, &hard, &reliabilities);
                 if distance < best_distance {
                     best_distance = distance;
-                    best_codeword = codeword.clone();
+                    best_codeword = codeword;
                 }
             }
 
@@ -965,17 +951,19 @@ impl ParityMatrix {
                     continue;
                 }
 
-                let mut message2 = message.clone();
+                let mut message2 = message;
                 message2[second] ^= 1;
-                let codeword2 = encode_mrb(&message2, &genmrb);
-                let distance = weighted_distance(&codeword2, &hard, &reliabilities);
+                let mut codeword2 = [0u8; N];
+                encode_mrb_array(&message2, &genmrb, &mut codeword2);
+                let distance = weighted_distance_array(&codeword2, &hard, &reliabilities);
                 if distance < best_distance {
                     best_distance = distance;
-                    best_codeword = codeword2.clone();
+                    best_codeword = codeword2;
                 }
 
                 if max_order >= 3 {
-                    let parity_tail2 = xor_tail(&codeword2, &hard, K);
+                    let mut parity_tail2 = [0u8; PARITY];
+                    xor_tail_array(&codeword2, &hard, &mut parity_tail2);
                     for third in (0..second).rev() {
                         if apmask[third] {
                             continue;
@@ -991,10 +979,11 @@ impl ParityMatrix {
                             continue;
                         }
 
-                        let mut message3 = message2.clone();
+                        let mut message3 = message2;
                         message3[third] ^= 1;
-                        let codeword3 = encode_mrb(&message3, &genmrb);
-                        let distance = weighted_distance(&codeword3, &hard, &reliabilities);
+                        let mut codeword3 = [0u8; N];
+                        encode_mrb_array(&message3, &genmrb, &mut codeword3);
+                        let distance = weighted_distance_array(&codeword3, &hard, &reliabilities);
                         if distance < best_distance {
                             best_distance = distance;
                             best_codeword = codeword3;
@@ -1004,7 +993,7 @@ impl ParityMatrix {
             }
         }
 
-        let restored = restore_osd_codeword(self, &best_codeword, &permuted_indices)?;
+        let restored = restore_osd_codeword_array(self, &best_codeword, &permuted_indices)?;
         if self.parity_ok(&restored) && crc::crc_matches(&restored[..77], &restored[77..91]) {
             Some(restored)
         } else {
@@ -1131,6 +1120,22 @@ fn encode_mrb(message: &[u8], generator_rows: &[Vec<u8>]) -> Vec<u8> {
     codeword
 }
 
+fn encode_mrb_array<const K: usize, const N: usize>(
+    message: &[u8],
+    generator_rows: &[[u8; N]; K],
+    codeword: &mut [u8; N],
+) {
+    codeword.fill(0);
+    for (row, bit) in generator_rows.iter().zip(message.iter().copied()) {
+        if bit == 0 {
+            continue;
+        }
+        for (slot, value) in codeword.iter_mut().zip(row) {
+            *slot ^= *value;
+        }
+    }
+}
+
 fn weighted_distance(codeword: &[u8], hard: &[u8], reliabilities: &[f32]) -> f32 {
     codeword
         .iter()
@@ -1138,6 +1143,20 @@ fn weighted_distance(codeword: &[u8], hard: &[u8], reliabilities: &[f32]) -> f32
         .zip(reliabilities)
         .map(|((&bit, &hard_bit), &weight)| if bit == hard_bit { 0.0 } else { weight })
         .sum()
+}
+
+fn weighted_distance_array<const N: usize>(
+    codeword: &[u8; N],
+    hard: &[u8; N],
+    reliabilities: &[f32; N],
+) -> f32 {
+    let mut distance = 0.0f32;
+    for index in 0..N {
+        if codeword[index] != hard[index] {
+            distance += reliabilities[index];
+        }
+    }
+    distance
 }
 
 fn xor_tail(codeword: &[u8], hard: &[u8], start: usize) -> Vec<u8> {
@@ -1148,12 +1167,38 @@ fn xor_tail(codeword: &[u8], hard: &[u8], start: usize) -> Vec<u8> {
         .collect()
 }
 
+fn xor_tail_array<const N: usize, const K: usize>(
+    codeword: &[u8; N],
+    hard: &[u8; N],
+    tail: &mut [u8; K],
+) {
+    for index in 0..K {
+        tail[index] = codeword[N - K + index] ^ hard[N - K + index];
+    }
+}
+
 fn restore_osd_codeword(
     parity: &ParityMatrix,
     codeword: &[u8],
     permuted_indices: &[usize],
 ) -> Option<Vec<u8>> {
     let mut restored = vec![0u8; codeword.len()];
+    for (column, bit) in codeword.iter().copied().enumerate() {
+        restored[permuted_indices[column]] = bit;
+    }
+    if parity.parity_ok(&restored) && crc::crc_matches(&restored[..77], &restored[77..91]) {
+        Some(restored)
+    } else {
+        None
+    }
+}
+
+fn restore_osd_codeword_array<const N: usize>(
+    parity: &ParityMatrix,
+    codeword: &[u8; N],
+    permuted_indices: &[usize; N],
+) -> Option<Vec<u8>> {
+    let mut restored = vec![0u8; N];
     for (column, bit) in codeword.iter().copied().enumerate() {
         restored[permuted_indices[column]] = bit;
     }

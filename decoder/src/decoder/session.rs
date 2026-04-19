@@ -259,13 +259,15 @@ pub(super) fn run_early47_search(
     if !options.disable_subtraction
         && let Some(stage41) = early41
     {
+        let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
         for success in &stage41.successes {
             if success.candidate.dt_seconds < spec.subtraction.refine_cutoff_seconds {
-                subtract_candidate_with_dt_refinement(
+                subtract_candidate_with_workspace(
                     &mut partial47,
                     success,
                     subtraction_plan,
                     true,
+                    &mut subtraction_workspace,
                 );
             }
         }
@@ -299,12 +301,14 @@ pub(super) fn run_full_search(
     let prepared_full =
         (!options.disable_subtraction && !initial_successes.is_empty()).then(|| {
             let mut prepared = audio.clone();
+            let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
             for success in &initial_successes {
-                subtract_candidate_with_dt_refinement(
+                subtract_candidate_with_workspace(
                     &mut prepared,
                     success,
                     subtraction_plan,
                     true,
+                    &mut subtraction_workspace,
                 );
             }
             prepared
@@ -478,6 +482,7 @@ fn debug_run_decode_search_inner(
     let mut residual_audio = residual_override.unwrap_or_else(|| audio.clone());
     let spec = options.mode.spec();
     let baseband_plan = BasebandPlan::new(spec);
+    let mut baseband_workspace = BasebandWorkspace::new(&baseband_plan);
     let subtraction_plan = SubtractionPlan::for_mode(options.mode);
     let parity = ParityMatrix::global();
     let mut top_candidates = Vec::new();
@@ -489,8 +494,15 @@ fn debug_run_decode_search_inner(
 
     let mut successes = initial_successes;
     if !options.disable_subtraction && !has_residual_override {
+        let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
         for success in &successes {
-            subtract_candidate(&mut residual_audio, success, subtraction_plan);
+            subtract_candidate_with_workspace(
+                &mut residual_audio,
+                success,
+                subtraction_plan,
+                false,
+                &mut subtraction_workspace,
+            );
         }
     }
 
@@ -518,6 +530,7 @@ fn debug_run_decode_search_inner(
         } else {
             None
         };
+        let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
         for candidate in &candidates {
             if options.mode == Mode::Ft4 && ft4_long_spectrum.is_none() {
                 ft4_long_spectrum = Some(build_long_spectrum(&residual_audio, spec));
@@ -534,6 +547,7 @@ fn debug_run_decode_search_inner(
                 search_grid,
                 &long_spectrum,
                 &baseband_plan,
+                &mut baseband_workspace,
                 candidate,
                 spec,
                 options,
@@ -573,14 +587,26 @@ fn debug_run_decode_search_inner(
                     // did this for all modes, and FT8 depends on it as well.
                     pass_changed = true;
                     if !options.disable_subtraction {
-                        subtract_candidate(&mut residual_audio, &success, subtraction_plan);
+                        subtract_candidate_with_workspace(
+                            &mut residual_audio,
+                            &success,
+                            subtraction_plan,
+                            false,
+                            &mut subtraction_workspace,
+                        );
                         ft4_long_spectrum = None;
                     }
                     continue;
                 }
                 pass_changed = true;
                 if !options.disable_subtraction {
-                    subtract_candidate(&mut residual_audio, &success, subtraction_plan);
+                    subtract_candidate_with_workspace(
+                        &mut residual_audio,
+                        &success,
+                        subtraction_plan,
+                        false,
+                        &mut subtraction_workspace,
+                    );
                     ft4_long_spectrum = None;
                 }
                 if capture_trace {
@@ -718,6 +744,7 @@ pub(super) fn try_candidate(
     _search_grid: SearchGrid,
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
+    baseband_workspace: &mut BasebandWorkspace,
     candidate: &DecodeCandidate,
     spec: &ModeSpec,
     options: &DecodeOptions,
@@ -733,6 +760,7 @@ pub(super) fn try_candidate(
         return try_candidate_ft4_ordered(
             long_spectrum,
             baseband_plan,
+            baseband_workspace,
             candidate,
             spec,
             options,
@@ -753,9 +781,21 @@ pub(super) fn try_candidate(
         return Vec::new();
     }
     let initial_baseband = if options.mode == Mode::Ft4 {
-        downsample_candidate_ft4_search(long_spectrum, baseband_plan, spec, coarse_freq_hz)
+        downsample_candidate_ft4_search_with_workspace(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            coarse_freq_hz,
+            baseband_workspace,
+        )
     } else {
-        downsample_candidate(long_spectrum, baseband_plan, spec, coarse_freq_hz)
+        downsample_candidate_with_workspace(
+            long_spectrum,
+            baseband_plan,
+            spec,
+            coarse_freq_hz,
+            baseband_workspace,
+        )
     };
     let Some(initial_baseband) = initial_baseband else {
         return Vec::new();
@@ -766,6 +806,7 @@ pub(super) fn try_candidate(
         spec,
         &initial_baseband,
         &mut refined_basebands,
+        baseband_workspace,
         candidate.start_seconds,
         coarse_freq_hz,
     ) {
@@ -830,6 +871,7 @@ pub(super) fn try_candidate(
 fn try_candidate_ft4_ordered(
     long_spectrum: &LongSpectrum,
     baseband_plan: &BasebandPlan,
+    baseband_workspace: &mut BasebandWorkspace,
     candidate: &DecodeCandidate,
     spec: &ModeSpec,
     options: &DecodeOptions,
@@ -845,9 +887,13 @@ fn try_candidate_ft4_ordered(
     if coarse_freq_hz < options.min_freq_hz || coarse_freq_hz > options.max_freq_hz {
         return Vec::new();
     }
-    let Some(initial_baseband) =
-        downsample_candidate_ft4_search(long_spectrum, baseband_plan, spec, coarse_freq_hz)
-    else {
+    let Some(initial_baseband) = downsample_candidate_ft4_search_with_workspace(
+        long_spectrum,
+        baseband_plan,
+        spec,
+        coarse_freq_hz,
+        baseband_workspace,
+    ) else {
         return Vec::new();
     };
     let mut refined_basebands = Vec::<(i32, Vec<Complex32>)>::new();
@@ -857,6 +903,7 @@ fn try_candidate_ft4_ordered(
         spec,
         &initial_baseband,
         &mut refined_basebands,
+        baseband_workspace,
         coarse_freq_hz,
     );
     let max_osd = options.max_osd_passes(outer_pass, coarse_freq_hz);

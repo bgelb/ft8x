@@ -706,8 +706,11 @@ pub(super) fn sync8_score(
     let sync_steps_per_symbol = spec.search.sync_step_divisor;
     let tone_bin_stride = spec.sync_tone_bin_stride();
     let sync_tone_span = spec.sync_tone_span_bins();
-    let mut block_signal = vec![0.0f32; geometry.sync_block_starts.len()];
-    let mut block_band = vec![0.0f32; geometry.sync_block_starts.len()];
+    const MAX_SYNC_BLOCKS: usize = 4;
+    let block_count = geometry.sync_block_starts.len();
+    debug_assert!(block_count <= MAX_SYNC_BLOCKS);
+    let mut block_signal = [0.0f32; MAX_SYNC_BLOCKS];
+    let mut block_band = [0.0f32; MAX_SYNC_BLOCKS];
 
     for (block_index, (&block_start, pattern)) in geometry
         .sync_block_starts
@@ -731,14 +734,14 @@ pub(super) fn sync8_score(
 
     let score_all = ratio_sync_score(
         spec,
-        block_signal.iter().copied().sum(),
-        block_band.iter().copied().sum(),
+        block_signal[..block_count].iter().copied().sum(),
+        block_band[..block_count].iter().copied().sum(),
     );
-    let score_tail = if block_signal.len() > 1 {
+    let score_tail = if block_count > 1 {
         ratio_sync_score(
             spec,
-            block_signal[1..].iter().copied().sum(),
-            block_band[1..].iter().copied().sum(),
+            block_signal[1..block_count].iter().copied().sum(),
+            block_band[1..block_count].iter().copied().sum(),
         )
     } else {
         0.0
