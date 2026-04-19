@@ -16,19 +16,19 @@
     "dataset_id": "kgoba-ft8-lib",
     "dataset_kind": "scored",
     "samples": 31,
-    "decode_count": 539,
+    "decode_count": 538,
     "truth_count": 429,
     "scored_truth_count": 418,
-    "tp": 410,
+    "tp": 408,
     "fp": 7,
-    "fn": 8
+    "fn": 10
   },
   {
     "profile_id": "medium",
     "dataset_id": "d9394-ft8-test-wave",
     "dataset_kind": "unscored",
     "samples": 11,
-    "decode_count": 47,
+    "decode_count": 46,
     "truth_count": 0,
     "scored_truth_count": 0,
     "tp": 0,
@@ -40,11 +40,11 @@
     "dataset_id": "kgoba-ft8-lib",
     "dataset_kind": "scored",
     "samples": 31,
-    "decode_count": 522,
+    "decode_count": 513,
     "truth_count": 429,
     "scored_truth_count": 418,
-    "tp": 397,
-    "fp": 7,
-    "fn": 21
+    "tp": 390,
+    "fp": 6,
+    "fn": 28
   }
 ]
