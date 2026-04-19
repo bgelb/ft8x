@@ -6,7 +6,7 @@ use ft8_decoder::{
     DecodeOptions, DecodeProfile, GridReport, Mode, TxRttyExchange, WaveformOptions,
     debug_candidate_truth_wav_file, debug_candidate_wav_file, debug_ft2_trace_wav_file,
     debug_ft4_decode174_wav_file, debug_ft4_metrics_wav_file, debug_ft4_search_probe_wav_file,
-    debug_ft4_variants_wav_file, debug_search_wav_file, decode_wav_file,
+    debug_ft4_variants_wav_file, debug_search_wav_file, debug_stages_wav_file, decode_wav_file,
     encode_rtty_contest_message, encode_standard_message, encode_standard_message_for_mode,
     parse_standard_info, subtract_truth_wav_file, write_rectangular_standard_wav, write_wav,
 };
@@ -76,6 +76,43 @@ enum Command {
     DebugSearch {
         #[arg(value_name = "WAV")]
         wav: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+
+        #[arg(long, default_value_t = 200.0)]
+        min_freq_hz: f32,
+
+        #[arg(long, default_value_t = 4000.0)]
+        max_freq_hz: f32,
+
+        #[arg(long, default_value_t = 600)]
+        max_candidates: usize,
+
+        #[arg(long, default_value_t = 200)]
+        max_successes: usize,
+
+        #[arg(long)]
+        search_passes: Option<usize>,
+
+        #[arg(long, default_value = "medium")]
+        profile: String,
+
+        #[arg(long, default_value = "ft8")]
+        mode: String,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        no_subtraction: bool,
+
+        #[arg(long, action = ArgAction::SetTrue)]
+        pretty: bool,
+    },
+    DebugStages {
+        #[arg(value_name = "WAV")]
+        wav: PathBuf,
+
+        #[arg(long)]
+        json: bool,
 
         #[arg(long, default_value_t = 200.0)]
         min_freq_hz: f32,
@@ -442,6 +479,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::DebugSearch {
             wav,
+            json: _,
             min_freq_hz,
             max_freq_hz,
             max_candidates,
@@ -465,6 +503,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_subtraction,
             );
             let report = debug_search_wav_file(&wav, &options)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::DebugStages {
+            wav,
+            json: _,
+            min_freq_hz,
+            max_freq_hz,
+            max_candidates,
+            max_successes,
+            search_passes,
+            profile,
+            mode,
+            no_subtraction,
+            pretty,
+        } => {
+            let profile = parse_profile(&profile)?;
+            let mode = parse_mode(&mode)?;
+            let options = decode_options_with_overrides(
+                mode,
+                profile,
+                min_freq_hz,
+                max_freq_hz,
+                max_candidates,
+                max_successes,
+                search_passes,
+                no_subtraction,
+            );
+            let report = debug_stages_wav_file(&wav, &options)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
