@@ -27,6 +27,42 @@ pub(super) fn subtract_candidate_with_workspace(
     refine_dt: bool,
     workspace: &mut SubtractionWorkspace,
 ) {
+    subtract_candidate_inner(
+        audio,
+        success,
+        plan,
+        refine_dt,
+        workspace,
+        SubtractionApplication::Contiguous,
+    );
+}
+
+pub(super) fn subtract_candidate_by_blocks_with_workspace(
+    audio: &mut AudioBuffer,
+    success: &SuccessfulDecode,
+    plan: &SubtractionPlan,
+    refine_dt: bool,
+    block_samples: usize,
+    workspace: &mut SubtractionWorkspace,
+) {
+    subtract_candidate_inner(
+        audio,
+        success,
+        plan,
+        refine_dt,
+        workspace,
+        SubtractionApplication::Blocks { block_samples },
+    );
+}
+
+fn subtract_candidate_inner(
+    audio: &mut AudioBuffer,
+    success: &SuccessfulDecode,
+    plan: &SubtractionPlan,
+    refine_dt: bool,
+    workspace: &mut SubtractionWorkspace,
+    application: SubtractionApplication,
+) {
     let Some(channel_symbols) =
         channel_symbols_from_codeword_bits_for_mode(success.mode, &success.codeword_bits)
     else {
@@ -62,7 +98,14 @@ pub(super) fn subtract_candidate_with_workspace(
         (0, false)
     };
     if reuse_current_envelope {
-        apply_subtraction_from_envelope(audio, &reference, start_sample, plan, workspace);
+        apply_subtraction_from_envelope(
+            audio,
+            &reference,
+            start_sample,
+            plan,
+            workspace,
+            application,
+        );
     } else {
         apply_subtraction_with_workspace(
             audio,
@@ -70,6 +113,7 @@ pub(super) fn subtract_candidate_with_workspace(
             start_sample + offset_samples,
             plan,
             workspace,
+            application,
         );
     }
 }
@@ -273,9 +317,16 @@ fn apply_subtraction_with_workspace(
     start_sample: isize,
     plan: &SubtractionPlan,
     workspace: &mut SubtractionWorkspace,
+    application: SubtractionApplication,
 ) {
     filtered_subtraction_envelope_with_workspace(audio, reference, start_sample, plan, workspace);
-    apply_subtraction_from_envelope(audio, reference, start_sample, plan, workspace);
+    apply_subtraction_from_envelope(audio, reference, start_sample, plan, workspace, application);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SubtractionApplication {
+    Contiguous,
+    Blocks { block_samples: usize },
 }
 
 fn apply_subtraction_from_envelope(
@@ -284,24 +335,112 @@ fn apply_subtraction_from_envelope(
     start_sample: isize,
     plan: &SubtractionPlan,
     workspace: &SubtractionWorkspace,
+    application: SubtractionApplication,
 ) {
     let frame_len = reference.len();
     if let Some(window) = overlapping_window(start_sample, frame_len, audio.samples.len()) {
-        let audio_window =
-            &mut audio.samples[window.signal_start..window.signal_start + window.len];
-        let envelope_window =
-            &workspace.envelope[window.reference_start..window.reference_start + window.len];
-        let reference_window =
-            &reference[window.reference_start..window.reference_start + window.len];
-        for (local_offset, (audio_sample, (&envelope_value, &reference_value))) in audio_window
-            .iter_mut()
-            .zip(envelope_window.iter().zip(reference_window.iter()))
-            .enumerate()
-        {
-            let global_offset = window.reference_start + local_offset;
-            let coeff = envelope_value * edge_correction(plan, frame_len, global_offset);
-            *audio_sample -= 2.0 * (coeff * reference_value).re;
+        match application {
+            SubtractionApplication::Contiguous => {
+                apply_subtraction_window(audio, reference, plan, workspace, frame_len, window)
+            }
+            SubtractionApplication::Blocks { block_samples } => apply_subtraction_window_by_blocks(
+                audio,
+                reference,
+                plan,
+                workspace,
+                frame_len,
+                window,
+                block_samples,
+            ),
         }
+    }
+}
+
+fn apply_subtraction_window(
+    audio: &mut AudioBuffer,
+    reference: &[Complex32],
+    plan: &SubtractionPlan,
+    workspace: &SubtractionWorkspace,
+    frame_len: usize,
+    window: OverlapWindow,
+) {
+    apply_subtraction_range(
+        audio, reference, plan, workspace, frame_len, window, 0, window.len,
+    );
+}
+
+fn apply_subtraction_window_by_blocks(
+    audio: &mut AudioBuffer,
+    reference: &[Complex32],
+    plan: &SubtractionPlan,
+    workspace: &SubtractionWorkspace,
+    frame_len: usize,
+    window: OverlapWindow,
+    block_samples: usize,
+) {
+    let block_samples = block_samples.max(1);
+    let absolute_start = window.reference_start;
+    let absolute_end = window.reference_start + window.len;
+    let first_block_end = absolute_start.next_multiple_of(block_samples);
+
+    let mut local_start = 0;
+    if first_block_end > absolute_start {
+        let local_end = (first_block_end - absolute_start).min(window.len);
+        apply_subtraction_range(
+            audio,
+            reference,
+            plan,
+            workspace,
+            frame_len,
+            window,
+            local_start,
+            local_end,
+        );
+        local_start = local_end;
+    }
+
+    while local_start < window.len {
+        let absolute = absolute_start + local_start;
+        let next_boundary = (absolute + block_samples).min(absolute_end);
+        let local_end = next_boundary - absolute_start;
+        apply_subtraction_range(
+            audio,
+            reference,
+            plan,
+            workspace,
+            frame_len,
+            window,
+            local_start,
+            local_end,
+        );
+        local_start = local_end;
+    }
+}
+
+fn apply_subtraction_range(
+    audio: &mut AudioBuffer,
+    reference: &[Complex32],
+    plan: &SubtractionPlan,
+    workspace: &SubtractionWorkspace,
+    frame_len: usize,
+    window: OverlapWindow,
+    local_start: usize,
+    local_end: usize,
+) {
+    let signal_start = window.signal_start + local_start;
+    let reference_start = window.reference_start + local_start;
+    let len = local_end - local_start;
+    let audio_window = &mut audio.samples[signal_start..signal_start + len];
+    let envelope_window = &workspace.envelope[reference_start..reference_start + len];
+    let reference_window = &reference[reference_start..reference_start + len];
+    for (local_offset, (audio_sample, (&envelope_value, &reference_value))) in audio_window
+        .iter_mut()
+        .zip(envelope_window.iter().zip(reference_window.iter()))
+        .enumerate()
+    {
+        let global_offset = reference_start + local_offset;
+        let coeff = envelope_value * edge_correction(plan, frame_len, global_offset);
+        *audio_sample -= 2.0 * (coeff * reference_value).re;
     }
 }
 
@@ -429,5 +568,53 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    #[test]
+    fn block_subtraction_matches_contiguous_subtraction() {
+        let mode = Mode::Ft8;
+        let frame =
+            crate::encode::encode_standard_message("CQ", "K1ABC", false, &GridReport::Blank)
+                .expect("encode frame");
+        let audio = crate::encode::synthesize_rectangular_waveform(
+            &frame,
+            &crate::encode::WaveformOptions {
+                base_freq_hz: 1_234.0,
+                amplitude: 1.0,
+                ..crate::encode::WaveformOptions::default()
+            },
+        )
+        .expect("audio");
+        let mut contiguous =
+            crate::encode::pad_audio_buffer_for_mode(&audio, mode).expect("padded audio");
+        let mut blocks = contiguous.clone();
+        let reference =
+            synthesize_subtraction_reference_for_mode(mode, &frame.channel_symbols, 1_234.0);
+        let plan = SubtractionPlan::for_mode(mode);
+        let start_sample = mode.spec().start_sample_from_dt(0.0);
+
+        let mut contiguous_workspace = SubtractionWorkspace::new(plan);
+        apply_subtraction_with_workspace(
+            &mut contiguous,
+            &reference,
+            start_sample,
+            plan,
+            &mut contiguous_workspace,
+            SubtractionApplication::Contiguous,
+        );
+
+        let mut block_workspace = SubtractionWorkspace::new(plan);
+        apply_subtraction_with_workspace(
+            &mut blocks,
+            &reference,
+            start_sample,
+            plan,
+            &mut block_workspace,
+            SubtractionApplication::Blocks {
+                block_samples: mode.spec().refine.early_block_samples,
+            },
+        );
+
+        assert_eq!(blocks.samples, contiguous.samples);
     }
 }
