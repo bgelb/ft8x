@@ -69,6 +69,17 @@ pub struct QsoOutcome {
     pub sent_terminal_73: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodeStageOutcome {
+    pub priority_direct_preempted: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RxTransitionOutcome {
+    exit_reason: Option<String>,
+    priority_direct_preempted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompoundHandoffPlan {
     pub next_station: StationStartInfo,
@@ -273,21 +284,34 @@ impl QsoController {
         decodes: &[ft8_decoder::DecodedMessage],
         now: SystemTime,
     ) {
-        self.on_decode_stage(slot_start, DecodeStage::Full, decodes, now);
+        let _ = self.on_decode_stage(slot_start, DecodeStage::Full, decodes, now);
     }
 
+    #[cfg(test)]
     pub fn on_decode_stage(
         &mut self,
         slot_start: SystemTime,
         stage: DecodeStage,
         decodes: &[ft8_decoder::DecodedMessage],
         now: SystemTime,
-    ) {
+    ) -> DecodeStageOutcome {
+        self.on_decode_stage_with_priority_direct(slot_start, stage, decodes, now, false)
+    }
+
+    pub fn on_decode_stage_with_priority_direct(
+        &mut self,
+        slot_start: SystemTime,
+        stage: DecodeStage,
+        decodes: &[ft8_decoder::DecodedMessage],
+        now: SystemTime,
+        priority_direct_available: bool,
+    ) -> DecodeStageOutcome {
+        let mut outcome = DecodeStageOutcome::default();
         let Some(session) = &mut self.session else {
-            return;
+            return outcome;
         };
         if slot_family_for_mode(session.app_mode, slot_start) == session.tx_slot_family {
-            return;
+            return outcome;
         }
         if stage == DecodeStage::Full {
             Self::restore_rx_slot_baseline_for_full(session, slot_start);
@@ -311,8 +335,9 @@ impl QsoController {
                 stage,
                 &event,
                 now,
+                priority_direct_available,
             );
-            return;
+            return outcome;
         }
         Self::roll_rx_stage_tracking(session, slot_start);
         session.compound_rr73_ready_slot = None;
@@ -335,7 +360,7 @@ impl QsoController {
 
         let should_consume = Self::should_consume_stage_event(session, stage, &event);
         if !should_consume {
-            return;
+            return outcome;
         }
         session.rx_slot_consumed_stage = Some(stage);
 
@@ -558,7 +583,20 @@ impl QsoController {
             QsoState::Send73Once => {}
         }
 
+        if priority_direct_available {
+            if let Some(reason) = Self::priority_direct_preempt_reason(session) {
+                exit_reason = Some(reason);
+                outcome.priority_direct_preempted = true;
+            }
+        }
+
         if let Some(reason) = exit_reason {
+            if outcome.priority_direct_preempted {
+                info!(
+                    slot = %format_timestamp(slot_start),
+                    "qso_preempted_for_priority_direct"
+                );
+            }
             if let Some(session) = &mut self.session {
                 if committed_next_tx {
                     session.pending_action = Some(PendingAction::Exit(reason.to_string()));
@@ -604,11 +642,11 @@ impl QsoController {
                         now,
                     );
                     session.next_tx_slot = schedule_next_tx_slot(session, slot_start);
-                    return;
+                    return outcome;
                 }
             }
             self.finish_session(reason, now);
-            return;
+            return outcome;
         }
 
         if let Some(session) = &mut self.session {
@@ -634,7 +672,7 @@ impl QsoController {
                             next_state.as_str()
                         ),
                     ) {
-                        return;
+                        return outcome;
                     }
                     session.pending_action = Some(PendingAction::Transition(next_state));
                     Self::log_late_tx_switch_wanted(
@@ -715,7 +753,7 @@ impl QsoController {
                             now,
                             format!("late-bound current tx: {desired_tx}"),
                         ) {
-                            return;
+                            return outcome;
                         }
                         Self::log_late_tx_switch_wanted(
                             session,
@@ -743,6 +781,7 @@ impl QsoController {
             }
             session.next_tx_slot = schedule_next_tx_slot(session, slot_start);
         }
+        outcome
     }
 
     pub fn tick(&mut self, now: SystemTime) {
@@ -1241,6 +1280,8 @@ impl QsoController {
         }
 
         let source_stage = provisional.source_stage;
+        let priority_direct_preempted = provisional.priority_direct_preempted;
+        let provisional_slot_start = provisional.slot_start;
         if let Some(reason) = provisional.exit_reason {
             let mut applied = *provisional.session;
             applied.transcript = session.transcript.clone();
@@ -1268,6 +1309,12 @@ impl QsoController {
                 now,
             );
             self.immediate_start_slot = Some(target_slot);
+            if priority_direct_preempted {
+                info!(
+                    slot = %format_timestamp(provisional_slot_start),
+                    "qso_preempted_for_priority_direct"
+                );
+            }
             self.finish_session(&reason, now);
             return;
         }
@@ -1362,11 +1409,8 @@ impl QsoController {
         true
     }
 
-    pub fn preempt_for_priority_direct(&mut self, now: SystemTime) -> bool {
-        let Some(session) = &self.session else {
-            return false;
-        };
-        let reason = match (session.start_mode, session.state, session.partner_rx_count) {
+    fn priority_direct_preempt_reason(session: &ActiveSession) -> Option<&'static str> {
+        match (session.start_mode, session.state, session.partner_rx_count) {
             (QsoStartMode::Normal, QsoState::SendGrid, 0) => Some("send_grid_no_msg_limit"),
             (_, QsoState::SendSig, 0)
                 if session.last_tx_slot.is_some() && session.no_msg_count > 0 =>
@@ -1375,7 +1419,15 @@ impl QsoController {
             }
             (QsoStartMode::Cq, QsoState::SendCq, _) => Some("send_cq_direct_preempt"),
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn preempt_for_priority_direct(&mut self, now: SystemTime) -> bool {
+        let Some(session) = &self.session else {
+            return false;
         };
+        let reason = Self::priority_direct_preempt_reason(session);
         let Some(reason) = reason else {
             return false;
         };
@@ -2016,6 +2068,7 @@ impl QsoController {
         stage: DecodeStage,
         event: &PartnerEvent,
         now: SystemTime,
+        priority_direct_available: bool,
     ) {
         if session.app_mode != Mode::Ft8 {
             return;
@@ -2028,8 +2081,15 @@ impl QsoController {
         let baseline = Self::clean_session_snapshot(session);
         let mut proposed = baseline.clone();
         let previous_state = proposed.state;
-        let exit_reason =
-            Self::apply_rx_event_to_session_state(config, &mut proposed, slot_start, stage, event);
+        let transition = Self::apply_rx_event_to_session_state(
+            config,
+            &mut proposed,
+            slot_start,
+            stage,
+            event,
+            priority_direct_available,
+        );
+        let exit_reason = transition.exit_reason;
         proposed.transcript = session.transcript.clone();
         proposed.rx_slot_baseline = None;
         proposed.provisional_rx_decision = None;
@@ -2063,6 +2123,7 @@ impl QsoController {
             source_stage: stage,
             target_slot,
             exit_reason,
+            priority_direct_preempted: transition.priority_direct_preempted,
             session: Box::new(proposed),
             baseline: Box::new(baseline),
         });
@@ -2074,7 +2135,8 @@ impl QsoController {
         slot_start: SystemTime,
         stage: DecodeStage,
         event: &PartnerEvent,
-    ) -> Option<String> {
+        priority_direct_available: bool,
+    ) -> RxTransitionOutcome {
         Self::roll_rx_stage_tracking(session, slot_start);
         session.compound_rr73_ready_slot = None;
         session.pending_action = None;
@@ -2282,6 +2344,12 @@ impl QsoController {
             QsoState::Send73Once => {}
         }
 
+        let priority_direct_preempted =
+            priority_direct_available && Self::priority_direct_preempt_reason(session).is_some();
+        if priority_direct_preempted {
+            exit_reason = Self::priority_direct_preempt_reason(session).map(str::to_string);
+        }
+
         if exit_reason.is_none() {
             if next_state != previous_state {
                 if matches!(next_state, QsoState::SendRR73 | QsoState::Send73Once) {
@@ -2294,7 +2362,10 @@ impl QsoController {
             session.next_tx_slot = schedule_next_tx_slot(session, slot_start);
         }
 
-        exit_reason
+        RxTransitionOutcome {
+            exit_reason,
+            priority_direct_preempted,
+        }
     }
 }
 
@@ -2374,6 +2445,7 @@ struct ProvisionalRxDecision {
     source_stage: DecodeStage,
     target_slot: Option<SystemTime>,
     exit_reason: Option<String>,
+    priority_direct_preempted: bool,
     session: Box<ActiveSession>,
     baseline: Box<ActiveSession>,
 }
@@ -4903,6 +4975,89 @@ mod tests {
         assert_eq!(snapshot.state, "send_73");
         assert_eq!(snapshot.no_msg_count, 0);
         assert_eq!(snapshot.no_fwd_count, 0);
+    }
+
+    #[test]
+    fn early_partner_decode_blocks_priority_direct_preempt() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = SystemTime::UNIX_EPOCH + Duration::from_secs(45);
+        let target_slot = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        {
+            let session = controller.session.as_mut().expect("session");
+            session.state = QsoState::SendGrid;
+            session.last_tx_slot = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(30));
+            session.next_tx_slot = None;
+        }
+
+        let outcome = controller.on_decode_stage_with_priority_direct(
+            rx_slot_start,
+            DecodeStage::Early41,
+            &[directed_decode("K1ABC", "N1VF", ToUsEvent::ReportLike)],
+            rx_slot_start + Duration::from_secs(12),
+            true,
+        );
+        assert!(!outcome.priority_direct_preempted);
+        assert_eq!(controller.snapshot(now).state, "send_grid");
+
+        controller.tick(tx_key_time_for_slot(target_slot, Mode::Ft8));
+
+        assert!(controller.drain_outcomes().is_empty());
+        let state = backend_state.lock().expect("manual tx state");
+        assert_eq!(state.launches, vec!["K1ABC N1VF R-07".to_string()]);
+        drop(state);
+        assert_eq!(controller.snapshot(now).state, "send_sig_ack");
+    }
+
+    #[test]
+    fn early_empty_decode_can_preempt_for_priority_direct() {
+        let backend_state = Arc::new(Mutex::new(ManualTxState::default()));
+        let mut controller = QsoController::new(
+            sample_config(),
+            Box::new(ManualTxBackend::new(backend_state.clone())),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let rx_slot_start = SystemTime::UNIX_EPOCH + Duration::from_secs(45);
+        let target_slot = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        {
+            let session = controller.session.as_mut().expect("session");
+            session.state = QsoState::SendGrid;
+            session.last_tx_slot = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(30));
+            session.next_tx_slot = None;
+        }
+
+        let outcome = controller.on_decode_stage_with_priority_direct(
+            rx_slot_start,
+            DecodeStage::Early41,
+            &[],
+            rx_slot_start + Duration::from_secs(12),
+            true,
+        );
+        assert!(!outcome.priority_direct_preempted);
+
+        controller.tick(tx_key_time_for_slot(target_slot, Mode::Ft8));
+
+        let state = backend_state.lock().expect("manual tx state");
+        assert!(state.launches.is_empty());
+        drop(state);
+        let outcomes = controller.drain_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].partner_call, "K1ABC");
+        assert_eq!(outcomes[0].exit_reason, "send_grid_no_msg_limit");
     }
 
     #[test]
