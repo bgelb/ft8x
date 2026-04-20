@@ -839,6 +839,19 @@ impl Rig {
         }
     }
 
+    pub fn read_telemetry(&mut self) -> Result<RigTelemetry> {
+        match self {
+            Self::K3s(rig) => Ok(RigTelemetry {
+                rx_s_meter: None,
+                tx_forward_power_w: rig.get_tx_output_power_w().ok(),
+                tx_swr: rig.get_last_tx_swr().ok(),
+                tx_alc: None,
+                bar_graph: rig.get_bar_graph().ok().map(|reading| reading.level),
+            }),
+            Self::Mchf(rig) => rig.read_telemetry(),
+        }
+    }
+
     pub fn read_snapshot(&mut self) -> Result<RigSnapshot> {
         let frequency_hz = self.get_frequency_hz()?;
         let mode = self.get_mode()?;
@@ -849,16 +862,7 @@ impl Rig {
             })
         })?;
         let transmitting = self.is_transmitting()?;
-        let telemetry = match self {
-            Self::K3s(rig) => RigTelemetry {
-                rx_s_meter: None,
-                tx_forward_power_w: rig.get_tx_output_power_w().ok(),
-                tx_swr: rig.get_last_tx_swr().ok(),
-                tx_alc: None,
-                bar_graph: rig.get_bar_graph().ok().map(|reading| reading.level),
-            },
-            Self::Mchf(rig) => rig.read_telemetry()?,
-        };
+        let telemetry = self.read_telemetry()?;
         let power = self.power_state()?;
         Ok(RigSnapshot {
             kind: self.kind(),
