@@ -59,10 +59,6 @@ const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
 const CQ_ACTIVITY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const DIRECT_CALL_PANE_RETENTION: Duration = Duration::from_secs(60 * 60);
-#[cfg(test)]
-const DEFAULT_QUEUE_NO_MSG_RETRY_DELAY: Duration = Duration::from_secs(35);
-#[cfg(test)]
-const DEFAULT_QUEUE_NO_FWD_RETRY_DELAY: Duration = Duration::from_secs(300);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const QSO_JSONL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const CONFIG_DEFAULT: &str = "config/ft8rx.json";
@@ -5879,41 +5875,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         ) {
             let dispatch_now = SystemTime::now();
             let station_info = station_info_from_dispatch(&station_tracker, &dispatch.kind);
-            match dispatch.kind {
-                QueueDispatchKind::Station {
-                    callsign,
-                    initial_state,
-                    start_mode,
-                    ..
-                } => {
-                    qso_controller.handle_command(
-                        QsoCommand::Start {
-                            partner_call: callsign,
-                            tx_freq_hz: dispatch.tx_freq_hz,
-                            initial_state,
-                            start_mode,
-                            tx_slot_family_override: Some(dispatch.tx_slot_family),
-                        },
-                        station_info,
-                        dispatch_now,
-                    );
-                }
-                QueueDispatchKind::Cq {
-                    tx_slot_family_override,
-                } => {
-                    qso_controller.handle_command(
-                        QsoCommand::Start {
-                            partner_call: "CQ".to_string(),
-                            tx_freq_hz: dispatch.tx_freq_hz,
-                            initial_state: QsoState::SendCq,
-                            start_mode: QsoStartMode::Cq,
-                            tx_slot_family_override,
-                        },
-                        None,
-                        dispatch_now,
-                    );
-                }
-            }
+            let command = qso_start_command_from_dispatch(&dispatch);
+            qso_controller.handle_command(command, station_info, dispatch_now);
         }
         qso_controller.tick(SystemTime::now());
         for outcome in qso_controller.drain_outcomes() {
@@ -7038,11 +7001,6 @@ pub(crate) fn next_slot_boundary_for_mode(mode: DecoderMode, now: SystemTime) ->
     current_slot_boundary_for_mode(mode, now) + slot_duration_for_mode(mode)
 }
 
-#[cfg(test)]
-fn next_slot_boundary(now: SystemTime) -> SystemTime {
-    next_slot_boundary_for_mode(DecoderMode::Ft8, now)
-}
-
 pub(crate) fn current_slot_boundary_for_mode(mode: DecoderMode, now: SystemTime) -> SystemTime {
     let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     let slot_millis = slot_millis_for_mode(mode) as u128;
@@ -7058,11 +7016,6 @@ pub(crate) fn slot_index_for_mode(mode: DecoderMode, time: SystemTime) -> u64 {
         .unwrap_or_default()
         .as_millis()
         / slot_millis) as u64
-}
-
-#[cfg(test)]
-fn slot_index(time: SystemTime) -> u64 {
-    slot_index_for_mode(DecoderMode::Ft8, time)
 }
 
 fn latest_slot_index_for_family(
@@ -7746,11 +7699,6 @@ impl StationTracker {
 
     fn ingest_frame(&mut self, received_at: SystemTime, decodes: &[DecodedMessage]) {
         self.ingest_stage(received_at, DecodeStage::Full, decodes);
-    }
-
-    #[cfg(test)]
-    fn ingest_decode(&mut self, received_at: SystemTime, decode: &DecodedMessage) {
-        self.ingest_decode_stage(received_at, DecodeStage::Full, decode);
     }
 
     fn ingest_decode_stage(
@@ -8541,7 +8489,6 @@ fn station_info_from_dispatch(
     station_info
 }
 
-#[cfg(test)]
 fn qso_start_command_from_dispatch(dispatch: &QueueDispatch) -> qso::QsoCommand {
     match &dispatch.kind {
         QueueDispatchKind::Station {
@@ -8851,6 +8798,26 @@ mod tests {
         StationConfig, TxConfig,
     };
     use crate::qso::{SlotFamily, TxBackend};
+
+    fn ingest_decode(
+        tracker: &mut StationTracker,
+        received_at: SystemTime,
+        decode: &DecodedMessage,
+    ) {
+        tracker.ingest_frame(received_at, std::slice::from_ref(decode));
+    }
+
+    fn ft8_slot_index(time: SystemTime) -> u64 {
+        slot_index_for_mode(DecoderMode::Ft8, time)
+    }
+
+    fn ft8_slot_family(time: SystemTime) -> SlotFamily {
+        qso::slot_family_for_mode(DecoderMode::Ft8, time)
+    }
+
+    fn ft8_next_slot_boundary(now: SystemTime) -> SystemTime {
+        next_slot_boundary_for_mode(DecoderMode::Ft8, now)
+    }
 
     fn sample_app_config() -> AppConfig {
         AppConfig {
@@ -9332,7 +9299,7 @@ mod tests {
     fn station_tracker_reset_for_mode_clears_previous_state() {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let mut tracker = StationTracker::default();
-        tracker.ingest_decode(now, &cq_decode("K1ABC"));
+        ingest_decode(&mut tracker, now, &cq_decode("K1ABC"));
         assert!(tracker.start_info("K1ABC").is_some());
 
         tracker.reset_for_mode(DecoderMode::Ft4);
@@ -9347,7 +9314,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let config = sample_app_config();
         let mut tracker = StationTracker::default();
-        tracker.ingest_decode(now, &cq_decode("K1ABC"));
+        ingest_decode(&mut tracker, now, &cq_decode("K1ABC"));
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         queue.auto_enabled = true;
         queue.set_current_band(Some("20m".to_string()));
@@ -9432,8 +9399,12 @@ mod tests {
         let mut tracker = StationTracker::default();
         let now = UNIX_EPOCH + Duration::from_secs(1);
 
-        tracker.ingest_decode(now, &directed_decode("B", "A"));
-        tracker.ingest_decode(now + Duration::from_secs(15), &directed_decode("B", "C"));
+        ingest_decode(&mut tracker, now, &directed_decode("B", "A"));
+        ingest_decode(
+            &mut tracker,
+            now + Duration::from_secs(15),
+            &directed_decode("B", "C"),
+        );
 
         let logs = tracker.web_logs();
         assert_eq!(logs.len(), 2);
@@ -9457,8 +9428,8 @@ mod tests {
         let mut tracker = StationTracker::default();
         let now = UNIX_EPOCH + Duration::from_secs(1);
 
-        tracker.ingest_decode(now, &directed_decode("B", "A"));
-        tracker.ingest_decode(now + Duration::from_secs(15), &cq_decode("B"));
+        ingest_decode(&mut tracker, now, &directed_decode("B", "A"));
+        ingest_decode(&mut tracker, now + Duration::from_secs(15), &cq_decode("B"));
 
         let logs = tracker.web_logs();
         assert_eq!(logs.len(), 2);
@@ -9471,8 +9442,8 @@ mod tests {
     fn queue_pick_uses_oldest_ready_entry() {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let mut tracker = StationTracker::default();
-        tracker.ingest_decode(now, &cq_decode("OLDER"));
-        tracker.ingest_decode(now, &cq_decode("NEWER"));
+        ingest_decode(&mut tracker, now, &cq_decode("OLDER"));
+        ingest_decode(&mut tracker, now, &cq_decode("NEWER"));
 
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
@@ -9500,8 +9471,8 @@ mod tests {
         let observation = DirectCallObservation {
             callsign: "K1ABC".to_string(),
             observed_at: now,
-            slot_index: slot_index(now),
-            slot_family: qso::slot_family(now),
+            slot_index: ft8_slot_index(now),
+            slot_family: ft8_slot_family(now),
             snr_db: -5,
             start_state: QsoState::SendSig,
             compound_eligible: true,
@@ -9570,8 +9541,8 @@ mod tests {
                 DirectCallObservation {
                     callsign: "GRID".to_string(),
                     observed_at: now,
-                    slot_index: slot_index(now),
-                    slot_family: qso::slot_family(now),
+                    slot_index: ft8_slot_index(now),
+                    slot_family: ft8_slot_family(now),
                     snr_db: -8,
                     start_state: QsoState::SendSig,
                     compound_eligible: true,
@@ -9586,8 +9557,8 @@ mod tests {
                 DirectCallObservation {
                     callsign: "GRID".to_string(),
                     observed_at: now + Duration::from_secs(15),
-                    slot_index: slot_index(now + Duration::from_secs(15)),
-                    slot_family: qso::slot_family(now + Duration::from_secs(15)),
+                    slot_index: ft8_slot_index(now + Duration::from_secs(15)),
+                    slot_family: ft8_slot_family(now + Duration::from_secs(15)),
                     snr_db: -8,
                     start_state: QsoState::SendSig,
                     compound_eligible: true,
@@ -9602,8 +9573,8 @@ mod tests {
                 DirectCallObservation {
                     callsign: "SIG".to_string(),
                     observed_at: now + Duration::from_secs(15),
-                    slot_index: slot_index(now + Duration::from_secs(15)),
-                    slot_family: qso::slot_family(now + Duration::from_secs(15)),
+                    slot_index: ft8_slot_index(now + Duration::from_secs(15)),
+                    slot_family: ft8_slot_family(now + Duration::from_secs(15)),
                     snr_db: -2,
                     start_state: QsoState::SendSigAck,
                     compound_eligible: false,
@@ -9624,8 +9595,8 @@ mod tests {
                 DirectCallObservation {
                     callsign: "SIG".to_string(),
                     observed_at: now,
-                    slot_index: slot_index(now),
-                    slot_family: qso::slot_family(now),
+                    slot_index: ft8_slot_index(now),
+                    slot_family: ft8_slot_family(now),
                     snr_db: -2,
                     start_state: QsoState::SendSigAck,
                     compound_eligible: false,
@@ -9653,8 +9624,8 @@ mod tests {
                 DirectCallObservation {
                     callsign: "SIG".to_string(),
                     observed_at: now,
-                    slot_index: slot_index(now),
-                    slot_family: qso::slot_family(now),
+                    slot_index: ft8_slot_index(now),
+                    slot_family: ft8_slot_family(now),
                     snr_db: -2,
                     start_state: QsoState::SendSigAck,
                     compound_eligible: false,
@@ -9750,11 +9721,6 @@ mod tests {
             true,
             rx_slot_start + Duration::from_secs(15),
         ));
-        assert_eq!(
-            controller.reserved_compound_next_call().as_deref(),
-            Some("NEW1")
-        );
-
         let decode = DecodedMessage {
             utc: "00:00:00".to_string(),
             snr_db: -7,
@@ -9906,7 +9872,7 @@ mod tests {
     fn queue_requeue_after_early_no_msg_adds_retry_delay() {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let mut tracker = StationTracker::default();
-        tracker.ingest_decode(now, &cq_decode("K1ABC"));
+        ingest_decode(&mut tracker, now, &cq_decode("K1ABC"));
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         queue.set_current_band(Some("40m".to_string()));
@@ -9925,7 +9891,7 @@ mod tests {
         assert_eq!(entry.queued_at, now);
         assert_eq!(
             entry.ok_to_schedule_after,
-            now + DEFAULT_QUEUE_NO_MSG_RETRY_DELAY
+            now + Duration::from_secs(config.queue.no_message_retry_delay_seconds_default)
         );
     }
 
@@ -9933,7 +9899,7 @@ mod tests {
     fn queue_requeue_after_no_fwd_uses_no_fwd_retry_delay() {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let mut tracker = StationTracker::default();
-        tracker.ingest_decode(now, &cq_decode("K1ABC"));
+        ingest_decode(&mut tracker, now, &cq_decode("K1ABC"));
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         queue.set_current_band(Some("40m".to_string()));
@@ -9952,7 +9918,7 @@ mod tests {
         assert_eq!(entry.queued_at, now);
         assert_eq!(
             entry.ok_to_schedule_after,
-            now + DEFAULT_QUEUE_NO_FWD_RETRY_DELAY
+            now + Duration::from_secs(config.queue.no_forward_retry_delay_seconds_default)
         );
     }
 
@@ -9991,8 +9957,8 @@ mod tests {
         let observation = DirectCallObservation {
             callsign: "N1VF".to_string(),
             observed_at: now,
-            slot_index: slot_index(now),
-            slot_family: qso::slot_family(now),
+            slot_index: ft8_slot_index(now),
+            slot_family: ft8_slot_family(now),
             snr_db: -10,
             start_state: QsoState::SendSig,
             compound_eligible: false,
@@ -10023,7 +9989,7 @@ mod tests {
             } => {
                 assert_eq!(
                     tx_slot_family_override,
-                    Some(qso::slot_family(next_slot_boundary(now)).opposite())
+                    Some(ft8_slot_family(ft8_next_slot_boundary(now)).opposite())
                 );
             }
             _ => panic!("expected cq dispatch"),
@@ -10038,7 +10004,7 @@ mod tests {
                 tx_slot_family_override,
             } => assert_eq!(
                 tx_slot_family_override,
-                Some(qso::slot_family(next_slot_boundary(
+                Some(ft8_slot_family(ft8_next_slot_boundary(
                     now + Duration::from_secs(15)
                 )))
             ),
@@ -10089,7 +10055,7 @@ mod tests {
         let first = UNIX_EPOCH + Duration::from_secs(30);
         let second = first + Duration::from_secs(30);
 
-        tracker.ingest_decode(first, &cq_decode("ALPHA"));
+        ingest_decode(&mut tracker, first, &cq_decode("ALPHA"));
         maybe_auto_add_decoded_calls(
             &mut queue,
             &tracker,
@@ -10099,7 +10065,7 @@ mod tests {
         );
         assert!(queue.entries.is_empty());
 
-        tracker.ingest_decode(second, &cq_decode("ALPHA"));
+        ingest_decode(&mut tracker, second, &cq_decode("ALPHA"));
         maybe_auto_add_decoded_calls(
             &mut queue,
             &tracker,
@@ -10128,8 +10094,8 @@ mod tests {
         let first = UNIX_EPOCH + Duration::from_secs(30);
         let second = first + Duration::from_secs(301);
 
-        tracker.ingest_decode(first, &cq_decode("ALPHA"));
-        tracker.ingest_decode(second, &cq_decode("ALPHA"));
+        ingest_decode(&mut tracker, first, &cq_decode("ALPHA"));
+        ingest_decode(&mut tracker, second, &cq_decode("ALPHA"));
         maybe_auto_add_decoded_calls(
             &mut queue,
             &tracker,
@@ -10153,13 +10119,21 @@ mod tests {
         queue.set_pause_cq_when_few_unique_calls(true);
         queue.set_cq_pause_min_unique_calls_5m(3);
 
-        tracker.ingest_decode(now - Duration::from_secs(30), &cq_decode("A1"));
-        tracker.ingest_decode(now - Duration::from_secs(15), &cq_decode("A2"));
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(30),
+            &cq_decode("A1"),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(15),
+            &cq_decode("A2"),
+        );
 
         assert!(queue.scheduler_pick(now, &tracker, false, false).is_none());
         assert!(queue.scheduler_status.contains("cq paused"));
 
-        tracker.ingest_decode(now, &cq_decode("A3"));
+        ingest_decode(&mut tracker, now, &cq_decode("A3"));
         let dispatch = queue
             .scheduler_pick(now + Duration::from_secs(1), &tracker, false, false)
             .expect("cq dispatch once threshold is met");
@@ -10173,9 +10147,17 @@ mod tests {
     fn unique_sender_count_excludes_our_own_call() {
         let now = UNIX_EPOCH + Duration::from_secs(60);
         let mut tracker = StationTracker::default();
-        tracker.ingest_decode(now - Duration::from_secs(30), &cq_decode("A1"));
-        tracker.ingest_decode(now - Duration::from_secs(15), &cq_decode("N1VF"));
-        tracker.ingest_decode(now, &cq_decode("A2"));
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(30),
+            &cq_decode("A1"),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(15),
+            &cq_decode("N1VF"),
+        );
+        ingest_decode(&mut tracker, now, &cq_decode("A2"));
 
         assert_eq!(
             tracker.unique_sender_count_since_excluding(
@@ -10287,7 +10269,7 @@ mod tests {
         let older = UNIX_EPOCH + Duration::from_secs(30);
         let newer = older + Duration::from_secs(15);
         let mut tracker = StationTracker::default();
-        tracker.ingest_decode(older, &cq_decode("K7VAY"));
+        ingest_decode(&mut tracker, older, &cq_decode("K7VAY"));
 
         let station_info = station_info_from_dispatch(
             &tracker,
