@@ -673,11 +673,13 @@ impl ParityMatrix {
         for (row_index, columns) in self.row_columns.iter().enumerate() {
             for (row_slot, &column) in columns.iter().enumerate() {
                 let mut product = 1.0f32;
-                for other_slot in 0..columns.len() {
+                for (other_slot, tanh_value) in
+                    tanhtoc[row_index].iter().enumerate().take(columns.len())
+                {
                     if other_slot == row_slot {
                         continue;
                     }
-                    product *= tanhtoc[row_index][other_slot];
+                    product *= *tanh_value;
                 }
                 let column_slot = self.row_column_slots[row_index][row_slot];
                 tov[column][column_slot] = 2.0 * apply_bp_update_rule(bp_update_rule, -product);
@@ -730,8 +732,9 @@ impl ParityMatrix {
                 }
                 for row in 0..K {
                     if row != pivot && genmrb[row][pivot] == 1 {
-                        for column in 0..N {
-                            genmrb[row][column] ^= genmrb[pivot][column];
+                        let pivot_row = genmrb[pivot].clone();
+                        for (column, cell) in genmrb[row].iter_mut().enumerate().take(N) {
+                            *cell ^= pivot_row[column];
                         }
                     }
                 }
@@ -909,8 +912,9 @@ impl ParityMatrix {
             }
             for row in 0..K {
                 if row != pivot && genmrb[row][pivot] == 1 {
-                    for column in 0..N {
-                        genmrb[row][column] ^= genmrb[pivot][column];
+                    let pivot_row = genmrb[pivot];
+                    for (column, cell) in genmrb[row].iter_mut().enumerate().take(N) {
+                        *cell ^= pivot_row[column];
                     }
                 }
             }
@@ -1239,13 +1243,13 @@ fn xor_tail_with_row_flips<const N: usize, const K: usize>(
     rows: &[&[u8; N]],
     tail: &mut [u8; K],
 ) {
-    for index in 0..K {
+    for (index, cell) in tail.iter_mut().enumerate().take(K) {
         let source_index = N - K + index;
         let mut bit = base[source_index];
         for row in rows {
             bit ^= row[source_index];
         }
-        tail[index] = bit ^ hard[source_index];
+        *cell = bit ^ hard[source_index];
     }
 }
 
@@ -1408,7 +1412,7 @@ mod tests {
     #[test]
     fn decodes_all_zero_codeword() {
         let parity = ParityMatrix::global();
-        assert!(parity.parity_ok(&vec![0u8; 174]));
+        assert!(parity.parity_ok(&[0u8; 174]));
         let llrs = vec![-10.0f32; 174];
         let (bits, _) = parity.decode(&llrs).expect("decode");
         assert!(bits.iter().all(|bit| *bit == 0));

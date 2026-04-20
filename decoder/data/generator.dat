@@ -1,4 +1,4 @@
-This file contains the generator matrix for the FT8/FT4 (174,91) LDPC code. 
+This file contains the generator matrix for the FT8/FT4 (174,91) LDPC code.
 The matrix has 91 columns and 83 rows.
 
 1000001100101001110011100001000110111111001100011110101011110101000010011111001001111111110

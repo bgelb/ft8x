@@ -265,6 +265,7 @@ impl QsoController {
         }
     }
 
+    #[cfg(test)]
     pub fn on_full_decode(
         &mut self,
         slot_start: SystemTime,
@@ -1043,6 +1044,7 @@ impl QsoController {
             .map(|session| session.partner_call.clone())
     }
 
+    #[cfg(test)]
     pub fn reserved_compound_next_call(&self) -> Option<String> {
         self.session
             .as_ref()
@@ -3537,6 +3539,7 @@ fn is_next_tx_slot_committed(
     session.last_tx_slot == Some(candidate_slot)
 }
 
+#[cfg(test)]
 pub fn slot_family(time: SystemTime) -> SlotFamily {
     slot_family_for_mode(Mode::Ft8, time)
 }

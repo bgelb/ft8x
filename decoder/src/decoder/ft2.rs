@@ -453,14 +453,19 @@ fn sequence_metrics(
     let half = nbit / 2;
     let numseq = 1usize << nbit;
     let mut metrics = *previous;
-    for target in half..(FT2_MESSAGE_SYMBOLS - half) {
+    for (target, metric) in metrics
+        .iter_mut()
+        .enumerate()
+        .take(FT2_MESSAGE_SYMBOLS - half)
+        .skip(half)
+    {
         let mut max1 = 0.0f32;
         let mut max0 = 0.0f32;
         for seq in 0..numseq {
             let mut csum = Complex32::new(0.0, 0.0);
             let mut cterm = Complex32::new(1.0, 0.0);
             for pos in 0..nbit {
-                let bit = ((seq >> (nbit - 1 - pos)) & 1) as usize;
+                let bit = (seq >> (nbit - 1 - pos)) & 1;
                 let index = target - half + pos;
                 csum += if bit == 1 { ccor1[index] } else { ccor0[index] } * cterm;
                 cterm *= if bit == 1 { refs.cc1 } else { refs.cc0 };
@@ -472,7 +477,7 @@ fn sequence_metrics(
                 max0 = max0.max(score);
             }
         }
-        metrics[target] = max1 - max0;
+        *metric = max1 - max0;
     }
     metrics
 }
@@ -750,8 +755,10 @@ impl Ft2ParityMatrix {
             }
             for row in 0..FT2_INFO_BITS {
                 if row != pivot && genmrb[row][pivot] == 1 {
-                    for column in 0..FT2_COLUMN_COUNT {
-                        genmrb[row][column] ^= genmrb[pivot][column];
+                    let pivot_row = genmrb[pivot].clone();
+                    for (column, cell) in genmrb[row].iter_mut().enumerate().take(FT2_COLUMN_COUNT)
+                    {
+                        *cell ^= pivot_row[column];
                     }
                 }
             }

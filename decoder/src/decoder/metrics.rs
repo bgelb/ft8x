@@ -450,16 +450,12 @@ pub(super) fn decode_llr_set(
     counters: &mut DecodeCounters,
 ) -> Option<(Payload, Vec<u8>, usize)> {
     let policy = ldpc_decode_policy(mode);
-    let Some((bits, iterations)) = parity.decode_with_policy(llrs, None, max_osd, policy) else {
-        return None;
-    };
+    let (bits, iterations) = parity.decode_with_policy(llrs, None, max_osd, policy)?;
     if bits.iter().all(|bit| *bit == 0) {
         return None;
     }
     counters.ldpc_codewords += 1;
-    let Some(payload) = unpack_message_for_mode(mode, &bits) else {
-        return None;
-    };
+    let payload = unpack_message_for_mode(mode, &bits)?;
     if matches!(payload, Payload::Unsupported(_)) {
         return None;
     }
@@ -476,18 +472,12 @@ pub(super) fn decode_llr_set_with_known_bits(
     counters: &mut DecodeCounters,
 ) -> Option<(Payload, Vec<u8>, usize)> {
     let policy = ldpc_decode_policy(mode);
-    let Some((bits, iterations)) =
-        parity.decode_with_policy(llrs, Some(known_bits), max_osd, policy)
-    else {
-        return None;
-    };
+    let (bits, iterations) = parity.decode_with_policy(llrs, Some(known_bits), max_osd, policy)?;
     if bits.iter().all(|bit| *bit == 0) {
         return None;
     }
     counters.ldpc_codewords += 1;
-    let Some(payload) = unpack_message_for_mode(mode, &bits) else {
-        return None;
-    };
+    let payload = unpack_message_for_mode(mode, &bits)?;
     if matches!(payload, Payload::Unsupported(_)) {
         return None;
     }

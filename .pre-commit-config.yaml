@@ -1,0 +1,25 @@
+exclude: ^(artifacts/|golden/|decoder/data/distilled/.+\.wav$)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt (all Rust crates)
+        entry: bash -c 'cargo fmt --manifest-path decoder/Cargo.toml && cargo fmt --manifest-path audiolib/Cargo.toml && cargo fmt --manifest-path rigctl/Cargo.toml && cargo fmt --manifest-path ft8rx/Cargo.toml'
+        language: system
+        pass_filenames: false
+        files: \.rs$
+      - id: clippy
+        name: clippy (all Rust crates)
+        entry: bash -c 'cargo clippy --manifest-path decoder/Cargo.toml --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::collapsible_if -A clippy::result_large_err -A clippy::needless_range_loop && cargo clippy --manifest-path audiolib/Cargo.toml --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::collapsible_if -A clippy::result_large_err -A clippy::needless_range_loop && cargo clippy --manifest-path rigctl/Cargo.toml --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::collapsible_if -A clippy::result_large_err -A clippy::needless_range_loop && cargo clippy --manifest-path ft8rx/Cargo.toml --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::collapsible_if -A clippy::result_large_err -A clippy::needless_range_loop'
+        language: system
+        pass_filenames: false
+        files: \.rs$

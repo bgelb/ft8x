@@ -59,7 +59,9 @@ const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
 const CQ_ACTIVITY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const DIRECT_CALL_PANE_RETENTION: Duration = Duration::from_secs(60 * 60);
+#[cfg(test)]
 const DEFAULT_QUEUE_NO_MSG_RETRY_DELAY: Duration = Duration::from_secs(35);
+#[cfg(test)]
 const DEFAULT_QUEUE_NO_FWD_RETRY_DELAY: Duration = Duration::from_secs(300);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const QSO_JSONL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -1500,7 +1502,7 @@ impl WorkQueueState {
                             <= RECENT_WORKED_RETENTION
                     })
             });
-            if worked_recently && !(entry.direct_pending && !ignore_direct) {
+            if worked_recently && (ignore_direct || !entry.direct_pending) {
                 info!(
                     callsign = entry.callsign,
                     band = current_band.clone().unwrap_or_default(),
@@ -1531,7 +1533,7 @@ impl WorkQueueState {
         now: SystemTime,
     ) -> QueueEntryStatus {
         if self.was_worked_recently_on_current_band(&entry.callsign, now)
-            && !(entry.direct_pending && !self.ignore_direct_calls_from_recently_worked)
+            && (self.ignore_direct_calls_from_recently_worked || !entry.direct_pending)
         {
             return QueueEntryStatus {
                 last_heard_at: Some(entry.last_observed_at),
@@ -7036,6 +7038,7 @@ pub(crate) fn next_slot_boundary_for_mode(mode: DecoderMode, now: SystemTime) ->
     current_slot_boundary_for_mode(mode, now) + slot_duration_for_mode(mode)
 }
 
+#[cfg(test)]
 fn next_slot_boundary(now: SystemTime) -> SystemTime {
     next_slot_boundary_for_mode(DecoderMode::Ft8, now)
 }
@@ -7057,6 +7060,7 @@ pub(crate) fn slot_index_for_mode(mode: DecoderMode, time: SystemTime) -> u64 {
         / slot_millis) as u64
 }
 
+#[cfg(test)]
 fn slot_index(time: SystemTime) -> u64 {
     slot_index_for_mode(DecoderMode::Ft8, time)
 }
@@ -7744,6 +7748,7 @@ impl StationTracker {
         self.ingest_stage(received_at, DecodeStage::Full, decodes);
     }
 
+    #[cfg(test)]
     fn ingest_decode(&mut self, received_at: SystemTime, decode: &DecodedMessage) {
         self.ingest_decode_stage(received_at, DecodeStage::Full, decode);
     }
@@ -8536,6 +8541,7 @@ fn station_info_from_dispatch(
     station_info
 }
 
+#[cfg(test)]
 fn qso_start_command_from_dispatch(dispatch: &QueueDispatch) -> qso::QsoCommand {
     match &dispatch.kind {
         QueueDispatchKind::Station {

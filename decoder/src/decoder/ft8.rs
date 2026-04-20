@@ -143,7 +143,7 @@ fn spectrum_baseline_db(
     if nlen == 0 {
         return None;
     }
-    let i0 = ((ib - ia + 1) / 2) as f64;
+    let i0 = (ib - ia).div_ceil(2) as f64;
     let mut xs = Vec::<f64>::with_capacity(BASELINE_MAX_POINTS);
     let mut ys = Vec::<f64>::with_capacity(BASELINE_MAX_POINTS);
     for seg in 0..BASELINE_SEGMENTS {

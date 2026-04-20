@@ -854,16 +854,17 @@ fn parse_rendered_standard_message(
 fn tail_candidates(tokens: &[&str]) -> Vec<(usize, bool, GridReport)> {
     let mut candidates = vec![(tokens.len(), false, GridReport::Blank)];
 
-    if tokens.len() >= 3 {
-        if let Some((acknowledge, info)) = parse_trailing_info_token(tokens[tokens.len() - 1]) {
-            candidates.push((tokens.len() - 1, acknowledge, info));
-        }
+    if tokens.len() >= 3
+        && let Some((acknowledge, info)) = parse_trailing_info_token(tokens[tokens.len() - 1])
+    {
+        candidates.push((tokens.len() - 1, acknowledge, info));
     }
 
-    if tokens.len() >= 4 && tokens[tokens.len() - 2].eq_ignore_ascii_case("R") {
-        if let Ok(info) = parse_standard_info(tokens[tokens.len() - 1]) {
-            candidates.push((tokens.len() - 2, true, info));
-        }
+    if tokens.len() >= 4
+        && tokens[tokens.len() - 2].eq_ignore_ascii_case("R")
+        && let Ok(info) = parse_standard_info(tokens[tokens.len() - 1])
+    {
+        candidates.push((tokens.len() - 2, true, info));
     }
 
     candidates
@@ -873,14 +874,13 @@ fn parse_trailing_info_token(token: &str) -> Option<(bool, GridReport)> {
     if token.eq_ignore_ascii_case("R") {
         return Some((true, GridReport::Blank));
     }
-    if !token.eq_ignore_ascii_case("RRR") && !token.eq_ignore_ascii_case("RR73") {
-        if let Some(rest) = token.strip_prefix('R').or_else(|| token.strip_prefix('r')) {
-            if !rest.is_empty() {
-                if let Ok(info) = parse_standard_info(rest) {
-                    return Some((true, info));
-                }
-            }
-        }
+    if !token.eq_ignore_ascii_case("RRR")
+        && !token.eq_ignore_ascii_case("RR73")
+        && let Some(rest) = token.strip_prefix('R').or_else(|| token.strip_prefix('r'))
+        && !rest.is_empty()
+        && let Ok(info) = parse_standard_info(rest)
+    {
+        return Some((true, info));
     }
     parse_standard_info(token).ok().map(|info| (false, info))
 }

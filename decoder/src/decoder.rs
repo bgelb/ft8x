@@ -37,10 +37,11 @@ use refine::*;
 use search::*;
 use subtract::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum DecodeProfile {
     Quick,
+    #[default]
     Medium,
     Deepest,
 }
@@ -52,12 +53,6 @@ impl DecodeProfile {
             Self::Medium => "medium",
             Self::Deepest => "deepest",
         }
-    }
-}
-
-impl Default for DecodeProfile {
-    fn default() -> Self {
-        Self::Medium
     }
 }
 
@@ -1526,7 +1521,7 @@ mod tests {
             .map(|decode| decode.text.as_str())
             .collect();
         assert!(
-            learned_texts.iter().any(|text| *text == "CQ HF19NY"),
+            learned_texts.contains(&"CQ HF19NY"),
             "expected plain learned call in {learned_texts:?}"
         );
 
@@ -1538,7 +1533,7 @@ mod tests {
             .map(|decode| decode.text.as_str())
             .collect();
         assert!(
-            resolved_texts.iter().any(|text| *text == "CQ HF19NY"),
+            resolved_texts.contains(&"CQ HF19NY"),
             "expected resolved call in {resolved_texts:?}"
         );
     }
@@ -1727,9 +1722,7 @@ mod tests {
             .map(|decode| decode.text.as_str())
             .collect();
         assert!(
-            resolved_texts
-                .iter()
-                .any(|text| *text == "HF19NY K1ABC R-07"),
+            resolved_texts.contains(&"HF19NY K1ABC R-07"),
             "expected resolved hashed partner in {resolved_texts:?}"
         );
     }
@@ -1854,9 +1847,7 @@ mod tests {
             .map(|decode| decode.text.as_str())
             .collect();
         assert!(
-            unresolved_texts
-                .iter()
-                .any(|text| *text == "K1ABC RR73; W9XYZ <...> -12"),
+            unresolved_texts.contains(&"K1ABC RR73; W9XYZ <...> -12"),
             "expected unresolved dxpedition text in {unresolved_texts:?}"
         );
 
@@ -1870,9 +1861,7 @@ mod tests {
             .map(|decode| decode.text.as_str())
             .collect();
         assert!(
-            resolved_texts
-                .iter()
-                .any(|text| *text == "K1ABC RR73; W9XYZ <KH1/KH7Z> -12"),
+            resolved_texts.contains(&"K1ABC RR73; W9XYZ <KH1/KH7Z> -12"),
             "expected resolved dxpedition text in {resolved_texts:?}"
         );
     }

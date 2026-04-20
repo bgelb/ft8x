@@ -408,25 +408,13 @@ pub enum RigPowerState {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct RigTelemetry {
     pub rx_s_meter: Option<f32>,
     pub tx_forward_power_w: Option<f32>,
     pub tx_swr: Option<f32>,
     pub tx_alc: Option<f32>,
     pub bar_graph: Option<u8>,
-}
-
-impl Default for RigTelemetry {
-    fn default() -> Self {
-        Self {
-            rx_s_meter: None,
-            tx_forward_power_w: None,
-            tx_swr: None,
-            tx_alc: None,
-            bar_graph: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

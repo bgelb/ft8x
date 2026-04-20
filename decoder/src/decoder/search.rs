@@ -471,7 +471,7 @@ fn ft4_baseline(savg: &[f32], nfa: usize, nfb: usize) -> Vec<f32> {
         return vec![0.0f32; savg.len()];
     }
     // Match WSJT-X ft4_baseline.f90 exactly: integer midpoint, not half-bin midpoint.
-    let i0 = ((ib - ia + 1) / 2) as f64;
+    let i0 = (ib - ia).div_ceil(2) as f64;
     let mut xs = Vec::<f64>::with_capacity(BASELINE_MAX_POINTS);
     let mut ys = Vec::<f64>::with_capacity(BASELINE_MAX_POINTS);
 
@@ -536,9 +536,7 @@ pub(super) fn polyfit_degree4(xs: &[f64], ys: &[f64]) -> Option<[f64; 5]> {
 
     let mut normal = [[0.0f64; NTERMS]; NTERMS];
     for row in 0..NTERMS {
-        for col in 0..NTERMS {
-            normal[row][col] = sumx[row + col];
-        }
+        normal[row][..NTERMS].copy_from_slice(&sumx[row..(NTERMS + row)]);
     }
     let delta = determ(normal, NTERMS);
     if delta == 0.0 {
@@ -562,8 +560,8 @@ fn determ(mut array: [[f64; 5]; 5], norder: usize) -> f64 {
     while k < norder {
         if array[k][k] == 0.0 {
             let mut swap_col = None;
-            for col in k..norder {
-                if array[k][col] != 0.0 {
+            for (col, value) in array[k].iter().enumerate().take(norder).skip(k) {
+                if *value != 0.0 {
                     swap_col = Some(col);
                     break;
                 }
@@ -571,17 +569,20 @@ fn determ(mut array: [[f64; 5]; 5], norder: usize) -> f64 {
             let Some(col) = swap_col else {
                 return 0.0;
             };
-            for row in k..norder {
-                array[row].swap(col, k);
+            for row in array.iter_mut().take(norder).skip(k) {
+                row.swap(col, k);
             }
             determ = -determ;
         }
         determ *= array[k][k];
         if k + 1 < norder {
             let k1 = k + 1;
-            for row in k1..norder {
-                for col in k1..norder {
-                    array[row][col] -= array[row][k] * array[k][col] / array[k][k];
+            let pivot_row = array[k];
+            let pivot_diag = pivot_row[k];
+            for row in array.iter_mut().take(norder).skip(k1) {
+                let row_k = row[k];
+                for (col, cell) in row.iter_mut().enumerate().take(norder).skip(k1) {
+                    *cell -= row_k * pivot_row[col] / pivot_diag;
                 }
             }
         }
