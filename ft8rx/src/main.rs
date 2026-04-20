@@ -22,7 +22,7 @@ use qso::{
 use rigctl::audio::{AudioDevice, AudioStreamConfig, SampleStream, play_tone};
 use rigctl::{
     Band, Mode as RigMode, Rig, RigConnectionConfig, RigKind, RigPowerRequest, RigPowerState,
-    RigSnapshot as CommonRigSnapshot, TxMeterMode, detect_audio_device_for_rig,
+    RigSnapshot as CommonRigSnapshot, RigTelemetry, TxMeterMode, detect_audio_device_for_rig,
     detect_audio_output_device_for_rig, resolve_rig_kind,
 };
 use rustfft::FftPlanner;
@@ -63,6 +63,7 @@ const DEFAULT_QUEUE_NO_MSG_RETRY_DELAY: Duration = Duration::from_secs(35);
 const DEFAULT_QUEUE_NO_FWD_RETRY_DELAY: Duration = Duration::from_secs(300);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const QSO_JSONL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const TX_TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const CONFIG_DEFAULT: &str = "config/ft8rx.json";
 
 #[derive(Debug, Parser)]
@@ -5347,6 +5348,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let mut slot_direct_skip_start: Option<SystemTime> = None;
     let mut slot_direct_skip_calls = BTreeSet::<String>::new();
     let mut last_rig_poll = UNIX_EPOCH;
+    let mut last_tx_telemetry_poll = UNIX_EPOCH;
     let mut active_decode: Option<ActiveDecodeJob> = None;
     let mut waterfall_rows = seeded_waterfall_rows();
     let mut last_waterfall_update = UNIX_EPOCH;
@@ -5506,6 +5508,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         work_queue.set_current_band(current_band);
                         work_queue.set_current_mode(display.app_mode);
                         last_rig_poll = now;
+                        last_tx_telemetry_poll = now;
                     }
                 }
                 RigCommand::Tune10s => {
@@ -5919,6 +5922,14 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         }
 
         let qso_runtime_snapshot = qso_controller.snapshot(SystemTime::now());
+        let tx_path_active = qso_runtime_snapshot.tx_active
+            || tune_active.load(Ordering::Relaxed)
+            || tx_busy.load(Ordering::Relaxed)
+            || display
+                .rig
+                .as_ref()
+                .and_then(|state| state.transmitting)
+                .unwrap_or(false);
         if should_poll_rig_on_main_loop(
             now,
             last_rig_poll,
@@ -5945,6 +5956,15 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             work_queue.set_current_band(current_band);
             work_queue.set_current_mode(display.app_mode);
             last_rig_poll = now;
+            last_tx_telemetry_poll = now;
+        } else if should_poll_rig_telemetry_during_tx(
+            now,
+            last_tx_telemetry_poll,
+            active_decode,
+            tx_path_active,
+        ) {
+            refresh_rig_telemetry_shared(&rig, &mut display.rig);
+            last_tx_telemetry_poll = now;
         }
 
         if should_refresh_waterfall(
@@ -6259,6 +6279,34 @@ fn read_rig_snapshot(rig: &mut Option<Rig>) -> Option<RigSnapshot> {
 fn read_rig_snapshot_shared(rig: &SharedRig) -> Option<RigSnapshot> {
     let mut guard = rig.lock().expect("rig mutex poisoned");
     read_rig_snapshot(&mut guard)
+}
+
+fn apply_rig_telemetry(
+    snapshot: &mut Option<RigSnapshot>,
+    telemetry: RigTelemetry,
+    transmitting: Option<bool>,
+) {
+    let Some(snapshot) = snapshot.as_mut() else {
+        return;
+    };
+    snapshot.bar_graph = telemetry.bar_graph;
+    snapshot.telemetry_rx_s_meter = telemetry.rx_s_meter;
+    snapshot.telemetry_tx_forward_power_w = telemetry.tx_forward_power_w;
+    snapshot.telemetry_tx_swr = telemetry.tx_swr;
+    if transmitting.is_some() {
+        snapshot.transmitting = transmitting;
+    }
+}
+
+fn refresh_rig_telemetry_shared(rig: &SharedRig, snapshot: &mut Option<RigSnapshot>) {
+    let mut guard = rig.lock().expect("rig mutex poisoned");
+    let Some(rig) = guard.as_mut() else {
+        return;
+    };
+    let transmitting = rig.is_transmitting().ok();
+    if let Ok(telemetry) = rig.read_telemetry() {
+        apply_rig_telemetry(snapshot, telemetry, transmitting);
+    }
 }
 
 fn rig_power_web_fields(
@@ -7011,6 +7059,17 @@ fn should_poll_rig_on_main_loop(
         return true;
     };
     next_stage_ready_at.duration_since(now).unwrap_or_default() >= Duration::from_millis(1_500)
+}
+
+fn should_poll_rig_telemetry_during_tx(
+    now: SystemTime,
+    last_poll: SystemTime,
+    active_decode: Option<ActiveDecodeJob>,
+    tx_path_active: bool,
+) -> bool {
+    tx_path_active
+        && active_decode.is_none()
+        && now.duration_since(last_poll).unwrap_or_default() >= TX_TELEMETRY_REFRESH_INTERVAL
 }
 
 fn next_unhandled_decode_stage_ready_at(
@@ -9089,6 +9148,32 @@ mod tests {
             capture_window_duration(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4),
             Duration::from_secs_f64(72_576.0 / 12_000.0)
         );
+    }
+
+    #[test]
+    fn tx_telemetry_polling_is_allowed_during_tx_without_active_decode() {
+        let now = UNIX_EPOCH + Duration::from_secs(10);
+        assert!(should_poll_rig_telemetry_during_tx(
+            now, UNIX_EPOCH, None, true
+        ));
+        assert!(!should_poll_rig_telemetry_during_tx(
+            now,
+            now - Duration::from_millis(100),
+            None,
+            true
+        ));
+        assert!(!should_poll_rig_telemetry_during_tx(
+            now,
+            UNIX_EPOCH,
+            Some(ActiveDecodeJob {
+                slot_start: now,
+                stage: DecodeStage::Full,
+            }),
+            true
+        ));
+        assert!(!should_poll_rig_telemetry_during_tx(
+            now, UNIX_EPOCH, None, false
+        ));
     }
 
     #[test]
