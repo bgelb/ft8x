@@ -1885,6 +1885,100 @@ impl SlotStageState {
     }
 }
 
+#[derive(Debug, Default)]
+struct DecodeCycleLogState {
+    slot_start: Option<SystemTime>,
+    mode: Option<DecoderMode>,
+    early41_wall_ms: Option<u128>,
+    early47_wall_ms: Option<u128>,
+    full_wall_ms: Option<u128>,
+    early41_decode_count: Option<usize>,
+    early47_decode_count: Option<usize>,
+    full_decode_count: Option<usize>,
+    status: Option<&'static str>,
+    error_stage: Option<DecodeStage>,
+    error_message: Option<String>,
+}
+
+impl DecodeCycleLogState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn begin(&mut self, slot_start: SystemTime, mode: DecoderMode) {
+        if self.slot_start != Some(slot_start) || self.mode != Some(mode) {
+            self.reset();
+            self.slot_start = Some(slot_start);
+            self.mode = Some(mode);
+        }
+    }
+
+    fn record_ok(&mut self, stage: DecodeStage, wall_ms: u128, decode_count: usize) {
+        self.record_wall_ms(stage, wall_ms);
+        self.record_decode_count(stage, decode_count);
+    }
+
+    fn record_decode_failed(&mut self, stage: DecodeStage, wall_ms: u128, error: &AppError) {
+        self.record_wall_ms(stage, wall_ms);
+        self.record_error("decode_failed", stage, error.to_string());
+    }
+
+    fn record_capture_failed(&mut self, stage: DecodeStage, error: &AppError) {
+        self.record_error("capture_failed", stage, error.to_string());
+    }
+
+    fn record_dropped(&mut self, stage: DecodeStage, reason: &'static str) {
+        self.record_error("dropped", stage, reason.to_string());
+    }
+
+    fn record_wall_ms(&mut self, stage: DecodeStage, wall_ms: u128) {
+        match stage {
+            DecodeStage::Early41 => self.early41_wall_ms = Some(wall_ms),
+            DecodeStage::Early47 => self.early47_wall_ms = Some(wall_ms),
+            DecodeStage::Full => self.full_wall_ms = Some(wall_ms),
+        }
+    }
+
+    fn record_decode_count(&mut self, stage: DecodeStage, decode_count: usize) {
+        match stage {
+            DecodeStage::Early41 => self.early41_decode_count = Some(decode_count),
+            DecodeStage::Early47 => self.early47_decode_count = Some(decode_count),
+            DecodeStage::Full => self.full_decode_count = Some(decode_count),
+        }
+    }
+
+    fn record_error(&mut self, status: &'static str, stage: DecodeStage, message: String) {
+        self.status = Some(status);
+        self.error_stage = Some(stage);
+        self.error_message = Some(message);
+    }
+
+    fn emit(
+        &self,
+        slot_start: SystemTime,
+        mode: DecoderMode,
+        decode_profile: DecodeProfile,
+        tx_margin_ms: Option<i128>,
+    ) {
+        info!(
+            slot = %format_slot_time_for_mode(mode, slot_start),
+            mode = %mode.as_str(),
+            decode_profile = %decode_profile.as_str(),
+            status = self.status.unwrap_or("ok"),
+            early41_wall_ms = option_u128_i128(self.early41_wall_ms),
+            early47_wall_ms = option_u128_i128(self.early47_wall_ms),
+            full_wall_ms = option_u128_i128(self.full_wall_ms),
+            tx_margin_ms = tx_margin_ms.unwrap_or(-1),
+            early41_decode_count = option_usize_i64(self.early41_decode_count),
+            early47_decode_count = option_usize_i64(self.early47_decode_count),
+            full_decode_count = option_usize_i64(self.full_decode_count),
+            error_stage = self.error_stage.map(DecodeStage::as_str).unwrap_or(""),
+            message = self.error_message.as_deref().unwrap_or(""),
+            "decode_cycle"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ActiveDecodeJob {
     slot_start: SystemTime,
@@ -5131,6 +5225,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
     let mut next_slot = next_slot_boundary_for_mode(display.app_mode, SystemTime::now());
     let mut next_slot_stages = SlotStageState::default();
+    let mut decode_cycle_log = DecodeCycleLogState::default();
     let mut slot_direct_skip_start: Option<SystemTime> = None;
     let mut slot_direct_skip_calls = BTreeSet::<String>::new();
     let mut last_rig_poll = UNIX_EPOCH;
@@ -5293,6 +5388,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             display.full_decodes.clear();
                             next_slot = next_slot_boundary_for_mode(app_mode, now);
                             next_slot_stages = SlotStageState::default();
+                            decode_cycle_log.reset();
                             active_decode = None;
                         }
                         qso_controller.update_rig_context(
@@ -5347,153 +5443,165 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         slot_direct_skip_calls.insert(active_partner);
                     }
                     match result {
-                        Ok(update) => match stage {
-                            DecodeStage::Early41 => {
-                                display.early41_wall_ms = Some(wall_ms);
-                                display.early41_decodes = update.report.decodes.clone();
-                                station_tracker.ingest_stage(
-                                    slot_start,
-                                    stage,
-                                    &display.early41_decodes,
-                                );
-                                maybe_track_priority_directs(
-                                    &mut work_queue,
-                                    &mut qso_controller,
-                                    &display.early41_decodes,
-                                    &config.station.our_call,
-                                    slot_start,
-                                    &slot_direct_skip_calls,
-                                );
-                                qso_controller.on_decode_stage(
-                                    slot_start,
-                                    stage,
-                                    &display.early41_decodes,
-                                    SystemTime::now(),
-                                );
-                                maybe_arm_compound_handoff_from_queue(
-                                    &mut work_queue,
-                                    &mut qso_controller,
-                                    &station_tracker,
-                                    slot_start,
-                                    SystemTime::now(),
-                                );
-                                if work_queue.has_recent_priority_direct_for_slot(
-                                    slot_start,
-                                    SystemTime::now(),
-                                ) && qso_controller
-                                    .preempt_for_priority_direct(SystemTime::now())
-                                {
-                                    info!(
-                                        slot = %format_slot_time(slot_start),
-                                        "qso_preempted_for_priority_direct"
+                        Ok(update) => {
+                            decode_cycle_log.record_ok(stage, wall_ms, update.report.decodes.len());
+                            match stage {
+                                DecodeStage::Early41 => {
+                                    display.early41_wall_ms = Some(wall_ms);
+                                    display.early41_decodes = update.report.decodes.clone();
+                                    station_tracker.ingest_stage(
+                                        slot_start,
+                                        stage,
+                                        &display.early41_decodes,
                                     );
+                                    maybe_track_priority_directs(
+                                        &mut work_queue,
+                                        &mut qso_controller,
+                                        &display.early41_decodes,
+                                        &config.station.our_call,
+                                        slot_start,
+                                        &slot_direct_skip_calls,
+                                    );
+                                    qso_controller.on_decode_stage(
+                                        slot_start,
+                                        stage,
+                                        &display.early41_decodes,
+                                        SystemTime::now(),
+                                    );
+                                    maybe_arm_compound_handoff_from_queue(
+                                        &mut work_queue,
+                                        &mut qso_controller,
+                                        &station_tracker,
+                                        slot_start,
+                                        SystemTime::now(),
+                                    );
+                                    if work_queue.has_recent_priority_direct_for_slot(
+                                        slot_start,
+                                        SystemTime::now(),
+                                    ) && qso_controller
+                                        .preempt_for_priority_direct(SystemTime::now())
+                                    {
+                                        info!(
+                                            slot = %format_slot_time(slot_start),
+                                            "qso_preempted_for_priority_direct"
+                                        );
+                                    }
+                                }
+                                DecodeStage::Early47 => {
+                                    display.early47_wall_ms = Some(wall_ms);
+                                    display.early47_decodes = update.report.decodes.clone();
+                                    station_tracker.ingest_stage(
+                                        slot_start,
+                                        stage,
+                                        &display.early47_decodes,
+                                    );
+                                    maybe_track_priority_directs(
+                                        &mut work_queue,
+                                        &mut qso_controller,
+                                        &display.early47_decodes,
+                                        &config.station.our_call,
+                                        slot_start,
+                                        &slot_direct_skip_calls,
+                                    );
+                                    qso_controller.on_decode_stage(
+                                        slot_start,
+                                        stage,
+                                        &display.early47_decodes,
+                                        SystemTime::now(),
+                                    );
+                                    maybe_arm_compound_handoff_from_queue(
+                                        &mut work_queue,
+                                        &mut qso_controller,
+                                        &station_tracker,
+                                        slot_start,
+                                        SystemTime::now(),
+                                    );
+                                    if work_queue.has_recent_priority_direct_for_slot(
+                                        slot_start,
+                                        SystemTime::now(),
+                                    ) && qso_controller
+                                        .preempt_for_priority_direct(SystemTime::now())
+                                    {
+                                        info!(
+                                            slot = %format_slot_time(slot_start),
+                                            "qso_preempted_for_priority_direct"
+                                        );
+                                    }
+                                }
+                                DecodeStage::Full => {
+                                    display.last_slot_start = Some(slot_start);
+                                    display.full_wall_ms = Some(wall_ms);
+                                    display.last_decode_wall_ms = Some(wall_ms);
+                                    let tx_margin_ms = tx_margin_after_stage_decode_ms(
+                                        display.app_mode,
+                                        slot_start,
+                                        stage,
+                                        wall_ms,
+                                    )?;
+                                    display.tx_margin_ms = Some(tx_margin_ms);
+                                    display.full_decodes = update.report.decodes.clone();
+                                    if dt_frame_history.len() == DT_HISTORY_FRAMES {
+                                        dt_frame_history.pop_front();
+                                    }
+                                    dt_frame_history.push_back(display.full_decodes.clone());
+                                    station_tracker.ingest_frame(slot_start, &display.full_decodes);
+                                    update_bandmaps(
+                                        &mut bandmaps,
+                                        display.app_mode,
+                                        slot_start,
+                                        &display.full_decodes,
+                                    );
+                                    maybe_auto_add_decoded_calls(
+                                        &mut work_queue,
+                                        &station_tracker,
+                                        &qso_controller,
+                                        &display.full_decodes,
+                                        slot_start,
+                                    );
+                                    maybe_track_priority_directs(
+                                        &mut work_queue,
+                                        &mut qso_controller,
+                                        &display.full_decodes,
+                                        &config.station.our_call,
+                                        slot_start,
+                                        &slot_direct_skip_calls,
+                                    );
+                                    qso_controller.on_decode_stage(
+                                        slot_start,
+                                        stage,
+                                        &display.full_decodes,
+                                        SystemTime::now(),
+                                    );
+                                    maybe_arm_compound_handoff_from_queue(
+                                        &mut work_queue,
+                                        &mut qso_controller,
+                                        &station_tracker,
+                                        slot_start,
+                                        SystemTime::now(),
+                                    );
+                                    if work_queue.has_recent_priority_direct_for_slot(
+                                        slot_start,
+                                        SystemTime::now(),
+                                    ) && qso_controller
+                                        .preempt_for_priority_direct(SystemTime::now())
+                                    {
+                                        info!(
+                                            slot = %format_slot_time(slot_start),
+                                            "qso_preempted_for_priority_direct"
+                                        );
+                                    }
+                                    decode_cycle_log.emit(
+                                        slot_start,
+                                        mode,
+                                        decode_profile,
+                                        Some(tx_margin_ms),
+                                    );
+                                    decode_cycle_log.reset();
                                 }
                             }
-                            DecodeStage::Early47 => {
-                                display.early47_wall_ms = Some(wall_ms);
-                                display.early47_decodes = update.report.decodes.clone();
-                                station_tracker.ingest_stage(
-                                    slot_start,
-                                    stage,
-                                    &display.early47_decodes,
-                                );
-                                maybe_track_priority_directs(
-                                    &mut work_queue,
-                                    &mut qso_controller,
-                                    &display.early47_decodes,
-                                    &config.station.our_call,
-                                    slot_start,
-                                    &slot_direct_skip_calls,
-                                );
-                                qso_controller.on_decode_stage(
-                                    slot_start,
-                                    stage,
-                                    &display.early47_decodes,
-                                    SystemTime::now(),
-                                );
-                                maybe_arm_compound_handoff_from_queue(
-                                    &mut work_queue,
-                                    &mut qso_controller,
-                                    &station_tracker,
-                                    slot_start,
-                                    SystemTime::now(),
-                                );
-                                if work_queue.has_recent_priority_direct_for_slot(
-                                    slot_start,
-                                    SystemTime::now(),
-                                ) && qso_controller
-                                    .preempt_for_priority_direct(SystemTime::now())
-                                {
-                                    info!(
-                                        slot = %format_slot_time(slot_start),
-                                        "qso_preempted_for_priority_direct"
-                                    );
-                                }
-                            }
-                            DecodeStage::Full => {
-                                display.last_slot_start = Some(slot_start);
-                                display.full_wall_ms = Some(wall_ms);
-                                display.last_decode_wall_ms = Some(wall_ms);
-                                display.tx_margin_ms = Some(tx_margin_after_stage_decode_ms(
-                                    display.app_mode,
-                                    slot_start,
-                                    stage,
-                                    wall_ms,
-                                )?);
-                                display.full_decodes = update.report.decodes.clone();
-                                if dt_frame_history.len() == DT_HISTORY_FRAMES {
-                                    dt_frame_history.pop_front();
-                                }
-                                dt_frame_history.push_back(display.full_decodes.clone());
-                                station_tracker.ingest_frame(slot_start, &display.full_decodes);
-                                update_bandmaps(
-                                    &mut bandmaps,
-                                    display.app_mode,
-                                    slot_start,
-                                    &display.full_decodes,
-                                );
-                                maybe_auto_add_decoded_calls(
-                                    &mut work_queue,
-                                    &station_tracker,
-                                    &qso_controller,
-                                    &display.full_decodes,
-                                    slot_start,
-                                );
-                                maybe_track_priority_directs(
-                                    &mut work_queue,
-                                    &mut qso_controller,
-                                    &display.full_decodes,
-                                    &config.station.our_call,
-                                    slot_start,
-                                    &slot_direct_skip_calls,
-                                );
-                                qso_controller.on_decode_stage(
-                                    slot_start,
-                                    stage,
-                                    &display.full_decodes,
-                                    SystemTime::now(),
-                                );
-                                maybe_arm_compound_handoff_from_queue(
-                                    &mut work_queue,
-                                    &mut qso_controller,
-                                    &station_tracker,
-                                    slot_start,
-                                    SystemTime::now(),
-                                );
-                                if work_queue.has_recent_priority_direct_for_slot(
-                                    slot_start,
-                                    SystemTime::now(),
-                                ) && qso_controller
-                                    .preempt_for_priority_direct(SystemTime::now())
-                                {
-                                    info!(
-                                        slot = %format_slot_time(slot_start),
-                                        "qso_preempted_for_priority_direct"
-                                    );
-                                }
-                            }
-                        },
+                        }
                         Err(error) => {
+                            decode_cycle_log.record_decode_failed(stage, wall_ms, &error);
                             display.decode_status = format!(
                                 "Last {} {} failed: {}",
                                 stage_display_label(display.app_mode, stage),
@@ -5507,6 +5615,21 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 display.early41_decodes.clear();
                                 display.early47_decodes.clear();
                                 display.full_decodes.clear();
+                                let tx_margin_ms = tx_margin_after_stage_decode_ms(
+                                    display.app_mode,
+                                    slot_start,
+                                    stage,
+                                    wall_ms,
+                                )
+                                .ok();
+                                display.tx_margin_ms = tx_margin_ms;
+                                decode_cycle_log.emit(
+                                    slot_start,
+                                    mode,
+                                    decode_profile,
+                                    tx_margin_ms,
+                                );
+                                decode_cycle_log.reset();
                             }
                         }
                     }
@@ -5521,6 +5644,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             display.capture_latest_sample_time,
         ) {
             let slot_start = next_slot;
+            let app_mode = display.app_mode;
+            decode_cycle_log.begin(slot_start, app_mode);
             let capture_end = stage_capture_end(display.app_mode, slot_start, stage)?;
             let samples = match extract_stage_capture(&capture, slot_start, display.app_mode, stage)
             {
@@ -5531,16 +5656,20 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 Err(error) => {
                     display.decode_status = format!(
                         "Capture error for {} {}: {}",
-                        stage_display_label(display.app_mode, stage),
-                        format_slot_time_for_mode(display.app_mode, slot_start),
+                        stage_display_label(app_mode, stage),
+                        format_slot_time_for_mode(app_mode, slot_start),
                         error
                     );
+                    decode_cycle_log.record_capture_failed(stage, &error);
                     next_slot_stages.mark_handled(stage);
                     if stage == DecodeStage::Full {
                         display.last_slot_start = Some(slot_start);
                         display.early41_decodes.clear();
                         display.early47_decodes.clear();
                         display.full_decodes.clear();
+                        display.tx_margin_ms = None;
+                        decode_cycle_log.emit(slot_start, app_mode, decode_profile, None);
+                        decode_cycle_log.reset();
                         next_slot += slot_duration_for_mode(display.app_mode);
                         next_slot_stages = SlotStageState::default();
                     }
@@ -5583,6 +5712,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     active_decode = Some(ActiveDecodeJob { slot_start, stage });
                 }
                 Err(mpsc::TrySendError::Full(_)) => {
+                    decode_cycle_log.record_dropped(stage, "decode_worker_busy");
                     if stage == DecodeStage::Full {
                         display.dropped_slots += 1;
                         display.decode_status = format!(
@@ -5598,6 +5728,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                         display.early41_decodes.clear();
                         display.early47_decodes.clear();
                         display.full_decodes.clear();
+                        display.tx_margin_ms = None;
+                        decode_cycle_log.emit(slot_start, app_mode, decode_profile, None);
+                        decode_cycle_log.reset();
                     }
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -6659,6 +6792,14 @@ fn ms_to_seconds(ms: u128) -> f32 {
 
 fn ms_to_signed_seconds(ms: i128) -> f32 {
     ms as f32 / 1000.0
+}
+
+fn option_u128_i128(value: Option<u128>) -> i128 {
+    value.map(|value| value as i128).unwrap_or(-1)
+}
+
+fn option_usize_i64(value: Option<usize>) -> i64 {
+    value.map(|value| value as i64).unwrap_or(-1)
 }
 
 fn stage_display_label(_mode: DecoderMode, stage: DecodeStage) -> &'static str {
