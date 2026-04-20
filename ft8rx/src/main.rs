@@ -5051,7 +5051,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         })
         .collect::<Vec<_>>();
     session_rows.retain(|(_, entry)| entry.age_seconds <= RECENT_WORKED_RETENTION.as_secs());
-    session_rows.sort_by(|left, right| right.0.cmp(&left.0));
+    session_rows.sort_by_key(|row| std::cmp::Reverse(row.0));
     let history = session_rows
         .into_iter()
         .map(|(_, entry)| entry)
