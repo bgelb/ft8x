@@ -1,12 +1,12 @@
-This file specifies the sparse 83x174 parity-check matrix for the 
+This file specifies the sparse 83x174 parity-check matrix for the
 FT8/FT4 (174,91) LDPC code. Each of the 174 columns contains
-exactly 3 ones. The rows contain either 6 or 7 ones.  
-The matrix is specified by the following list consisting of 
-174 lines, each of which includes 3 numbers. 
-Each line corresponds to a column of the parity check matrix. 
+exactly 3 ones. The rows contain either 6 or 7 ones.
+The matrix is specified by the following list consisting of
+174 lines, each of which includes 3 numbers.
+Each line corresponds to a column of the parity check matrix.
 The three numbers are indices of the rows that contain a one in
-the corresponding column. The indices range from 1 through 83. 
- 
+the corresponding column. The indices range from 1 through 83.
+
   16   45   73
   25   51   62
   33   58   78

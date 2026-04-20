@@ -2,9 +2,10 @@ pub mod ft2;
 pub mod ft4;
 pub mod ft8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
+    #[default]
     Ft8,
     Ft4,
     Ft2,
@@ -25,12 +26,6 @@ impl Mode {
             Self::Ft4 => &ft4::FT4_SPEC,
             Self::Ft2 => &ft2::FT2_SPEC,
         }
-    }
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Ft8
     }
 }
 

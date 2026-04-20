@@ -904,10 +904,10 @@ pub fn parse_standard_info(text: &str) -> Result<GridReport, EncodeError> {
     if is_grid4(&upper) {
         return Ok(GridReport::Grid(upper));
     }
-    if let Ok(report) = upper.parse::<i16>() {
-        if (-50..=49).contains(&report) {
-            return Ok(GridReport::Signal(report));
-        }
+    if let Ok(report) = upper.parse::<i16>()
+        && (-50..=49).contains(&report)
+    {
+        return Ok(GridReport::Signal(report));
     }
     Err(EncodeError::UnsupportedInfo(text.to_string()))
 }
@@ -1113,7 +1113,7 @@ fn encode_c28(text: &str) -> Result<u32, EncodeError> {
                     }
                     let mut encoded = 0u32;
                     for ch in packed {
-                        encoded = encoded * 27 + u32::from(alphabet27_index(ch).unwrap_or(0));
+                        encoded = encoded * 27 + alphabet27_index(ch).unwrap_or(0);
                     }
                     return Ok(1003 + encoded);
                 }

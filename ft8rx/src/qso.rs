@@ -265,6 +265,8 @@ impl QsoController {
         }
     }
 
+    // Test convenience for the common full-decode path; production uses on_decode_stage.
+    #[cfg(test)]
     pub fn on_full_decode(
         &mut self,
         slot_start: SystemTime,
@@ -1041,13 +1043,6 @@ impl QsoController {
             .as_ref()
             .filter(|session| session.start_mode != QsoStartMode::Cq)
             .map(|session| session.partner_call.clone())
-    }
-
-    pub fn reserved_compound_next_call(&self) -> Option<String> {
-        self.session
-            .as_ref()
-            .and_then(|session| session.pending_compound_handoff.as_ref())
-            .map(|handoff| handoff.next_station.callsign.clone())
     }
 
     pub fn refresh_reserved_compound_next_station(
@@ -3535,10 +3530,6 @@ fn is_next_tx_slot_committed(
         return false;
     };
     session.last_tx_slot == Some(candidate_slot)
-}
-
-pub fn slot_family(time: SystemTime) -> SlotFamily {
-    slot_family_for_mode(Mode::Ft8, time)
 }
 
 pub fn slot_family_for_mode(app_mode: Mode, time: SystemTime) -> SlotFamily {

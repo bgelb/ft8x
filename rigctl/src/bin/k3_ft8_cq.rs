@@ -63,12 +63,15 @@ impl Drop for TxGuard<'_> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let mut config = K3sConfig::default();
-    config.baud_rate = cli.baud;
-    config.timeout = Duration::from_millis(cli.timeout_ms);
-    if let Some(port) = cli.port {
-        config.port_path = port;
-    }
+    let default_config = K3sConfig::default();
+    let port_path = cli.port.unwrap_or_else(|| default_config.port_path.clone());
+    let config = K3sConfig {
+        port_path,
+        baud_rate: cli.baud,
+        timeout: Duration::from_millis(cli.timeout_ms),
+        rts: default_config.rts,
+        dtr: default_config.dtr,
+    };
 
     let output_device = detect_k3s_audio_output_device(cli.output_device.as_deref())?;
     let mut rig = K3s::connect(config)?;

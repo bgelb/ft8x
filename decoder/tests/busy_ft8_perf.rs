@@ -38,47 +38,47 @@ fn measure_busy_profile(audio: &AudioBuffer, profile: DecodeProfile) {
 
     let early41_started = Instant::now();
     let (early41, next_state) = session
-        .decode_stage_with_state(&audio, &options, DecodeStage::Early41, Some(&state))
+        .decode_stage_with_state(audio, &options, DecodeStage::Early41, Some(&state))
         .expect("early41 decode");
     state = next_state;
     let early41_ms = early41_started.elapsed().as_millis();
 
     let early47_started = Instant::now();
     let (early47, next_state) = session
-        .decode_stage_with_state(&audio, &options, DecodeStage::Early47, Some(&state))
+        .decode_stage_with_state(audio, &options, DecodeStage::Early47, Some(&state))
         .expect("early47 decode");
     state = next_state;
     let early47_ms = early47_started.elapsed().as_millis();
 
     let full_started = Instant::now();
     let (full, _) = session
-        .decode_stage_with_state(&audio, &options, DecodeStage::Full, Some(&state))
+        .decode_stage_with_state(audio, &options, DecodeStage::Full, Some(&state))
         .expect("full decode");
     let full_ms = full_started.elapsed().as_millis();
 
     let mut live_session = DecoderSession::new();
     let mut live_state = DecoderState::new();
     let (_, next_state) = live_session
-        .decode_stage_with_state(&audio, &options, DecodeStage::Early41, Some(&live_state))
+        .decode_stage_with_state(audio, &options, DecodeStage::Early41, Some(&live_state))
         .expect("live early41 decode");
     live_state = next_state;
     let live_full_started = Instant::now();
     let (live_full, _) = live_session
-        .decode_stage_with_state(&audio, &options, DecodeStage::Full, Some(&live_state))
+        .decode_stage_with_state(audio, &options, DecodeStage::Full, Some(&live_state))
         .expect("live full decode without early47");
     let live_full_ms = live_full_started.elapsed().as_millis();
 
     let mut reset_full_session = DecoderSession::new();
     let reset_full_started = Instant::now();
     let (reset_full, _) = reset_full_session
-        .decode_stage_with_state(&audio, &options, DecodeStage::Full, Some(&live_state))
+        .decode_stage_with_state(audio, &options, DecodeStage::Full, Some(&live_state))
         .expect("live full decode after stage reset");
     let reset_full_ms = reset_full_started.elapsed().as_millis();
 
     let mut raw_full_session = DecoderSession::new();
     let raw_full_started = Instant::now();
     let (raw_full, _) = raw_full_session
-        .decode_stage_with_state(&audio, &options, DecodeStage::Full, None)
+        .decode_stage_with_state(audio, &options, DecodeStage::Full, None)
         .expect("raw full decode");
     let raw_full_ms = raw_full_started.elapsed().as_millis();
 

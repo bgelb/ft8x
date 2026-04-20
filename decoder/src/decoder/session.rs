@@ -845,7 +845,7 @@ fn debug_run_decode_search_inner(
             }
             let long_spectrum = ft4_long_spectrum
                 .as_ref()
-                .or_else(|| cached_long_spectrum.as_ref())
+                .or(cached_long_spectrum.as_ref())
                 .expect("decode pass spectrum should be available");
             let (successes_for_candidate, local_counters) =
                 if let Some(results) = parallel_results.as_mut() {
@@ -1149,38 +1149,38 @@ pub(super) fn try_candidate(
             best = None;
         }
 
-        if matches!(options.profile, DecodeProfile::Medium) {
-            if let Some(seed) = extract_candidate_from_baseband(
+        if matches!(options.profile, DecodeProfile::Medium)
+            && let Some(seed) = extract_candidate_from_baseband(
                 &initial_baseband,
                 spec,
                 candidate.start_seconds,
                 coarse_freq_hz,
-            ) {
-                let seed_success = try_refined_candidate(
-                    &seed,
-                    options.mode,
-                    candidate.score,
-                    max_osd,
-                    allow_ap,
-                    ft4_ap_known_bits,
-                    resolver,
-                    seen_messages,
-                    parity,
-                    counters,
-                );
-                best = match (best, seed_success) {
-                    (None, other) => other,
-                    (some @ Some(_), None) => some,
-                    (Some(refined_success), Some(seed_success))
-                        if options.mode == Mode::Ft4
-                            && success_is_duplicate(&refined_success, resolver, seen_messages)
-                            && !success_is_duplicate(&seed_success, resolver, seen_messages) =>
-                    {
-                        Some(seed_success)
-                    }
-                    (some @ Some(_), Some(_)) => some,
-                };
-            }
+            )
+        {
+            let seed_success = try_refined_candidate(
+                &seed,
+                options.mode,
+                candidate.score,
+                max_osd,
+                allow_ap,
+                ft4_ap_known_bits,
+                resolver,
+                seen_messages,
+                parity,
+                counters,
+            );
+            best = match (best, seed_success) {
+                (None, other) => other,
+                (some @ Some(_), None) => some,
+                (Some(refined_success), Some(seed_success))
+                    if options.mode == Mode::Ft4
+                        && success_is_duplicate(&refined_success, resolver, seen_messages)
+                        && !success_is_duplicate(&seed_success, resolver, seen_messages) =>
+                {
+                    Some(seed_success)
+                }
+                (some @ Some(_), Some(_)) => some,
+            };
         }
     }
     best.into_iter().collect()

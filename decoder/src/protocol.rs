@@ -385,11 +385,11 @@ mod tests {
     #[test]
     fn bit_field_helpers_round_trip() {
         let mut bits = [0u8; FTX_MESSAGE_BITS];
-        write_bit_field(&mut bits, FTX_STANDARD_LAYOUT.first_call, 0x1234_567);
+        write_bit_field(&mut bits, FTX_STANDARD_LAYOUT.first_call, 0x0123_4567);
         write_bit_field(&mut bits, FTX_STANDARD_LAYOUT.kind, 0b101);
         assert_eq!(
             read_bit_field(&bits, FTX_STANDARD_LAYOUT.first_call),
-            0x1234_567
+            0x0123_4567
         );
         assert_eq!(read_bit_field(&bits, FTX_STANDARD_LAYOUT.kind), 0b101);
     }

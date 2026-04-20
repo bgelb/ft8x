@@ -774,16 +774,26 @@ fn sync4d_block(
     match tweak_step {
         Some(step) => {
             let mut tweak = step.powu(first_waveform_index as u32);
-            for index in first_waveform_index..=last_waveform_index {
+            for (index, waveform_value) in waveform
+                .iter()
+                .enumerate()
+                .take(last_waveform_index + 1)
+                .skip(first_waveform_index)
+            {
                 let sample_index = (start_index + (index * 2) as isize) as usize;
-                corr += baseband[sample_index] * (waveform[index] * tweak).conj();
+                corr += baseband[sample_index] * (*waveform_value * tweak).conj();
                 tweak *= step;
             }
         }
         None => {
-            for index in first_waveform_index..=last_waveform_index {
+            for (index, waveform_value) in waveform
+                .iter()
+                .enumerate()
+                .take(last_waveform_index + 1)
+                .skip(first_waveform_index)
+            {
                 let sample_index = (start_index + (index * 2) as isize) as usize;
-                corr += baseband[sample_index] * waveform[index].conj();
+                corr += baseband[sample_index] * waveform_value.conj();
             }
         }
     }
@@ -889,9 +899,7 @@ fn extract_symbol_tones_ft4(
         let mut spectrum =
             baseband[sample_index as usize..sample_index as usize + symbol_samples].to_vec();
         fft.process(&mut spectrum);
-        for tone in 0..4 {
-            symbol_tones[tone] = spectrum[tone];
-        }
+        symbol_tones[..4].copy_from_slice(&spectrum[..4]);
     }
 
     tones
