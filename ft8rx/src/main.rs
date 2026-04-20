@@ -116,7 +116,7 @@ struct DisplayState {
     decode_status: String,
     early41_wall_ms: Option<u128>,
     early47_wall_ms: Option<u128>,
-    early47_tx_margin_ms: Option<i128>,
+    tx_margin_ms: Option<i128>,
     full_wall_ms: Option<u128>,
     last_decode_wall_ms: Option<u128>,
     dropped_slots: u64,
@@ -1863,12 +1863,13 @@ impl SlotStageState {
     fn next_due_stage(
         self,
         mode: DecoderMode,
+        profile: DecodeProfile,
         slot_start: SystemTime,
         latest_sample_time: Option<SystemTime>,
     ) -> Option<DecodeStage> {
         let latest_sample_time = latest_sample_time?;
         for stage in DecodeStage::ordered() {
-            if !decode_stage_enabled_for_mode(mode, stage) {
+            if !decode_stage_enabled_for_profile(mode, profile, stage) {
                 continue;
             }
             if self.is_handled(stage) {
@@ -5060,7 +5061,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         let mut session = DecoderSession::new();
         let mut state = DecoderState::new();
         while let Ok(job) = job_rx.recv() {
-            if session_slot != Some(job.slot_start) || session_mode != job.mode {
+            let full_authoritative_reset = job.mode == DecoderMode::Ft8
+                && job.stage == DecodeStage::Full
+                && !session.emitted_stages().contains(&DecodeStage::Early47);
+            if full_authoritative_reset
+                || session_slot != Some(job.slot_start)
+                || session_mode != job.mode
+            {
                 session.reset();
                 session_slot = Some(job.slot_start);
                 session_mode = job.mode;
@@ -5112,7 +5119,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         decode_status: "Idle".to_string(),
         early41_wall_ms: None,
         early47_wall_ms: None,
-        early47_tx_margin_ms: None,
+        tx_margin_ms: None,
         full_wall_ms: None,
         last_decode_wall_ms: None,
         dropped_slots: 0,
@@ -5277,7 +5284,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             dt_frame_history.clear();
                             display.early41_wall_ms = None;
                             display.early47_wall_ms = None;
-                            display.early47_tx_margin_ms = None;
+                            display.tx_margin_ms = None;
                             display.full_wall_ms = None;
                             display.last_decode_wall_ms = None;
                             display.last_slot_start = None;
@@ -5384,13 +5391,6 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             }
                             DecodeStage::Early47 => {
                                 display.early47_wall_ms = Some(wall_ms);
-                                display.early47_tx_margin_ms =
-                                    Some(tx_margin_after_stage_decode_ms(
-                                        display.app_mode,
-                                        slot_start,
-                                        stage,
-                                        wall_ms,
-                                    )?);
                                 display.early47_decodes = update.report.decodes.clone();
                                 station_tracker.ingest_stage(
                                     slot_start,
@@ -5434,15 +5434,12 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                 display.last_slot_start = Some(slot_start);
                                 display.full_wall_ms = Some(wall_ms);
                                 display.last_decode_wall_ms = Some(wall_ms);
-                                if display.app_mode != DecoderMode::Ft8 {
-                                    display.early47_tx_margin_ms =
-                                        Some(tx_margin_after_stage_decode_ms(
-                                            display.app_mode,
-                                            slot_start,
-                                            stage,
-                                            wall_ms,
-                                        )?);
-                                }
+                                display.tx_margin_ms = Some(tx_margin_after_stage_decode_ms(
+                                    display.app_mode,
+                                    slot_start,
+                                    stage,
+                                    wall_ms,
+                                )?);
                                 display.full_decodes = update.report.decodes.clone();
                                 if dt_frame_history.len() == DT_HISTORY_FRAMES {
                                     dt_frame_history.pop_front();
@@ -5519,6 +5516,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
 
         while let Some(stage) = next_slot_stages.next_due_stage(
             display.app_mode,
+            decode_profile,
             next_slot,
             display.capture_latest_sample_time,
         ) {
@@ -5575,7 +5573,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     if stage == DecodeStage::Early41 {
                         display.early41_wall_ms = None;
                         display.early47_wall_ms = None;
-                        display.early47_tx_margin_ms = None;
+                        display.tx_margin_ms = None;
                         display.full_wall_ms = None;
                         display.last_decode_wall_ms = None;
                         display.early41_decodes.clear();
@@ -5835,14 +5833,14 @@ fn refresh_web_snapshot(
             early_seconds: display.early41_wall_ms.map(ms_to_seconds),
             mid_seconds: display.early47_wall_ms.map(ms_to_seconds),
             late_seconds: display.full_wall_ms.map(ms_to_seconds),
-            tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+            tx_margin_seconds: display.tx_margin_ms.map(ms_to_signed_seconds),
         }
     } else {
         WebDecodeTimes {
             early_seconds: None,
             mid_seconds: display.full_wall_ms.map(ms_to_seconds),
             late_seconds: None,
-            tx_margin_seconds: display.early47_tx_margin_ms.map(ms_to_signed_seconds),
+            tx_margin_seconds: display.tx_margin_ms.map(ms_to_signed_seconds),
         }
     };
     guard.dt_stats = WebDtStats {
@@ -6529,14 +6527,14 @@ fn render(display: &DisplayState) {
             format_wall_time(display.early41_wall_ms),
             format_wall_time(display.early47_wall_ms),
             format_wall_time(display.full_wall_ms),
-            format_signed_wall_time(display.early47_tx_margin_ms)
+            format_signed_wall_time(display.tx_margin_ms)
         );
     } else {
         let _ = writeln!(
             output,
             "DecodeT  mid={} tx_margin={}",
             format_wall_time(display.full_wall_ms),
-            format_signed_wall_time(display.early47_tx_margin_ms)
+            format_signed_wall_time(display.tx_margin_ms)
         );
     }
     if let Some(slot_start) = display.last_slot_start {
@@ -6679,10 +6677,15 @@ fn slot_millis_for_mode(mode: DecoderMode) -> u64 {
     }
 }
 
-fn decode_stage_enabled_for_mode(mode: DecoderMode, stage: DecodeStage) -> bool {
+fn decode_stage_enabled_for_profile(
+    mode: DecoderMode,
+    profile: DecodeProfile,
+    stage: DecodeStage,
+) -> bool {
     match stage {
         DecodeStage::Full => true,
-        DecodeStage::Early41 | DecodeStage::Early47 => mode == DecoderMode::Ft8,
+        DecodeStage::Early41 => mode == DecoderMode::Ft8 && profile != DecodeProfile::Quick,
+        DecodeStage::Early47 => mode == DecoderMode::Ft8 && profile != DecodeProfile::Quick,
     }
 }
 
@@ -6815,9 +6818,10 @@ fn tx_margin_after_stage_decode_ms(
     stage: DecodeStage,
     wall_ms: u128,
 ) -> Result<i128, AppError> {
-    let tx_start = slot_start
+    let next_slot = slot_start
         .checked_add(slot_duration_for_mode(mode))
         .ok_or(AppError::Clock)?;
+    let tx_start = qso::tx_key_time_for_mode(next_slot, mode);
     let capture_end = stage_capture_end(mode, slot_start, stage)?;
     let capture_to_tx_ms = tx_start
         .duration_since(capture_end)
@@ -8736,7 +8740,7 @@ mod tests {
     fn full_decode_sample_window_matches_decoder_mode_spec() {
         assert_eq!(
             full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft8),
-            180_000
+            172_800
         );
         assert_eq!(
             full_decode_sample_count(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4),
@@ -8745,6 +8749,148 @@ mod tests {
         assert_eq!(
             capture_window_duration(DECODER_SAMPLE_RATE_HZ, DecoderMode::Ft4),
             Duration::from_secs_f64(72_576.0 / 12_000.0)
+        );
+    }
+
+    #[test]
+    fn ft8_live_scheduler_uses_medium_early47_residual_prep_before_full() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(30);
+        let spec = DecoderMode::Ft8.spec();
+        let early41_ready = stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Early41)
+            .expect("early41 ready");
+        let early47_ready = stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Early47)
+            .expect("early47 ready");
+        let full_ready =
+            stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Full).expect("full ready");
+        assert_eq!(
+            full_ready
+                .duration_since(slot_start)
+                .expect("full after slot")
+                .as_millis(),
+            14_400
+        );
+        assert_eq!(spec.full_decode_samples(), 172_800);
+
+        let mut stages = SlotStageState::default();
+        assert_eq!(
+            stages.next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Medium,
+                slot_start,
+                Some(early41_ready)
+            ),
+            Some(DecodeStage::Early41)
+        );
+        stages.mark_handled(DecodeStage::Early41);
+        assert_eq!(
+            stages.next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Medium,
+                slot_start,
+                Some(early47_ready)
+            ),
+            Some(DecodeStage::Early47)
+        );
+        stages.mark_handled(DecodeStage::Early47);
+        assert_eq!(
+            stages.next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Medium,
+                slot_start,
+                Some(full_ready)
+            ),
+            Some(DecodeStage::Full)
+        );
+    }
+
+    #[test]
+    fn ft8_deepest_live_scheduler_uses_early47_residual_prep_before_full() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(30);
+        let early41_ready = stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Early41)
+            .expect("early41 ready");
+        let early47_ready = stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Early47)
+            .expect("early47 ready");
+        let full_ready =
+            stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Full).expect("full ready");
+
+        let mut stages = SlotStageState::default();
+        assert_eq!(
+            stages.next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Deepest,
+                slot_start,
+                Some(early41_ready)
+            ),
+            Some(DecodeStage::Early41)
+        );
+        stages.mark_handled(DecodeStage::Early41);
+        assert_eq!(
+            stages.next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Deepest,
+                slot_start,
+                Some(early47_ready)
+            ),
+            Some(DecodeStage::Early47)
+        );
+        stages.mark_handled(DecodeStage::Early47);
+        assert_eq!(
+            stages.next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Deepest,
+                slot_start,
+                Some(full_ready)
+            ),
+            Some(DecodeStage::Full)
+        );
+    }
+
+    #[test]
+    fn ft8_live_scheduler_skips_early_stages_for_quick_profile() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(30);
+        let early41_ready = stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Early41)
+            .expect("early41 ready");
+        let early47_ready = stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Early47)
+            .expect("early47 ready");
+        let full_ready =
+            stage_capture_end(DecoderMode::Ft8, slot_start, DecodeStage::Full).expect("full ready");
+
+        assert_eq!(
+            SlotStageState::default().next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Quick,
+                slot_start,
+                Some(early41_ready)
+            ),
+            None
+        );
+        assert_eq!(
+            SlotStageState::default().next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Quick,
+                slot_start,
+                Some(early47_ready)
+            ),
+            None
+        );
+        assert_eq!(
+            SlotStageState::default().next_due_stage(
+                DecoderMode::Ft8,
+                DecodeProfile::Quick,
+                slot_start,
+                Some(full_ready)
+            ),
+            Some(DecodeStage::Full)
+        );
+    }
+
+    #[test]
+    fn full_decode_margin_is_against_next_slot_pre_key_deadline() {
+        let slot_start = UNIX_EPOCH + Duration::from_secs(30);
+        assert_eq!(
+            tx_margin_after_stage_decode_ms(DecoderMode::Ft8, slot_start, DecodeStage::Full, 500)
+                .expect("margin"),
+            450
         );
     }
 
@@ -8820,6 +8966,7 @@ mod tests {
         assert_eq!(
             SlotStageState::default().next_due_stage(
                 DecoderMode::Ft4,
+                DecodeProfile::Medium,
                 slot_start,
                 Some(before_full_ready)
             ),
@@ -8828,6 +8975,7 @@ mod tests {
         assert_eq!(
             SlotStageState::default().next_due_stage(
                 DecoderMode::Ft4,
+                DecodeProfile::Medium,
                 slot_start,
                 Some(ft4_full_ready)
             ),

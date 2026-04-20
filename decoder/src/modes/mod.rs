@@ -106,6 +106,7 @@ pub struct WaveformSpec {
 #[derive(Debug, Clone, Copy)]
 pub struct SearchSpec {
     pub long_input_samples: usize,
+    pub full_decode_samples: usize,
     pub long_fft_samples: usize,
     pub downsample_factor: usize,
     pub sync_fft_symbol_window: usize,
@@ -222,6 +223,10 @@ impl ModeSpec {
 
     pub fn early47_samples(&self) -> usize {
         47 * self.refine.early_block_samples
+    }
+
+    pub const fn full_decode_samples(&self) -> usize {
+        self.search.full_decode_samples
     }
 
     pub const fn baseband_taper_len(&self) -> usize {
@@ -401,6 +406,7 @@ mod tests {
     };
     const MOCK_SEARCH: SearchSpec = SearchSpec {
         long_input_samples: 4_000,
+        full_decode_samples: 4_000,
         long_fft_samples: 6_400,
         downsample_factor: 8,
         sync_fft_symbol_window: 2,
@@ -468,6 +474,7 @@ mod tests {
         assert_eq!(MOCK_SPEC.baseband_symbol_samples(), 20);
         assert_eq!(MOCK_SPEC.early41_samples(), 3_936);
         assert_eq!(MOCK_SPEC.early47_samples(), 4_512);
+        assert_eq!(MOCK_SPEC.full_decode_samples(), 4_000);
         assert_eq!(MOCK_SPEC.nominal_start_sync_lag(), 25);
         assert_eq!(MOCK_SPEC.nominal_start_sync_fraction(), 0.0);
         assert_eq!(MOCK_SPEC.codeword_half_bits(), 6);

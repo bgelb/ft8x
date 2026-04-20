@@ -10,7 +10,7 @@ const REPORTED_SNR_FLOOR_DB: f32 = -24.0;
 
 pub(super) struct Ft8ReportedSnrContext {
     long_spectrum: LongSpectrum,
-    baseband_plan: BasebandPlan,
+    pub(super) baseband_plan: &'static BasebandPlan,
     baseline_db: Vec<f32>,
 }
 
@@ -21,21 +21,23 @@ pub(super) fn build_ft8_reported_snr_context(
     let spec = Mode::Ft8.spec();
     Some(Ft8ReportedSnrContext {
         long_spectrum: build_long_spectrum(audio, spec),
-        baseband_plan: BasebandPlan::new(spec),
+        baseband_plan: BasebandPlan::for_mode(Mode::Ft8),
         baseline_db: spectrum_baseline_db(audio, options.min_freq_hz, options.max_freq_hz)?,
     })
 }
 
-pub(super) fn ft8_reported_snr_db(
+pub(super) fn ft8_reported_snr_db_with_workspace(
     context: &Ft8ReportedSnrContext,
     success: &SuccessfulDecode,
+    workspace: &mut BasebandWorkspace,
 ) -> Option<i32> {
     let spec = Mode::Ft8.spec();
-    let baseband = downsample_candidate(
+    let baseband = downsample_candidate_with_workspace(
         &context.long_spectrum,
-        &context.baseband_plan,
+        context.baseband_plan,
         spec,
         success.candidate.freq_hz,
+        workspace,
     )?;
     let start_index = (success.candidate.start_seconds * spec.baseband_rate_hz()).round() as isize;
     let full_tones = extract_symbol_tones(spec, &baseband, start_index);

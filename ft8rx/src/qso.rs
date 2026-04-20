@@ -1781,16 +1781,10 @@ impl QsoController {
     fn should_consume_stage_event(
         session: &ActiveSession,
         stage: DecodeStage,
-        event: &PartnerEvent,
+        _event: &PartnerEvent,
     ) -> bool {
         if session.rx_slot_consumed_stage.is_some() {
             return false;
-        }
-        if event.has_partner_message() {
-            return true;
-        }
-        if matches!(session.state, QsoState::SendRR73) && matches!(stage, DecodeStage::Early47) {
-            return true;
         }
         matches!(stage, DecodeStage::Full)
     }
@@ -2980,6 +2974,10 @@ fn tx_key_time_for_slot(slot_start: SystemTime, app_mode: Mode) -> SystemTime {
         .unwrap_or(symbol_start)
 }
 
+pub fn tx_key_time_for_mode(slot_start: SystemTime, app_mode: Mode) -> SystemTime {
+    tx_key_time_for_slot(slot_start, app_mode)
+}
+
 fn schedule_next_tx_slot(session: &ActiveSession, rx_slot_start: SystemTime) -> Option<SystemTime> {
     let mut candidate =
         next_matching_slot_after(rx_slot_start, session.tx_slot_family, session.app_mode)?;
@@ -3724,16 +3722,17 @@ mod tests {
                     "decoded RR73 should classify as reply, stage={}, texts={texts:?}",
                     report.stage.as_str(),
                 );
+                controller.on_decode_stage(
+                    rx_slot_start,
+                    DecodeStage::Full,
+                    &report.report.decodes,
+                    rx_slot_start + Duration::from_secs(15),
+                );
+                break;
             }
-            controller.on_decode_stage(
-                rx_slot_start,
-                report.stage,
-                &report.report.decodes,
-                rx_slot_start + Duration::from_secs(11),
-            );
         }
 
-        assert!(saw_rr73, "expected synthesized RR73 in decoder outputs");
+        assert!(saw_rr73, "expected synthesized RR73 in decoder output");
         let snapshot = controller.snapshot(now);
         assert_eq!(snapshot.state, "send_73_once");
         assert_eq!(snapshot.last_rx_event.as_deref(), Some("to_us_reply_rr73"));
@@ -4344,7 +4343,7 @@ mod tests {
     }
 
     #[test]
-    fn early_partner_decode_is_consumed_before_full() {
+    fn early_partner_decode_waits_for_full_authority() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
@@ -4367,7 +4366,7 @@ mod tests {
             &[directed_decode("K1ABC", "N1VF", ToUsEvent::ReportLike)],
             rx_slot_start + Duration::from_secs(11),
         );
-        assert_eq!(controller.snapshot(now).state, "send_sig_ack");
+        assert_eq!(controller.snapshot(now).state, "send_grid");
         controller.on_decode_stage(
             rx_slot_start,
             DecodeStage::Full,
@@ -4379,13 +4378,13 @@ mod tests {
             rx_slot_start + Duration::from_secs(15),
         );
         let snapshot = controller.snapshot(now);
-        assert_eq!(snapshot.state, "send_sig_ack");
+        assert_eq!(snapshot.state, "send_73");
         assert_eq!(snapshot.no_msg_count, 0);
         assert_eq!(snapshot.no_fwd_count, 0);
     }
 
     #[test]
-    fn full_stage_waits_until_both_early_stages_miss_partner() {
+    fn full_stage_counts_no_message_after_early_stage_misses_partner() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
@@ -4407,15 +4406,6 @@ mod tests {
             DecodeStage::Early41,
             &[cq_decode("ZZ9")],
             rx_slot_start + Duration::from_secs(11),
-        );
-        let snapshot = controller.snapshot(now);
-        assert_eq!(snapshot.state, "send_grid");
-        assert_eq!(snapshot.no_msg_count, 0);
-        controller.on_decode_stage(
-            rx_slot_start,
-            DecodeStage::Early47,
-            &[cq_decode("ZZ9")],
-            rx_slot_start + Duration::from_secs(12),
         );
         let snapshot = controller.snapshot(now);
         assert_eq!(snapshot.state, "send_grid");
@@ -4452,9 +4442,9 @@ mod tests {
         controller.session.as_mut().expect("session").state = QsoState::SendSig;
         controller.on_decode_stage(
             rx_slot_start,
-            DecodeStage::Early41,
+            DecodeStage::Full,
             &[directed_decode("K1ABC", "N1VF", ToUsEvent::ReportLike)],
-            rx_slot_start + Duration::from_secs(11),
+            rx_slot_start + Duration::from_secs(15),
         );
         let snapshot = controller.snapshot(now);
         assert_eq!(snapshot.state, "send_sig");
@@ -4483,9 +4473,9 @@ mod tests {
         controller.session.as_mut().expect("session").state = QsoState::SendSigAck;
         controller.on_decode_stage(
             rx_slot_start,
-            DecodeStage::Early41,
+            DecodeStage::Full,
             &[directed_decode("K1ABC", "N1VF", ToUsEvent::ReportLike)],
-            rx_slot_start + Duration::from_secs(11),
+            rx_slot_start + Duration::from_secs(15),
         );
         let snapshot = controller.snapshot(now);
         assert_eq!(snapshot.state, "send_sig_ack");
@@ -4522,7 +4512,7 @@ mod tests {
     }
 
     #[test]
-    fn send_rr73_exits_on_early47_when_partner_is_silent() {
+    fn send_rr73_exits_on_full_when_partner_is_silent() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
@@ -4543,7 +4533,7 @@ mod tests {
         }
         controller.on_decode_stage(
             now + Duration::from_secs(15),
-            DecodeStage::Early47,
+            DecodeStage::Full,
             &[],
             now + Duration::from_secs(15),
         );

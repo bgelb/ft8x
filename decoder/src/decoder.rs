@@ -214,7 +214,7 @@ impl DecodeStage {
         match self {
             Self::Early41 => spec.early41_samples(),
             Self::Early47 => spec.early47_samples(),
-            Self::Full => long_input_samples(spec),
+            Self::Full => spec.full_decode_samples(),
         }
     }
 }
@@ -377,6 +377,29 @@ pub struct SearchDebugReport {
     pub final_report: DecodeReport,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodeStageTrace {
+    pub stage: DecodeStage,
+    pub input_signature: SearchResidualSignature,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_signature: Option<SearchResidualSignature>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub residual_prep_subtractions: Vec<SearchAcceptedTrace>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub search_passes: Vec<SearchPassTrace>,
+    pub report: DecodeReport,
+    pub new_decodes: Vec<DecodedMessage>,
+    pub updated_decodes: Vec<DecodedMessage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StageDebugReport {
+    pub sample_rate_hz: u32,
+    pub duration_seconds: f32,
+    pub stages: Vec<DecodeStageTrace>,
+    pub final_report: DecodeReport,
+}
+
 pub use ft2::{Ft2CandidateTrace, Ft2SequenceTrace, Ft2TraceReport};
 
 #[derive(Debug, Clone)]
@@ -414,6 +437,12 @@ struct SearchResult {
     counters: DecodeCounters,
 }
 
+#[derive(Debug, Clone)]
+struct Early47ResidualState {
+    audio: AudioBuffer,
+    subtracted_early41: Vec<bool>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SearchGrid {
     frame_count: usize,
@@ -425,6 +454,7 @@ struct SearchGrid {
 pub struct DecoderSession {
     early41: Option<SearchResult>,
     early47: Option<SearchResult>,
+    early47_residual: Option<Early47ResidualState>,
     emitted_stages: Vec<DecodeStage>,
     last_decodes: BTreeMap<String, DecodedMessage>,
 }
@@ -1051,6 +1081,55 @@ pub fn debug_search_pcm(
     })
 }
 
+pub fn debug_stages_wav_file(
+    path: impl AsRef<Path>,
+    options: &DecodeOptions,
+) -> Result<StageDebugReport, DecoderError> {
+    let audio = load_wav(path)?;
+    debug_stages_pcm(&audio, options)
+}
+
+pub fn debug_stages_pcm(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+) -> Result<StageDebugReport, DecoderError> {
+    if options.mode == Mode::Ft2 {
+        return Err(DecoderError::UnsupportedFormat(
+            "stage tracing is not implemented for FT2".to_string(),
+        ));
+    }
+    let prepared = stock_window_audio(audio, options.mode);
+    let spec = options.mode.spec();
+    session::validate_audio(&prepared, spec)?;
+
+    let mut session = DecoderSession::new();
+    let mut state = DecoderState::new();
+    let mut stages = Vec::new();
+    for stage in DecodeStage::ordered() {
+        if !session::stage_is_enabled(stage, options)
+            || prepared.samples.len() < stage.required_samples(spec)
+        {
+            continue;
+        }
+        let (next_trace, next_state) =
+            session.debug_decode_stage_with_state(&prepared, options, stage, Some(&state))?;
+        state = next_state;
+        stages.push(next_trace);
+    }
+    let final_report = stages
+        .last()
+        .map(|stage| stage.report.clone())
+        .ok_or_else(|| {
+            DecoderError::UnsupportedFormat("audio too short for stage trace".to_string())
+        })?;
+    Ok(StageDebugReport {
+        sample_rate_hz: prepared.sample_rate_hz,
+        duration_seconds: prepared.samples.len() as f32 / prepared.sample_rate_hz as f32,
+        stages,
+        final_report,
+    })
+}
+
 pub fn debug_ft2_trace_wav_file(
     path: impl AsRef<Path>,
     options: &DecodeOptions,
@@ -1316,7 +1395,7 @@ mod tests {
 
         let full = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
-            samples: vec![0.0; long_input_samples(spec)],
+            samples: vec![0.0; spec.full_decode_samples()],
         };
         let updates = session
             .decode_available(&full, &options)
@@ -1331,6 +1410,35 @@ mod tests {
     }
 
     #[test]
+    fn stage_debug_trace_reports_early47_as_residual_prep() {
+        let options = DecodeOptions::default();
+        let spec = options.mode.spec();
+        assert!(spec.full_decode_samples() < long_input_samples(spec));
+        let audio = AudioBuffer {
+            sample_rate_hz: FT8_SAMPLE_RATE,
+            samples: vec![0.0; long_input_samples(spec)],
+        };
+
+        let report = debug_stages_pcm(&audio, &options).expect("stage trace");
+        assert_eq!(report.stages.len(), 3);
+        assert_eq!(report.stages[0].stage, DecodeStage::Early41);
+        assert_eq!(report.stages[1].stage, DecodeStage::Early47);
+        assert_eq!(report.stages[2].stage, DecodeStage::Full);
+        assert!(
+            (report.final_report.duration_seconds
+                - spec.full_decode_samples() as f32 / FT8_SAMPLE_RATE as f32)
+                .abs()
+                < 1e-6
+        );
+
+        let early47 = &report.stages[1];
+        assert!(early47.search_passes.is_empty());
+        assert!(early47.residual_signature.is_some());
+        assert_eq!(early47.report.diagnostics.ldpc_codewords, 0);
+        assert!(early47.report.decodes.is_empty());
+    }
+
+    #[test]
     fn quick_profile_skips_early_stages() {
         let options = DecodeOptions {
             profile: DecodeProfile::Quick,
@@ -1340,7 +1448,7 @@ mod tests {
         let mut session = DecoderSession::new();
         let full = AudioBuffer {
             sample_rate_hz: FT8_SAMPLE_RATE,
-            samples: vec![0.0; long_input_samples(spec)],
+            samples: vec![0.0; spec.full_decode_samples()],
         };
         let updates = session
             .decode_available(&full, &options)

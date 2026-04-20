@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use rayon::prelude::*;
+
 use super::*;
 use crate::message::{Payload, ReplyWord, StructuredMessage};
 
@@ -130,6 +132,7 @@ impl DecoderSession {
             ));
         }
 
+        let mut report_audio = None;
         let search = match stage {
             DecodeStage::Early41 => {
                 let early_audio = zero_tail(audio, early_41_samples(spec));
@@ -146,20 +149,30 @@ impl DecoderSession {
                 search
             }
             DecodeStage::Early47 => {
-                let search = run_early47_search(audio, options, self.early41.as_ref(), state);
+                let (search, residual) =
+                    run_early47_residual_prep(audio, options, self.early41.as_ref());
+                self.early47_residual = Some(residual);
                 self.early47 = Some(search.clone());
                 search
             }
-            DecodeStage::Full => run_full_search(
-                audio,
-                options,
-                self.early41.as_ref(),
-                self.early47.as_ref(),
-                state,
-            ),
+            DecodeStage::Full => {
+                let full_audio = truncate_tail(audio, spec.full_decode_samples());
+                let search = run_full_search(
+                    &full_audio,
+                    options,
+                    self.early41.as_ref(),
+                    self.early47.as_ref(),
+                    self.early47_residual.as_ref(),
+                    state,
+                );
+                report_audio = Some(full_audio);
+                search
+            }
         };
 
-        let report = build_decode_report_with_resolver(audio, options, search.clone(), state);
+        let report_source = report_audio.as_ref().unwrap_or(audio);
+        let report =
+            build_decode_report_with_resolver(report_source, options, search.clone(), state);
         let state = build_decoder_state(state, &search);
         let (new_decodes, updated_decodes) = diff_decodes(&self.last_decodes, &report.decodes);
         self.last_decodes = report
@@ -178,6 +191,115 @@ impl DecoderSession {
                 updated_decodes,
             },
             state,
+        ))
+    }
+
+    pub(super) fn debug_decode_stage_with_state(
+        &mut self,
+        audio: &AudioBuffer,
+        options: &DecodeOptions,
+        stage: DecodeStage,
+        state: Option<&DecoderState>,
+    ) -> Result<(DecodeStageTrace, DecoderState), DecoderError> {
+        let spec = options.mode.spec();
+        validate_audio(audio, spec)?;
+        if !stage_is_enabled(stage, options) {
+            return Err(DecoderError::UnsupportedFormat(format!(
+                "stage {} is not enabled for profile {}",
+                stage.as_str(),
+                options.profile.as_str()
+            )));
+        }
+        if audio.samples.len() < stage.required_samples(spec) {
+            return Err(DecoderError::UnsupportedFormat(format!(
+                "audio too short for stage {}",
+                stage.as_str()
+            )));
+        }
+
+        let full_audio =
+            (stage == DecodeStage::Full).then(|| truncate_tail(audio, spec.full_decode_samples()));
+        let stage_audio = full_audio.as_ref().unwrap_or(audio);
+        let input_signature = compute_residual_signature(stage_audio);
+        let mut residual_prep_subtractions = Vec::new();
+        let mut search_passes = Vec::new();
+        let search = match stage {
+            DecodeStage::Early41 => {
+                let early_audio = zero_tail(audio, early_41_samples(spec));
+                let trace = debug_run_decode_search_inner(
+                    &early_audio,
+                    options,
+                    None,
+                    Vec::new(),
+                    state.map(|state| &state.resolver),
+                    sync8_early_threshold(spec),
+                    false,
+                    true,
+                );
+                search_passes = trace.passes;
+                self.early41 = Some(trace.search.clone());
+                trace.search
+            }
+            DecodeStage::Early47 => {
+                let resolver = state.map(|state| &state.resolver);
+                let (search, residual, subtractions) = run_early47_residual_prep_with_trace(
+                    audio,
+                    options,
+                    self.early41.as_ref(),
+                    resolver,
+                );
+                self.early47_residual = Some(residual);
+                self.early47 = Some(search.clone());
+                residual_prep_subtractions = subtractions;
+                search
+            }
+            DecodeStage::Full => {
+                let (trace, subtractions) = debug_full_search(
+                    stage_audio,
+                    options,
+                    self.early41.as_ref(),
+                    self.early47.as_ref(),
+                    self.early47_residual.as_ref(),
+                    state,
+                );
+                residual_prep_subtractions = subtractions;
+                search_passes = trace.passes;
+                trace.search
+            }
+        };
+
+        let report = build_decode_report_with_resolver(stage_audio, options, search.clone(), state);
+        let next_state = build_decoder_state(state, &search);
+        let (new_decodes, updated_decodes) = diff_decodes(&self.last_decodes, &report.decodes);
+        self.last_decodes = report
+            .decodes
+            .iter()
+            .cloned()
+            .map(|decode| (decode.text.clone(), decode))
+            .collect();
+        self.emitted_stages.push(stage);
+        let residual_signature = search_passes
+            .last()
+            .and_then(|pass| pass.residual_signature.clone())
+            .or_else(|| {
+                self.early47_residual
+                    .as_ref()
+                    .filter(|_| stage == DecodeStage::Early47)
+                    .map(|residual| compute_residual_signature(&residual.audio))
+            });
+
+        Ok((
+            DecodeStageTrace {
+                stage,
+                input_signature,
+                residual_signature,
+                residual_prep_subtractions,
+                search_passes,
+                report,
+                new_decodes,
+                updated_decodes,
+            },
+            next_state,
         ))
     }
 }
@@ -247,42 +369,78 @@ pub(super) fn stage_is_enabled(stage: DecodeStage, options: &DecodeOptions) -> b
     }
 }
 
-pub(super) fn run_early47_search(
+pub(super) fn run_early47_residual_prep(
     audio: &AudioBuffer,
     options: &DecodeOptions,
     early41: Option<&SearchResult>,
-    state: Option<&DecoderState>,
-) -> SearchResult {
+) -> (SearchResult, Early47ResidualState) {
+    let (search, residual, _) = run_early47_residual_prep_with_trace(audio, options, early41, None);
+    (search, residual)
+}
+
+fn run_early47_residual_prep_with_trace(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    early41: Option<&SearchResult>,
+    base_resolver: Option<&HashResolver>,
+) -> (SearchResult, Early47ResidualState, Vec<SearchAcceptedTrace>) {
     let spec = options.mode.spec();
     let subtraction_plan = SubtractionPlan::for_mode(options.mode);
     let mut partial47 = zero_tail(audio, early_47_samples(spec));
-    if !options.disable_subtraction
-        && let Some(stage41) = early41
-    {
+    let early41_successes = early41
+        .map(|stage| stage.successes.clone())
+        .unwrap_or_default();
+    let mut subtracted_early41 = vec![false; early41_successes.len()];
+    let resolver = merged_resolver(base_resolver, &early41_successes);
+    let mut subtractions = Vec::new();
+    if !options.disable_subtraction && !early41_successes.is_empty() {
         let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
-        for success in &stage41.successes {
+        let refine_dt = matches!(options.profile, DecodeProfile::Deepest);
+        let mut refine_workspaces =
+            refine_dt.then(|| SubtractionRefineWorkspaces::new(subtraction_plan));
+        let block_samples = spec.refine.early_block_samples;
+        for (index, success) in early41_successes.iter().enumerate() {
             if success.candidate.dt_seconds < spec.subtraction.refine_cutoff_seconds {
-                subtract_candidate_with_workspace(
-                    &mut partial47,
-                    success,
-                    subtraction_plan,
-                    true,
-                    &mut subtraction_workspace,
-                );
+                // Apply early47 prep in the same hsym-sized chunks WSJT-X stages around. That keeps
+                // each block boundary usable as a future zero-copy residual checkpoint.
+                if let Some(refine_workspaces) = refine_workspaces.as_mut() {
+                    subtract_candidate_by_blocks_with_refine_workspaces(
+                        &mut partial47,
+                        success,
+                        subtraction_plan,
+                        block_samples,
+                        &mut subtraction_workspace,
+                        refine_workspaces,
+                    );
+                } else {
+                    subtract_candidate_by_blocks_with_workspace(
+                        &mut partial47,
+                        success,
+                        subtraction_plan,
+                        false,
+                        block_samples,
+                        &mut subtraction_workspace,
+                    );
+                }
+                subtracted_early41[index] = true;
+                subtractions.push(success_subtraction_trace(success, &resolver));
             }
         }
     }
-    let initial_successes = early41
-        .map(|stage| stage.successes.clone())
-        .unwrap_or_default();
-    run_decode_search(
-        &partial47,
-        options,
-        Some(partial47.clone()),
-        initial_successes,
-        state.map(|state| &state.resolver),
-        options.sync_threshold(),
-        false,
+    let search_grid = search_grid(&partial47, options);
+    (
+        SearchResult {
+            successes: early41_successes,
+            frame_count: search_grid.frame_count,
+            usable_bins: search_grid.usable_bins,
+            top_candidates: Vec::new(),
+            counters: DecodeCounters::default(),
+        },
+        Early47ResidualState {
+            audio: partial47,
+            subtracted_early41,
+        },
+        subtractions,
     )
 }
 
@@ -291,6 +449,7 @@ pub(super) fn run_full_search(
     options: &DecodeOptions,
     early41: Option<&SearchResult>,
     early47: Option<&SearchResult>,
+    early47_residual: Option<&Early47ResidualState>,
     state: Option<&DecoderState>,
 ) -> SearchResult {
     let subtraction_plan = SubtractionPlan::for_mode(options.mode);
@@ -300,9 +459,24 @@ pub(super) fn run_full_search(
         .unwrap_or_default();
     let prepared_full =
         (!options.disable_subtraction && !initial_successes.is_empty()).then(|| {
-            let mut prepared = audio.clone();
+            let mut prepared = if let Some(residual) = early47_residual {
+                splice_early_residual(
+                    audio,
+                    &residual.audio,
+                    early_47_samples(options.mode.spec()),
+                )
+            } else {
+                audio.clone()
+            };
             let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
-            for success in &initial_successes {
+            for (index, success) in initial_successes.iter().enumerate() {
+                if early47_residual
+                    .and_then(|residual| residual.subtracted_early41.get(index))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 subtract_candidate_with_workspace(
                     &mut prepared,
                     success,
@@ -324,6 +498,96 @@ pub(super) fn run_full_search(
     )
 }
 
+fn debug_full_search(
+    audio: &AudioBuffer,
+    options: &DecodeOptions,
+    early41: Option<&SearchResult>,
+    early47: Option<&SearchResult>,
+    early47_residual: Option<&Early47ResidualState>,
+    state: Option<&DecoderState>,
+) -> (DebugSearchTrace, Vec<SearchAcceptedTrace>) {
+    let subtraction_plan = SubtractionPlan::for_mode(options.mode);
+    let initial_successes = early47
+        .map(|stage| stage.successes.clone())
+        .or_else(|| early41.map(|stage| stage.successes.clone()))
+        .unwrap_or_default();
+    let resolver = merged_resolver(state.map(|state| &state.resolver), &initial_successes);
+    let mut residual_prep_subtractions = Vec::new();
+    let prepared_full =
+        (!options.disable_subtraction && !initial_successes.is_empty()).then(|| {
+            let mut prepared = if let Some(residual) = early47_residual {
+                splice_early_residual(
+                    audio,
+                    &residual.audio,
+                    early_47_samples(options.mode.spec()),
+                )
+            } else {
+                audio.clone()
+            };
+            let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
+            for (index, success) in initial_successes.iter().enumerate() {
+                if early47_residual
+                    .and_then(|residual| residual.subtracted_early41.get(index))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                subtract_candidate_with_workspace(
+                    &mut prepared,
+                    success,
+                    subtraction_plan,
+                    true,
+                    &mut subtraction_workspace,
+                );
+                residual_prep_subtractions.push(success_subtraction_trace(success, &resolver));
+            }
+            prepared
+        });
+    (
+        debug_run_decode_search_inner(
+            audio,
+            options,
+            prepared_full,
+            initial_successes,
+            state.map(|state| &state.resolver),
+            options.sync_threshold(),
+            true,
+            true,
+        ),
+        residual_prep_subtractions,
+    )
+}
+
+fn splice_early_residual(
+    audio: &AudioBuffer,
+    residual: &AudioBuffer,
+    prefix_samples: usize,
+) -> AudioBuffer {
+    let mut prepared = audio.clone();
+    let copied = prefix_samples
+        .min(prepared.samples.len())
+        .min(residual.samples.len());
+    prepared.samples[..copied].copy_from_slice(&residual.samples[..copied]);
+    prepared
+}
+
+fn success_subtraction_trace(
+    success: &SuccessfulDecode,
+    resolver: &HashResolver,
+) -> SearchAcceptedTrace {
+    SearchAcceptedTrace {
+        text: success.payload.to_message(resolver).to_text(),
+        dt_seconds: success.candidate.dt_seconds,
+        freq_hz: success.candidate.freq_hz,
+        codeword_bits: success
+            .codeword_bits
+            .iter()
+            .map(|bit| if *bit == 0 { '0' } else { '1' })
+            .collect(),
+    }
+}
+
 pub(super) fn build_decode_report_with_resolver(
     audio: &AudioBuffer,
     options: &DecodeOptions,
@@ -336,6 +600,9 @@ pub(super) fn build_decode_report_with_resolver(
     let ft8_snr_context = (options.mode == Mode::Ft8)
         .then(|| build_ft8_reported_snr_context(audio, options))
         .flatten();
+    let mut ft8_snr_workspace = ft8_snr_context
+        .as_ref()
+        .map(|context| BasebandWorkspace::new(context.baseband_plan));
 
     let mut dedup = BTreeMap::<String, DecodedMessage>::new();
     for success in search.successes {
@@ -348,10 +615,13 @@ pub(super) fn build_decode_report_with_resolver(
             continue;
         }
         let reported_snr_db = match success.mode {
-            Mode::Ft8 => ft8_snr_context
-                .as_ref()
-                .and_then(|context| ft8_reported_snr_db(context, &success))
-                .unwrap_or(success.snr_db),
+            Mode::Ft8 => match (ft8_snr_context.as_ref(), ft8_snr_workspace.as_mut()) {
+                (Some(context), Some(workspace)) => {
+                    ft8_reported_snr_db_with_workspace(context, &success, workspace)
+                        .unwrap_or(success.snr_db)
+                }
+                _ => success.snr_db,
+            },
             Mode::Ft4 | Mode::Ft2 => success.snr_db,
         };
         let decode = DecodedMessage {
@@ -481,8 +751,8 @@ fn debug_run_decode_search_inner(
     let has_residual_override = residual_override.is_some();
     let mut residual_audio = residual_override.unwrap_or_else(|| audio.clone());
     let spec = options.mode.spec();
-    let baseband_plan = BasebandPlan::new(spec);
-    let mut baseband_workspace = BasebandWorkspace::new(&baseband_plan);
+    let baseband_plan = BasebandPlan::for_mode(options.mode);
+    let mut baseband_workspace = BasebandWorkspace::new(baseband_plan);
     let subtraction_plan = SubtractionPlan::for_mode(options.mode);
     let parity = ParityMatrix::global();
     let mut top_candidates = Vec::new();
@@ -531,6 +801,41 @@ fn debug_run_decode_search_inner(
             None
         };
         let mut subtraction_workspace = SubtractionWorkspace::new(subtraction_plan);
+        let mut parallel_results = if options.mode == Mode::Ft8 && !capture_trace {
+            Some(
+                candidates
+                    .par_iter()
+                    .map_init(
+                        || BasebandWorkspace::new(baseband_plan),
+                        |baseband_workspace, candidate| {
+                            let mut local_counters = DecodeCounters::default();
+                            let successes_for_candidate = try_candidate(
+                                search_grid,
+                                cached_long_spectrum
+                                    .as_ref()
+                                    .expect("FT8 pass spectrum should be available"),
+                                baseband_plan,
+                                baseband_workspace,
+                                candidate,
+                                spec,
+                                options,
+                                pass,
+                                parity,
+                                allow_ap,
+                                &[],
+                                &HashResolver::default(),
+                                &HashSet::new(),
+                                &mut local_counters,
+                            );
+                            (successes_for_candidate, local_counters)
+                        },
+                    )
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+        } else {
+            None
+        };
         let mut cached_resolver = HashResolver::default();
         let mut cached_seen_messages = HashSet::new();
         let mut seen_cache_dirty = true;
@@ -542,29 +847,35 @@ fn debug_run_decode_search_inner(
                 .as_ref()
                 .or_else(|| cached_long_spectrum.as_ref())
                 .expect("decode pass spectrum should be available");
-            let mut local_counters = DecodeCounters::default();
-            let ft4_ap_known_bits = Vec::new();
-            if seen_cache_dirty {
-                (cached_resolver, cached_seen_messages) =
-                    current_seen_message_texts(base_resolver, &successes, &pass_successes);
-                seen_cache_dirty = false;
-            }
-            let successes_for_candidate = try_candidate(
-                search_grid,
-                &long_spectrum,
-                &baseband_plan,
-                &mut baseband_workspace,
-                candidate,
-                spec,
-                options,
-                pass,
-                parity,
-                allow_ap,
-                &ft4_ap_known_bits,
-                &cached_resolver,
-                &cached_seen_messages,
-                &mut local_counters,
-            );
+            let (successes_for_candidate, local_counters) =
+                if let Some(results) = parallel_results.as_mut() {
+                    results.next().expect("parallel candidate result")
+                } else {
+                    let mut local_counters = DecodeCounters::default();
+                    let ft4_ap_known_bits = Vec::new();
+                    if seen_cache_dirty {
+                        (cached_resolver, cached_seen_messages) =
+                            current_seen_message_texts(base_resolver, &successes, &pass_successes);
+                        seen_cache_dirty = false;
+                    }
+                    let successes_for_candidate = try_candidate(
+                        search_grid,
+                        long_spectrum,
+                        baseband_plan,
+                        &mut baseband_workspace,
+                        candidate,
+                        spec,
+                        options,
+                        pass,
+                        parity,
+                        allow_ap,
+                        &ft4_ap_known_bits,
+                        &cached_resolver,
+                        &cached_seen_messages,
+                        &mut local_counters,
+                    );
+                    (successes_for_candidate, local_counters)
+                };
             counters.ldpc_codewords += local_counters.ldpc_codewords;
             counters.parsed_payloads += local_counters.parsed_payloads;
             let raw_successes: Vec<String> = if capture_trace {

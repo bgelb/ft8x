@@ -105,6 +105,7 @@ pub const FT2_WAVEFORM: WaveformSpec = WaveformSpec {
 
 pub const FT2_SEARCH: SearchSpec = SearchSpec {
     long_input_samples: FT2_LONG_INPUT_SAMPLES,
+    full_decode_samples: FT2_LONG_INPUT_SAMPLES,
     long_fft_samples: FT2_LONG_FFT_SAMPLES,
     downsample_factor: FT2_DOWNSAMPLE_FACTOR,
     sync_fft_symbol_window: 1,

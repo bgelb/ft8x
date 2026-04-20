@@ -526,6 +526,7 @@ def compare_case(case: dict, rust_template: str, reference_template: str | None)
         "stock_only_messages": stock_only_messages,
         "stock_missed_truth_messages": stock_missed_truth_messages,
         "rust_only_truth_messages": rust_only_truth_messages,
+        "rust_covers_reference": len(stock_only_messages) == 0,
         "match": rust_messages == reference_messages,
     }
 
@@ -538,6 +539,8 @@ def compare_corpus(args: argparse.Namespace) -> int:
         reference_template = default_stock_reference_template(args.profile)
     results = []
     mismatches = 0
+    exact_mismatches = 0
+    superset_violations = 0
     jobs = args.jobs or os.cpu_count() or 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
         futures = [
@@ -546,7 +549,12 @@ def compare_corpus(args: argparse.Namespace) -> int:
         ]
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
-            mismatches += int(not result["match"])
+            exact_mismatches += int(not result["match"])
+            superset_violations += int(not result["rust_covers_reference"])
+            if args.require_rust_superset:
+                mismatches += int(not result["rust_covers_reference"])
+            else:
+                mismatches += int(not result["match"])
             results.append(result)
     results.sort(key=lambda item: item["id"])
 
@@ -554,13 +562,27 @@ def compare_corpus(args: argparse.Namespace) -> int:
         "manifest": str(Path(args.manifest).resolve()),
         "profile": args.profile,
         "reference_cmd": reference_template,
+        "comparison_mode": "rust-superset" if args.require_rust_superset else "exact",
         "case_count": len(results),
         "mismatch_count": mismatches,
+        "exact_mismatch_count": exact_mismatches,
+        "superset_violation_count": superset_violations,
         "results": results,
     }
     if args.output:
         Path(args.output).write_text(json.dumps(payload, indent=2) + "\n")
-    print(json.dumps({"case_count": len(results), "mismatch_count": mismatches}, indent=2))
+    print(
+        json.dumps(
+            {
+                "case_count": len(results),
+                "comparison_mode": payload["comparison_mode"],
+                "mismatch_count": mismatches,
+                "exact_mismatch_count": exact_mismatches,
+                "superset_violation_count": superset_violations,
+            },
+            indent=2,
+        )
+    )
     return 0 if mismatches == 0 else 1
 
 
@@ -1061,6 +1083,11 @@ def parse_args() -> argparse.Namespace:
         default="medium",
         choices=["medium", "deepest"],
         help="Reference profile when --use-stock-reference is enabled.",
+    )
+    compare.add_argument(
+        "--require-rust-superset",
+        action="store_true",
+        help="Treat Rust as passing when it includes every reference decode, even if it has additional decodes.",
     )
     compare.add_argument("--jobs", type=int, help="Parallel decode jobs. Defaults to the host CPU count.")
     compare.add_argument("--output", help="Optional JSON output path.")
