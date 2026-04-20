@@ -31,12 +31,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use tracing_subscriber::Registry;
 use tracing_subscriber::fmt::writer::MakeWriter;
@@ -1800,6 +1801,15 @@ impl QsoJsonlCache {
         self.last_modified = modified;
         self.last_len = len;
     }
+
+    fn apply_refresh(&mut self, refresh: QsoJsonlRefresh) {
+        self.history = refresh.scan.history;
+        self.direct_calls = refresh.scan.direct_calls;
+        self.recent_worked = refresh.scan.recent_worked;
+        self.last_modified = refresh.modified;
+        self.last_len = refresh.len;
+        self.last_refresh_at = Some(refresh.scanned_at);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1807,6 +1817,52 @@ struct QsoJsonlScan {
     history: Vec<WebQsoHistoryEntry>,
     direct_calls: Vec<WebDirectCallLog>,
     recent_worked: BTreeMap<WorkedBandKey, SystemTime>,
+}
+
+#[derive(Debug)]
+struct QsoJsonlRefresh {
+    scanned_at: SystemTime,
+    modified: Option<SystemTime>,
+    len: u64,
+    scan: QsoJsonlScan,
+}
+
+fn spawn_qso_jsonl_refresh_worker(
+    path: PathBuf,
+    direct_calls_since: SystemTime,
+    mut last_modified: Option<SystemTime>,
+    mut last_len: u64,
+) -> mpsc::Receiver<QsoJsonlRefresh> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            let now = SystemTime::now();
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                let modified = metadata.modified().ok();
+                let len = metadata.len();
+                if (modified != last_modified || len != last_len)
+                    && let Ok(contents) = std::fs::read_to_string(&path)
+                {
+                    let scan = scan_qso_jsonl(&contents, now, direct_calls_since);
+                    if tx
+                        .send(QsoJsonlRefresh {
+                            scanned_at: now,
+                            modified,
+                            len,
+                            scan,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    last_modified = modified;
+                    last_len = len;
+                }
+            }
+            thread::sleep(QSO_JSONL_REFRESH_INTERVAL);
+        }
+    });
+    rx
 }
 
 #[derive(Debug)]
@@ -1827,6 +1883,8 @@ enum DecodeEvent {
         mode: DecoderMode,
         stage: DecodeStage,
         wall_ms: u128,
+        worker_wait_ms: u128,
+        decode_run_ms: u128,
         result: Result<StageDecodeReport, AppError>,
     },
 }
@@ -1892,6 +1950,12 @@ struct DecodeCycleLogState {
     early41_wall_ms: Option<u128>,
     early47_wall_ms: Option<u128>,
     full_wall_ms: Option<u128>,
+    early41_worker_wait_ms: Option<u128>,
+    early47_worker_wait_ms: Option<u128>,
+    full_worker_wait_ms: Option<u128>,
+    early41_decode_run_ms: Option<u128>,
+    early47_decode_run_ms: Option<u128>,
+    full_decode_run_ms: Option<u128>,
     early41_decode_count: Option<usize>,
     early47_decode_count: Option<usize>,
     full_decode_count: Option<usize>,
@@ -1913,13 +1977,27 @@ impl DecodeCycleLogState {
         }
     }
 
-    fn record_ok(&mut self, stage: DecodeStage, wall_ms: u128, decode_count: usize) {
-        self.record_wall_ms(stage, wall_ms);
+    fn record_ok(
+        &mut self,
+        stage: DecodeStage,
+        wall_ms: u128,
+        worker_wait_ms: u128,
+        decode_run_ms: u128,
+        decode_count: usize,
+    ) {
+        self.record_timing(stage, wall_ms, worker_wait_ms, decode_run_ms);
         self.record_decode_count(stage, decode_count);
     }
 
-    fn record_decode_failed(&mut self, stage: DecodeStage, wall_ms: u128, error: &AppError) {
-        self.record_wall_ms(stage, wall_ms);
+    fn record_decode_failed(
+        &mut self,
+        stage: DecodeStage,
+        wall_ms: u128,
+        worker_wait_ms: u128,
+        decode_run_ms: u128,
+        error: &AppError,
+    ) {
+        self.record_timing(stage, wall_ms, worker_wait_ms, decode_run_ms);
         self.record_error("decode_failed", stage, error.to_string());
     }
 
@@ -1931,11 +2009,29 @@ impl DecodeCycleLogState {
         self.record_error("dropped", stage, reason.to_string());
     }
 
-    fn record_wall_ms(&mut self, stage: DecodeStage, wall_ms: u128) {
+    fn record_timing(
+        &mut self,
+        stage: DecodeStage,
+        wall_ms: u128,
+        worker_wait_ms: u128,
+        decode_run_ms: u128,
+    ) {
         match stage {
-            DecodeStage::Early41 => self.early41_wall_ms = Some(wall_ms),
-            DecodeStage::Early47 => self.early47_wall_ms = Some(wall_ms),
-            DecodeStage::Full => self.full_wall_ms = Some(wall_ms),
+            DecodeStage::Early41 => {
+                self.early41_wall_ms = Some(wall_ms);
+                self.early41_worker_wait_ms = Some(worker_wait_ms);
+                self.early41_decode_run_ms = Some(decode_run_ms);
+            }
+            DecodeStage::Early47 => {
+                self.early47_wall_ms = Some(wall_ms);
+                self.early47_worker_wait_ms = Some(worker_wait_ms);
+                self.early47_decode_run_ms = Some(decode_run_ms);
+            }
+            DecodeStage::Full => {
+                self.full_wall_ms = Some(wall_ms);
+                self.full_worker_wait_ms = Some(worker_wait_ms);
+                self.full_decode_run_ms = Some(decode_run_ms);
+            }
         }
     }
 
@@ -1968,12 +2064,18 @@ impl DecodeCycleLogState {
             early41_wall_ms = option_u128_i128(self.early41_wall_ms),
             early47_wall_ms = option_u128_i128(self.early47_wall_ms),
             full_wall_ms = option_u128_i128(self.full_wall_ms),
+            early41_worker_wait_ms = option_u128_i128(self.early41_worker_wait_ms),
+            early47_worker_wait_ms = option_u128_i128(self.early47_worker_wait_ms),
+            full_worker_wait_ms = option_u128_i128(self.full_worker_wait_ms),
+            early41_decode_run_ms = option_u128_i128(self.early41_decode_run_ms),
+            early47_decode_run_ms = option_u128_i128(self.early47_decode_run_ms),
+            full_decode_run_ms = option_u128_i128(self.full_decode_run_ms),
             tx_margin_ms = tx_margin_ms.unwrap_or(-1),
             early41_decode_count = option_usize_i64(self.early41_decode_count),
             early47_decode_count = option_usize_i64(self.early47_decode_count),
             full_decode_count = option_usize_i64(self.full_decode_count),
             error_stage = self.error_stage.map(DecodeStage::as_str).unwrap_or(""),
-            message = self.error_message.as_deref().unwrap_or(""),
+            error_message = self.error_message.as_deref().unwrap_or(""),
             "decode_cycle"
         );
     }
@@ -5122,6 +5224,12 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         process_started_at,
     );
     qso_jsonl_cache.refresh(process_started_at);
+    let qso_jsonl_refresh_rx = spawn_qso_jsonl_refresh_worker(
+        qso_jsonl_cache.path.clone(),
+        qso_jsonl_cache.direct_calls_since,
+        qso_jsonl_cache.last_modified,
+        qso_jsonl_cache.last_len,
+    );
     let mut work_queue = WorkQueueState::new(
         &config,
         qso_controller.defaults().tx_freq_default_hz,
@@ -5166,6 +5274,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 session_slot = Some(job.slot_start);
                 session_mode = job.mode;
             }
+            let worker_started_at = SystemTime::now();
+            let decode_started_at = Instant::now();
             let result = decode_stage_from_samples(
                 &mut session,
                 &mut state,
@@ -5177,7 +5287,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 decode_profile,
                 job.raw_path.as_deref(),
             );
-            let wall_ms = SystemTime::now()
+            let decode_run_ms = decode_started_at.elapsed().as_millis();
+            let finished_at = SystemTime::now();
+            let wall_ms = finished_at
+                .duration_since(job.capture_end)
+                .unwrap_or_default()
+                .as_millis();
+            let worker_wait_ms = worker_started_at
                 .duration_since(job.capture_end)
                 .unwrap_or_default()
                 .as_millis();
@@ -5186,6 +5302,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 mode: job.mode,
                 stage: job.stage,
                 wall_ms,
+                worker_wait_ms,
+                decode_run_ms,
                 result,
             });
             if job.stage == DecodeStage::Full {
@@ -5233,6 +5351,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     let mut waterfall_rows = seeded_waterfall_rows();
     let mut last_waterfall_update = UNIX_EPOCH;
     let mut last_waterfall_sample_time = UNIX_EPOCH;
+    let render_terminal = std::io::stdout().is_terminal();
+    let mut last_terminal_render = UNIX_EPOCH;
     let mut bandmaps = BandMapStore::default();
     let mut dt_frame_history = VecDeque::<Vec<DecodedMessage>>::with_capacity(DT_HISTORY_FRAMES);
     let mut station_tracker = StationTracker::default();
@@ -5244,7 +5364,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     work_queue.set_current_band(display.rig.as_ref().map(|rig| rig.band.to_string()));
     work_queue.set_current_mode(display.app_mode);
 
-    print!("\x1b[?25l");
+    if render_terminal {
+        print!("\x1b[?25l");
+    }
     while !stop.load(Ordering::Relaxed) {
         let stats = capture.stats();
         display.capture_rms_dbfs = stats.last_chunk_rms_dbfs;
@@ -5258,25 +5380,10 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         for outcome in qso_controller.drain_outcomes() {
             work_queue.handle_qso_outcome(&outcome, &station_tracker);
         }
-        if now.duration_since(last_rig_poll).unwrap_or_default() >= Duration::from_secs(2) {
-            let previous_band = display.rig.as_ref().map(|rig| rig.band.to_string());
-            display.rig = read_rig_snapshot_shared(&rig);
-            let current_band = display.rig.as_ref().map(|rig| rig.band.to_string());
-            if previous_band != current_band {
-                clear_bandmaps(&mut bandmaps);
-                work_queue.clear("band_change");
-            }
-            qso_controller.update_rig_context(
-                display.rig.as_ref().map(|rig| rig.frequency_hz),
-                current_band.clone(),
-                display.app_mode,
-            );
-            work_queue.set_current_band(current_band);
-            work_queue.set_current_mode(display.app_mode);
-            last_rig_poll = now;
+        while let Ok(refresh) = qso_jsonl_refresh_rx.try_recv() {
+            qso_jsonl_cache.apply_refresh(refresh);
+            work_queue.sync_recent_worked(qso_jsonl_cache.recent_worked.clone());
         }
-        qso_jsonl_cache.refresh(now);
-        work_queue.sync_recent_worked(qso_jsonl_cache.recent_worked.clone());
 
         for command in qso_control.drain() {
             let station_info = match &command {
@@ -5429,6 +5536,8 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     mode,
                     stage,
                     wall_ms,
+                    worker_wait_ms,
+                    decode_run_ms,
                     result,
                 } => {
                     if mode != display.app_mode {
@@ -5444,7 +5553,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     }
                     match result {
                         Ok(update) => {
-                            decode_cycle_log.record_ok(stage, wall_ms, update.report.decodes.len());
+                            decode_cycle_log.record_ok(
+                                stage,
+                                wall_ms,
+                                worker_wait_ms,
+                                decode_run_ms,
+                                update.report.decodes.len(),
+                            );
                             match stage {
                                 DecodeStage::Early41 => {
                                     display.early41_wall_ms = Some(wall_ms);
@@ -5601,7 +5716,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                             }
                         }
                         Err(error) => {
-                            decode_cycle_log.record_decode_failed(stage, wall_ms, &error);
+                            decode_cycle_log.record_decode_failed(
+                                stage,
+                                wall_ms,
+                                worker_wait_ms,
+                                decode_run_ms,
+                                &error,
+                            );
                             display.decode_status = format!(
                                 "Last {} {} failed: {}",
                                 stage_display_label(display.app_mode, stage),
@@ -5797,6 +5918,35 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             work_queue.handle_qso_outcome(&outcome, &station_tracker);
         }
 
+        let qso_runtime_snapshot = qso_controller.snapshot(SystemTime::now());
+        if should_poll_rig_on_main_loop(
+            now,
+            last_rig_poll,
+            next_slot,
+            next_slot_stages,
+            display.app_mode,
+            decode_profile,
+            active_decode,
+            &qso_runtime_snapshot,
+            tune_active.load(Ordering::Relaxed) || tx_busy.load(Ordering::Relaxed),
+        ) {
+            let previous_band = display.rig.as_ref().map(|rig| rig.band.to_string());
+            display.rig = read_rig_snapshot_shared(&rig);
+            let current_band = display.rig.as_ref().map(|rig| rig.band.to_string());
+            if previous_band != current_band {
+                clear_bandmaps(&mut bandmaps);
+                work_queue.clear("band_change");
+            }
+            qso_controller.update_rig_context(
+                display.rig.as_ref().map(|rig| rig.frequency_hz),
+                current_band.clone(),
+                display.app_mode,
+            );
+            work_queue.set_current_band(current_band);
+            work_queue.set_current_mode(display.app_mode);
+            last_rig_poll = now;
+        }
+
         if should_refresh_waterfall(
             now,
             last_waterfall_update,
@@ -5835,12 +5985,20 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             &config.station.our_call,
             tune_active.load(Ordering::Relaxed),
         );
-        render(&display);
+        if render_terminal
+            && now.duration_since(last_terminal_render).unwrap_or_default()
+                >= Duration::from_millis(250)
+        {
+            render(&display);
+            last_terminal_render = now;
+        }
         thread::sleep(Duration::from_millis(50));
     }
 
     qso_controller.shutdown(SystemTime::now());
-    print!("\x1b[?25h");
+    if render_terminal {
+        print!("\x1b[?25h");
+    }
     Ok(())
 }
 
@@ -6828,6 +6986,46 @@ fn decode_stage_enabled_for_profile(
         DecodeStage::Early41 => mode == DecoderMode::Ft8 && profile != DecodeProfile::Quick,
         DecodeStage::Early47 => mode == DecoderMode::Ft8 && profile != DecodeProfile::Quick,
     }
+}
+
+fn should_poll_rig_on_main_loop(
+    now: SystemTime,
+    last_rig_poll: SystemTime,
+    next_slot: SystemTime,
+    next_slot_stages: SlotStageState,
+    mode: DecoderMode,
+    decode_profile: DecodeProfile,
+    active_decode: Option<ActiveDecodeJob>,
+    qso_snapshot: &WebQsoSnapshot,
+    tx_busy: bool,
+) -> bool {
+    if now.duration_since(last_rig_poll).unwrap_or_default() < Duration::from_secs(2) {
+        return false;
+    }
+    if active_decode.is_some() || qso_snapshot.active || qso_snapshot.tx_active || tx_busy {
+        return false;
+    }
+    let Some(next_stage_ready_at) =
+        next_unhandled_decode_stage_ready_at(mode, decode_profile, next_slot, next_slot_stages)
+    else {
+        return true;
+    };
+    next_stage_ready_at.duration_since(now).unwrap_or_default() >= Duration::from_millis(1_500)
+}
+
+fn next_unhandled_decode_stage_ready_at(
+    mode: DecoderMode,
+    profile: DecodeProfile,
+    slot_start: SystemTime,
+    stages: SlotStageState,
+) -> Option<SystemTime> {
+    for stage in DecodeStage::ordered() {
+        if !decode_stage_enabled_for_profile(mode, profile, stage) || stages.is_handled(stage) {
+            continue;
+        }
+        return stage_capture_end(mode, slot_start, stage).ok();
+    }
+    None
 }
 
 pub(crate) fn slot_duration_for_mode(mode: DecoderMode) -> Duration {
