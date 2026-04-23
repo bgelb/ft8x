@@ -6379,7 +6379,11 @@ fn apply_rig_config(
     if frequency_hz > 0 {
         rig.set_frequency_hz(frequency_hz)?;
     }
-    rig.set_mode(RigMode::Data)?;
+    let rig_mode = match rig.kind() {
+        RigKind::Mchf => RigMode::Usb,
+        RigKind::K3s => RigMode::Data,
+    };
+    rig.set_mode(rig_mode)?;
     if let Some(power) = power.as_ref() {
         rig.apply_power_request(power)?;
     }
