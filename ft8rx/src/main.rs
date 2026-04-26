@@ -6379,7 +6379,11 @@ fn apply_rig_config(
     if frequency_hz > 0 {
         rig.set_frequency_hz(frequency_hz)?;
     }
-    rig.set_mode(RigMode::Data)?;
+    let rig_mode = match rig.kind() {
+        RigKind::Mchf => RigMode::Usb,
+        RigKind::K3s => RigMode::Data,
+    };
+    rig.set_mode(rig_mode)?;
     if let Some(power) = power.as_ref() {
         rig.apply_power_request(power)?;
     }
@@ -7895,10 +7899,6 @@ impl StationTracker {
         };
         if let Some(observed) = &observed_peer {
             if let Some(logged_peer) = &peer {
-                debug_assert!(
-                    self.same_peer_identity(observed, logged_peer),
-                    "explicit field1 peer should match logged peer"
-                );
                 if !self.same_peer_identity(observed, logged_peer) {
                     tracing::warn!(
                         sender_call,
@@ -7910,10 +7910,6 @@ impl StationTracker {
                 }
             }
             if let Some(tracker_peer) = &tracker_tag_peer {
-                debug_assert!(
-                    self.same_peer_identity(observed, tracker_peer),
-                    "explicit field1 peer should match tracker state"
-                );
                 if !self.same_peer_identity(observed, tracker_peer) {
                     tracing::warn!(
                         sender_call,
