@@ -21,6 +21,8 @@ struct Cli {
     input_device: Option<String>,
     #[arg(long)]
     output_device: Option<String>,
+    #[arg(long)]
+    no_capture: bool,
     #[arg(long, default_value_t = 1_000.0)]
     tone_hz: f32,
     #[arg(long, default_value_t = 5.0)]
@@ -67,15 +69,20 @@ impl MeterSummary {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let rig_kind = resolve_rig_kind(cli.rig)?;
-    let input_device = detect_audio_device_for_rig(rig_kind, cli.input_device.as_deref())?;
     let output_device = detect_audio_output_device_for_rig(rig_kind, cli.output_device.as_deref())?;
-    let capture = SampleStream::start(
-        input_device.clone(),
-        AudioStreamConfig {
-            sample_rate_hz: cli.sample_rate_hz,
-            ..AudioStreamConfig::default()
-        },
-    )?;
+    let input_and_capture = if cli.no_capture {
+        None
+    } else {
+        let input_device = detect_audio_device_for_rig(rig_kind, cli.input_device.as_deref())?;
+        let capture = SampleStream::start(
+            input_device.clone(),
+            AudioStreamConfig {
+                sample_rate_hz: cli.sample_rate_hz,
+                ..AudioStreamConfig::default()
+            },
+        )?;
+        Some((input_device, capture))
+    };
     let mut rig = Rig::connect(RigConnectionConfig {
         kind: rig_kind,
         port_path: cli.port,
@@ -94,7 +101,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = rig.read_snapshot()?;
     println!("rig_kind={}", rig_kind);
-    println!("input_device={} ({})", input_device.name, input_device.spec);
+    if let Some((input_device, _)) = &input_and_capture {
+        println!("input_device={} ({})", input_device.name, input_device.spec);
+    } else {
+        println!("input_device=(disabled)");
+    }
     println!(
         "output_device={} ({})",
         output_device.name, output_device.spec
@@ -102,6 +113,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_snapshot(&snapshot);
     print_power_state(&snapshot.power);
 
+    if cli.no_capture {
+        let tone_duration = Duration::from_secs_f32(cli.tone_seconds);
+        rig.enter_tx()?;
+        thread::sleep(Duration::from_millis(300));
+        let tone_result = play_tone(
+            &output_device,
+            cli.sample_rate_hz,
+            cli.playback_channels,
+            cli.tone_hz,
+            tone_duration,
+            cli.tone_level,
+        );
+        rig.enter_rx()?;
+        tone_result?;
+        println!();
+        println!(
+            "TX keyed, {} Hz tone for {:.1}s; capture disabled",
+            cli.tone_hz as u32, cli.tone_seconds
+        );
+        return Ok(());
+    }
+
+    let Some((_, capture)) = input_and_capture else {
+        unreachable!("capture is only absent when --no-capture returned early");
+    };
     let poll = Duration::from_millis(cli.poll_ms);
     let rx_baseline = sample_window(&mut rig, &capture, Duration::from_secs(2), poll)?;
     rig.enter_tx()?;
