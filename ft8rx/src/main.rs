@@ -956,7 +956,9 @@ impl WorkQueueState {
             entry.direct_compound_eligible = observation.compound_eligible;
             entry.last_direct_text = Some(observation.text.clone());
             entry.last_direct_structured_json = Some(observation.structured_json.clone());
-            entry.ok_to_schedule_after = now;
+            if entry.ok_to_schedule_after < now {
+                entry.ok_to_schedule_after = now;
+            }
             if !duplicate_slot {
                 entry.direct_count = entry.direct_count.saturating_add(1);
             }
@@ -5578,11 +5580,17 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                         slot_start,
                                         &slot_direct_skip_calls,
                                     );
-                                    qso_controller.on_decode_stage(
+                                    let priority_direct_available = work_queue
+                                        .has_recent_priority_direct_for_slot(
+                                            slot_start,
+                                            SystemTime::now(),
+                                        );
+                                    qso_controller.on_decode_stage_with_priority_direct(
                                         slot_start,
                                         stage,
                                         &display.early41_decodes,
                                         SystemTime::now(),
+                                        priority_direct_available,
                                     );
                                     maybe_arm_compound_handoff_from_queue(
                                         &mut work_queue,
@@ -5591,17 +5599,6 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                         slot_start,
                                         SystemTime::now(),
                                     );
-                                    if work_queue.has_recent_priority_direct_for_slot(
-                                        slot_start,
-                                        SystemTime::now(),
-                                    ) && qso_controller
-                                        .preempt_for_priority_direct(SystemTime::now())
-                                    {
-                                        info!(
-                                            slot = %format_slot_time(slot_start),
-                                            "qso_preempted_for_priority_direct"
-                                        );
-                                    }
                                 }
                                 DecodeStage::Early47 => {
                                     display.early47_wall_ms = Some(wall_ms);
@@ -5619,11 +5616,17 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                         slot_start,
                                         &slot_direct_skip_calls,
                                     );
-                                    qso_controller.on_decode_stage(
+                                    let priority_direct_available = work_queue
+                                        .has_recent_priority_direct_for_slot(
+                                            slot_start,
+                                            SystemTime::now(),
+                                        );
+                                    qso_controller.on_decode_stage_with_priority_direct(
                                         slot_start,
                                         stage,
                                         &display.early47_decodes,
                                         SystemTime::now(),
+                                        priority_direct_available,
                                     );
                                     maybe_arm_compound_handoff_from_queue(
                                         &mut work_queue,
@@ -5632,17 +5635,6 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                         slot_start,
                                         SystemTime::now(),
                                     );
-                                    if work_queue.has_recent_priority_direct_for_slot(
-                                        slot_start,
-                                        SystemTime::now(),
-                                    ) && qso_controller
-                                        .preempt_for_priority_direct(SystemTime::now())
-                                    {
-                                        info!(
-                                            slot = %format_slot_time(slot_start),
-                                            "qso_preempted_for_priority_direct"
-                                        );
-                                    }
                                 }
                                 DecodeStage::Full => {
                                     display.last_slot_start = Some(slot_start);
@@ -5682,11 +5674,17 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                         slot_start,
                                         &slot_direct_skip_calls,
                                     );
-                                    qso_controller.on_decode_stage(
+                                    let priority_direct_available = work_queue
+                                        .has_recent_priority_direct_for_slot(
+                                            slot_start,
+                                            SystemTime::now(),
+                                        );
+                                    qso_controller.on_decode_stage_with_priority_direct(
                                         slot_start,
                                         stage,
                                         &display.full_decodes,
                                         SystemTime::now(),
+                                        priority_direct_available,
                                     );
                                     maybe_arm_compound_handoff_from_queue(
                                         &mut work_queue,
@@ -5695,17 +5693,6 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                                         slot_start,
                                         SystemTime::now(),
                                     );
-                                    if work_queue.has_recent_priority_direct_for_slot(
-                                        slot_start,
-                                        SystemTime::now(),
-                                    ) && qso_controller
-                                        .preempt_for_priority_direct(SystemTime::now())
-                                    {
-                                        info!(
-                                            slot = %format_slot_time(slot_start),
-                                            "qso_preempted_for_priority_direct"
-                                        );
-                                    }
                                     decode_cycle_log.emit(
                                         slot_start,
                                         mode,
@@ -9572,6 +9559,43 @@ mod tests {
             .expect("duplicate stage add");
         let entry = queue.entries.front().expect("queued entry");
         assert_eq!(entry.direct_count, 1);
+    }
+
+    #[test]
+    fn direct_observation_preserves_retry_backoff() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let direct_at = now + Duration::from_secs(15);
+        let retry_until = now + Duration::from_secs(300);
+        queue
+            .add_station("K1ABC", now, now)
+            .expect("station queued");
+        queue
+            .entries
+            .front_mut()
+            .expect("queued entry")
+            .ok_to_schedule_after = retry_until;
+        let observation = DirectCallObservation {
+            callsign: "K1ABC".to_string(),
+            observed_at: direct_at,
+            slot_index: ft8_slot_index(direct_at),
+            slot_family: ft8_slot_family(direct_at),
+            snr_db: -5,
+            start_state: QsoState::SendSig,
+            compound_eligible: true,
+            text: "N1VF K1ABC FN20".to_string(),
+            structured_json: "{}".to_string(),
+        };
+
+        queue
+            .add_direct_observation(observation, direct_at)
+            .expect("direct update");
+
+        let entry = queue.entries.front().expect("queued entry");
+        assert!(entry.direct_pending);
+        assert_eq!(entry.ok_to_schedule_after, retry_until);
+        assert!(!queue.has_recent_priority_direct_for_slot(direct_at, direct_at));
     }
 
     #[test]
